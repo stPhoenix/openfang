@@ -211,6 +211,7 @@ impl AgentMode {
                     "web_fetch",
                     "web_search",
                     "agent_list",
+                    "agent_self_inspect",
                 ];
                 tools
                     .into_iter()

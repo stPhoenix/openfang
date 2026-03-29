@@ -11490,6 +11490,53 @@ fn remove_toml_section(content: &str, section: &str) -> String {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Wizard API — expose SetupWizard as HTTP endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /api/wizard/plan — generate a setup plan from a natural language intent.
+pub async fn wizard_plan(
+    Json(intent): Json<openfang_kernel::wizard::AgentIntent>,
+) -> impl IntoResponse {
+    let plan = openfang_kernel::wizard::SetupWizard::build_plan(intent);
+    Json(serde_json::json!({
+        "plan": plan,
+    }))
+}
+
+/// POST /api/wizard/spawn — generate a plan and immediately spawn the agent.
+pub async fn wizard_spawn(
+    State(state): State<Arc<AppState>>,
+    Json(intent): Json<openfang_kernel::wizard::AgentIntent>,
+) -> impl IntoResponse {
+    let plan = openfang_kernel::wizard::SetupWizard::build_plan(intent);
+    let toml = match openfang_kernel::wizard::SetupWizard::manifest_to_toml(&plan.manifest) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to serialize manifest: {e}") })),
+            );
+        }
+    };
+    match state.kernel.spawn_agent(
+        toml::from_str::<AgentManifest>(&toml).unwrap_or(plan.manifest),
+    ) {
+        Ok(agent_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "agent_id": agent_id.to_string(),
+                "summary": plan.summary,
+                "skills_to_install": plan.skills_to_install,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to spawn agent: {e}") })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod channel_config_tests {
     use super::*;

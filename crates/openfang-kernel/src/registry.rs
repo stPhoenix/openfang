@@ -224,6 +224,18 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's tags.
+    pub fn update_tags(&self, id: AgentId, tags: Vec<String>) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.tags = tags.clone();
+        entry.tags = tags;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's MCP server allowlist.
     pub fn update_mcp_servers(&self, id: AgentId, servers: Vec<String>) -> OpenFangResult<()> {
         let mut entry = self

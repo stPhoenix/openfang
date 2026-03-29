@@ -297,6 +297,10 @@ pub async fn execute_tool(
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
 
+        // Self-inspection / self-modification tools
+        "agent_self_inspect" => tool_agent_self_inspect(kernel, caller_agent_id),
+        "agent_self_modify" => tool_agent_self_modify(input, kernel, caller_agent_id).await,
+
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
@@ -687,6 +691,35 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "agent_id": { "type": "string", "description": "The agent's UUID to kill" }
                 },
                 "required": ["agent_id"]
+            }),
+        },
+        // --- Self-inspection / self-modification tools ---
+        ToolDefinition {
+            name: "agent_self_inspect".to_string(),
+            description: "Read your own agent manifest including system prompt, model config, capabilities, and metadata. No parameters required.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "agent_self_modify".to_string(),
+            description: "Propose changes to your own agent manifest. Requires human approval before changes are applied. Supported fields: system_prompt, description, name, model, provider, tags.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "system_prompt": { "type": "string", "description": "New system prompt (takes effect on next message)" },
+                    "description": { "type": "string", "description": "New agent description" },
+                    "name": { "type": "string", "description": "New agent name (must be unique)" },
+                    "model": { "type": "string", "description": "New model identifier" },
+                    "provider": { "type": "string", "description": "New model provider (must be set together with model)" },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "New tags for discovery"
+                    },
+                    "reason": { "type": "string", "description": "Explain why you want to change your manifest (shown to human approver)" }
+                }
             }),
         },
         // --- Shared memory tools ---
@@ -1689,6 +1722,43 @@ fn tool_agent_kill(
         .ok_or("Missing 'agent_id' parameter")?;
     kh.kill_agent(agent_id)?;
     Ok(format!("Agent {agent_id} killed successfully."))
+}
+
+// ---------------------------------------------------------------------------
+// Self-inspection / self-modification tools
+// ---------------------------------------------------------------------------
+
+fn tool_agent_self_inspect(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID — this tool can only be used by a running agent")?;
+    let manifest_json = kh.get_agent_manifest(agent_id)?;
+    serde_json::to_string_pretty(&manifest_json)
+        .map_err(|e| format!("Failed to format manifest: {e}"))
+}
+
+async fn tool_agent_self_modify(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID — this tool can only be used by a running agent")?;
+    // Build the changes object from input, excluding the "reason" field
+    let mut changes = serde_json::Map::new();
+    for field in &["system_prompt", "description", "name", "model", "provider", "tags"] {
+        if let Some(val) = input.get(*field) {
+            if !val.is_null() {
+                changes.insert(field.to_string(), val.clone());
+            }
+        }
+    }
+    if changes.is_empty() {
+        return Err("No recognized fields to modify. Supported: system_prompt, description, name, model, provider, tags".to_string());
+    }
+    kh.update_agent_manifest(agent_id, serde_json::Value::Object(changes)).await
 }
 
 // ---------------------------------------------------------------------------

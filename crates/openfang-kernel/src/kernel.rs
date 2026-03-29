@@ -5904,6 +5904,88 @@ impl KernelHandle for OpenFangKernel {
             .collect()
     }
 
+    fn get_agent_manifest(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+        let id: AgentId = agent_id
+            .parse()
+            .map_err(|_| "Invalid agent ID".to_string())?;
+        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        serde_json::to_value(&entry.manifest)
+            .map_err(|e| format!("Failed to serialize manifest: {e}"))
+    }
+
+    async fn update_agent_manifest(
+        &self,
+        agent_id: &str,
+        changes: serde_json::Value,
+    ) -> Result<String, String> {
+        let id: AgentId = agent_id
+            .parse()
+            .map_err(|_| "Invalid agent ID".to_string())?;
+        let mut updated = Vec::new();
+
+        if let Some(prompt) = changes.get("system_prompt").and_then(|v| v.as_str()) {
+            self.registry
+                .update_system_prompt(id, prompt.to_string())
+                .map_err(|e| format!("Failed to update system_prompt: {e}"))?;
+            updated.push("system_prompt");
+        }
+        if let Some(desc) = changes.get("description").and_then(|v| v.as_str()) {
+            self.registry
+                .update_description(id, desc.to_string())
+                .map_err(|e| format!("Failed to update description: {e}"))?;
+            updated.push("description");
+        }
+        if let Some(name) = changes.get("name").and_then(|v| v.as_str()) {
+            self.registry
+                .update_name(id, name.to_string())
+                .map_err(|e| format!("Failed to update name: {e}"))?;
+            updated.push("name");
+        }
+        let model = changes.get("model").and_then(|v| v.as_str());
+        let provider = changes.get("provider").and_then(|v| v.as_str());
+        match (model, provider) {
+            (Some(m), Some(p)) => {
+                self.registry
+                    .update_model_and_provider(id, m.to_string(), p.to_string())
+                    .map_err(|e| format!("Failed to update model: {e}"))?;
+                updated.push("model");
+                updated.push("provider");
+            }
+            (Some(m), None) => {
+                self.registry
+                    .update_model(id, m.to_string())
+                    .map_err(|e| format!("Failed to update model: {e}"))?;
+                updated.push("model");
+            }
+            (None, Some(_)) => {
+                return Err("Cannot update provider without model".to_string());
+            }
+            (None, None) => {}
+        }
+        if let Some(tags) = changes.get("tags").and_then(|v| v.as_array()) {
+            let tag_strings: Vec<String> = tags
+                .iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect();
+            self.registry
+                .update_tags(id, tag_strings)
+                .map_err(|e| format!("Failed to update tags: {e}"))?;
+            updated.push("tags");
+        }
+
+        if updated.is_empty() {
+            Ok("No changes applied (no recognized fields provided).".to_string())
+        } else {
+            Ok(format!(
+                "Agent manifest updated. Changed fields: {}",
+                updated.join(", ")
+            ))
+        }
+    }
+
     fn touch_agent(&self, agent_id: &str) {
         if let Ok(id) = agent_id.parse::<AgentId>() {
             self.registry.touch(id);

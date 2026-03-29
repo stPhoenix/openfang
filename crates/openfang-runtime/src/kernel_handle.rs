@@ -238,6 +238,24 @@ pub trait KernelHandle: Send + Sync {
         Err("Channel file data send not available".to_string())
     }
 
+    /// Get an agent's full manifest as JSON.
+    fn get_agent_manifest(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+        let _ = agent_id;
+        Err("Agent manifest inspection not available".to_string())
+    }
+
+    /// Update an agent's manifest fields. `changes` is a JSON object with optional fields:
+    /// `system_prompt`, `description`, `name`, `model`, `provider`, `tags`.
+    /// Returns a summary of what was changed.
+    async fn update_agent_manifest(
+        &self,
+        agent_id: &str,
+        changes: serde_json::Value,
+    ) -> Result<String, String> {
+        let _ = (agent_id, changes);
+        Err("Agent manifest modification not available".to_string())
+    }
+
     /// Refresh an agent's last_active timestamp without changing any other state.
     /// Called by the agent loop before long LLM calls to prevent heartbeat false-positives.
     fn touch_agent(&self, agent_id: &str) {

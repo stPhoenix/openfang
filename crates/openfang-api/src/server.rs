@@ -241,6 +241,15 @@ pub async fn build_router(
             axum::routing::post(routes::upload_file),
         )
         .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
+        // Wizard endpoints
+        .route(
+            "/api/wizard/plan",
+            axum::routing::post(routes::wizard_plan),
+        )
+        .route(
+            "/api/wizard/spawn",
+            axum::routing::post(routes::wizard_spawn),
+        )
         // Upload serving
         .route(
             "/api/uploads/{file_id}",
