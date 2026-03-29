@@ -49,6 +49,7 @@ pub struct AuthState {
     pub api_key: String,
     pub auth_enabled: bool,
     pub session_secret: String,
+    pub require_auth_for_reads: bool,
 }
 
 /// Bearer token authentication middleware.
@@ -80,13 +81,14 @@ pub async fn auth(
         }
     }
 
-    // Public endpoints that don't require auth (dashboard needs these).
-    // SECURITY: /api/agents is GET-only (listing). POST (spawn) requires auth.
-    // SECURITY: Public endpoints are GET-only unless explicitly noted.
-    // POST/PUT/DELETE to any endpoint ALWAYS requires auth to prevent
+    // Public endpoints that don't require auth.
+    // SECURITY: POST/PUT/DELETE to any endpoint ALWAYS requires auth to prevent
     // unauthenticated writes (cron job creation, skill install, etc.).
     let is_get = method == axum::http::Method::GET;
-    let is_public = path == "/"
+
+    // Tier 1: Always public — health, auth, static assets, A2A protocol.
+    // These remain public even when require_auth_for_reads is enabled.
+    let is_always_public = path == "/"
         || path == "/logo.png"
         || path == "/favicon.ico"
         || (path == "/.well-known/agent.json" && is_get)
@@ -95,42 +97,49 @@ pub async fn auth(
         || path == "/api/health/detail"
         || path == "/api/status"
         || path == "/api/version"
-        || (path == "/api/agents" && is_get)
-        || (path == "/api/profiles" && is_get)
-        || (path == "/api/config" && is_get)
         || (path == "/api/config/schema" && is_get)
-        || (path.starts_with("/api/uploads/") && is_get)
-        // Dashboard read endpoints — allow unauthenticated so the SPA can
-        // render before the user enters their API key.
-        || (path == "/api/models" && is_get)
-        || (path == "/api/models/aliases" && is_get)
-        || (path == "/api/providers" && is_get)
-        || (path == "/api/budget" && is_get)
-        || (path == "/api/budget/agents" && is_get)
-        || (path.starts_with("/api/budget/agents/") && is_get)
-        || (path == "/api/network/status" && is_get)
-        || (path == "/api/a2a/agents" && is_get)
-        || (path == "/api/approvals" && is_get)
-        || (path.starts_with("/api/approvals/") && is_get)
-        || (path == "/api/channels" && is_get)
-        || (path == "/api/hands" && is_get)
-        || (path == "/api/hands/active" && is_get)
-        || (path.starts_with("/api/hands/") && is_get)
-        || (path == "/api/skills" && is_get)
-        || (path == "/api/sessions" && is_get)
-        || (path == "/api/integrations" && is_get)
-        || (path == "/api/integrations/available" && is_get)
-        || (path == "/api/integrations/health" && is_get)
-        || (path == "/api/workflows" && is_get)
-        || path == "/api/logs/stream"  // SSE stream, read-only
-        || (path.starts_with("/api/cron/") && is_get)
         || path.starts_with("/api/providers/github-copilot/oauth/")
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
         || (path == "/api/auth/check" && is_get);
 
-    if is_public {
+    if is_always_public {
         return next.run(request).await;
+    }
+
+    // Tier 2: Dashboard read endpoints — public unless require_auth_for_reads
+    // is enabled. Allows the SPA to render before login in permissive mode.
+    // SECURITY: /api/agents is GET-only (listing). POST (spawn) requires auth.
+    if !auth_state.require_auth_for_reads {
+        let is_dashboard_public = is_get && (path == "/api/agents"
+            || path == "/api/profiles"
+            || path == "/api/config"
+            || path.starts_with("/api/uploads/")
+            || path == "/api/models"
+            || path == "/api/models/aliases"
+            || path == "/api/providers"
+            || path == "/api/budget"
+            || path == "/api/budget/agents"
+            || path.starts_with("/api/budget/agents/")
+            || path == "/api/network/status"
+            || path == "/api/a2a/agents"
+            || path == "/api/approvals"
+            || path.starts_with("/api/approvals/")
+            || path == "/api/channels"
+            || path == "/api/hands"
+            || path == "/api/hands/active"
+            || path.starts_with("/api/hands/")
+            || path == "/api/skills"
+            || path == "/api/sessions"
+            || path == "/api/integrations"
+            || path == "/api/integrations/available"
+            || path == "/api/integrations/health"
+            || path == "/api/workflows"
+            || path == "/api/logs/stream"  // SSE stream, read-only
+            || path.starts_with("/api/cron/"));
+        if is_dashboard_public {
+            return next.run(request).await;
+        }
     }
 
     // If no API key configured (empty, whitespace-only, or missing), skip auth
@@ -264,9 +273,136 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::get, Router};
+    use tower::ServiceExt;
 
     #[test]
     fn test_request_id_header_constant() {
         assert_eq!(REQUEST_ID_HEADER, "x-request-id");
+    }
+
+    /// Helper: build a minimal router with auth middleware and a catch-all 200 handler.
+    fn test_router(auth_state: AuthState) -> Router {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        Router::new()
+            .route("/api/health", get(ok))
+            .route("/api/agents", get(ok))
+            .route("/api/budget", get(ok))
+            .route("/api/auth/check", get(ok))
+            .layer(axum::middleware::from_fn_with_state(
+                auth_state,
+                auth,
+            ))
+    }
+
+    fn strict_auth_state() -> AuthState {
+        AuthState {
+            api_key: "test-secret".to_string(),
+            auth_enabled: false,
+            session_secret: String::new(),
+            require_auth_for_reads: true,
+        }
+    }
+
+    fn permissive_auth_state() -> AuthState {
+        AuthState {
+            api_key: "test-secret".to_string(),
+            auth_enabled: false,
+            session_secret: String::new(),
+            require_auth_for_reads: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mode_blocks_dashboard_reads() {
+        let app = test_router(strict_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_allows_health() {
+        let app = test_router(strict_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_allows_auth_check() {
+        let app = test_router(strict_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_blocks_budget() {
+        let app = test_router(strict_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/budget")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_allows_with_bearer_token() {
+        let app = test_router(strict_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .header("Authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn permissive_mode_allows_dashboard_reads() {
+        let app = test_router(permissive_auth_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

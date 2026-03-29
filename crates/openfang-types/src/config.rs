@@ -1143,6 +1143,9 @@ pub struct AuthConfig {
     pub password_hash: String,
     /// Session token lifetime in hours (default: 168 = 7 days).
     pub session_ttl_hours: u64,
+    /// When true, most GET endpoints require authentication.
+    /// Only health, auth, static assets, and A2A protocol endpoints remain public.
+    pub require_auth_for_reads: bool,
 }
 
 impl Default for AuthConfig {
@@ -1152,6 +1155,7 @@ impl Default for AuthConfig {
             username: "admin".to_string(),
             password_hash: String::new(),
             session_ttl_hours: 168,
+            require_auth_for_reads: false,
         }
     }
 }

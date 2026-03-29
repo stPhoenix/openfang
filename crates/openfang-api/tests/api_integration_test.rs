@@ -722,6 +722,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         } else {
             String::new()
         },
+        require_auth_for_reads: state.kernel.config.auth.require_auth_for_reads,
     };
 
     let app = Router::new()

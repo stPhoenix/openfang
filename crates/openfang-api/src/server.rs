@@ -116,6 +116,7 @@ pub async fn build_router(
         } else {
             String::new()
         },
+        require_auth_for_reads: state.kernel.config.auth.require_auth_for_reads,
     };
     let gcra_limiter = rate_limiter::create_rate_limiter();
 
