@@ -3,7 +3,7 @@ name = "Trading Hand"
 description = "Autonomous market intelligence and trading engine — multi-signal analysis, adversarial bull/bear reasoning, calibrated confidence scoring, strict risk management, and portfolio-level analytics"
 category = "data"
 icon = "\U0001F4C8"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "cron_create", "cron_list", "cron_cancel", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
 
 # ─── Configurable settings ───────────────────────────────────────────────────
 
@@ -236,7 +236,7 @@ Then recover state:
 ## Phase 1 — Portfolio & Market Setup
 
 ### First Run
-1. Create scan schedule using schedule_create based on `scan_schedule` setting
+1. Create scan schedule using cron_create based on `scan_schedule` setting
 2. Initialize portfolio ledger:
    ```json
    {

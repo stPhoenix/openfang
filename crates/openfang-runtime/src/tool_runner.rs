@@ -313,11 +313,6 @@ pub async fn execute_tool(
         "task_list" => tool_task_list(input, kernel).await,
         "event_publish" => tool_event_publish(input, kernel).await,
 
-        // Scheduling tools
-        "schedule_create" => tool_schedule_create(input, kernel).await,
-        "schedule_list" => tool_schedule_list(kernel).await,
-        "schedule_delete" => tool_schedule_delete(input, kernel).await,
-
         // Knowledge graph tools
         "knowledge_add_entity" => tool_knowledge_add_entity(input, kernel).await,
         "knowledge_add_relation" => tool_knowledge_add_relation(input, kernel).await,
@@ -813,39 +808,6 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["event_type"]
             }),
         },
-        // --- Scheduling tools ---
-        ToolDefinition {
-            name: "schedule_create".to_string(),
-            description: "Schedule a recurring task using natural language or cron syntax. Examples: 'every 5 minutes', 'daily at 9am', 'weekdays at 6pm', '0 */5 * * *'.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "description": { "type": "string", "description": "What this schedule does (e.g., 'Check for new emails')" },
-                    "schedule": { "type": "string", "description": "Natural language or cron expression (e.g., 'every 5 minutes', 'daily at 9am', '0 */5 * * *')" },
-                    "agent": { "type": "string", "description": "Agent name or ID to run this task (optional, defaults to self)" }
-                },
-                "required": ["description", "schedule"]
-            }),
-        },
-        ToolDefinition {
-            name: "schedule_list".to_string(),
-            description: "List all scheduled tasks with their IDs, descriptions, schedules, and next run times.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "schedule_delete".to_string(),
-            description: "Remove a scheduled task by its ID.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The schedule ID to remove" }
-                },
-                "required": ["id"]
-            }),
-        },
         // --- Knowledge graph tools ---
         ToolDefinition {
             name: "knowledge_add_entity".to_string(),
@@ -1055,14 +1017,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Cron scheduling tools ---
         ToolDefinition {
             name: "cron_create".to_string(),
-            description: "Create a scheduled/cron job. Supports one-shot (at), recurring (every N seconds), and cron expressions. Max 50 jobs per agent.".to_string(),
+            description: "Create a scheduled/cron job. Supports natural language schedules ('every 5 minutes', 'daily at 9am', 'weekdays at 6pm'), one-shot (at), recurring (every N seconds), and cron expressions. Max 50 jobs per agent.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Job name (max 128 chars, alphanumeric + spaces/hyphens/underscores)" },
                     "schedule": {
-                        "type": "object",
-                        "description": "Schedule: {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} or {\"kind\":\"every\",\"every_secs\":300} or {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\"}"
+                        "description": "Schedule as natural language string ('every 5 minutes', 'daily at 9am', 'weekdays at 6pm', '0 */5 * * *') OR structured object: {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} or {\"kind\":\"every\",\"every_secs\":300} or {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\"}"
                     },
                     "action": {
                         "type": "object",
@@ -2156,98 +2117,42 @@ fn parse_time_to_hour(s: &str) -> Result<u32, String> {
     Ok(hour)
 }
 
-const SCHEDULES_KEY: &str = "__openfang_schedules";
+/// Convert a natural-language or cron schedule string into a structured
+/// `CronSchedule` JSON value that the kernel's `cron_create` accepts.
+///
+/// Short intervals ("every N minutes/hours") map to the `Every` variant for
+/// sub-second precision. Everything else is parsed to a cron expression via
+/// `parse_schedule_to_cron()` and wrapped as a `Cron` variant.
+fn parse_nl_to_schedule(input: &str) -> Result<serde_json::Value, String> {
+    let trimmed = input.trim().to_lowercase();
 
-async fn tool_schedule_create(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let description = input["description"]
-        .as_str()
-        .ok_or("Missing 'description' parameter")?;
-    let schedule_str = input["schedule"]
-        .as_str()
-        .ok_or("Missing 'schedule' parameter")?;
-    let agent = input["agent"].as_str().unwrap_or("");
-
-    let cron_expr = parse_schedule_to_cron(schedule_str)?;
-    let schedule_id = uuid::Uuid::new_v4().to_string();
-
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "description": description,
-        "schedule_input": schedule_str,
-        "cron": cron_expr,
-        "agent": agent,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "enabled": true,
-    });
-
-    // Load existing schedules from shared memory
-    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-
-    schedules.push(entry);
-    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
-
-    Ok(format!(
-        "Schedule created:\n  ID: {schedule_id}\n  Description: {description}\n  Cron: {cron_expr}\n  Original: {schedule_str}"
-    ))
-}
-
-async fn tool_schedule_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-
-    let schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-
-    if schedules.is_empty() {
-        return Ok("No scheduled tasks.".to_string());
+    // "every N minutes" / "every minute" → Every variant (more precise than cron)
+    if let Some(rest) = trimmed.strip_prefix("every ") {
+        if rest == "minute" || rest == "1 minute" {
+            return Ok(serde_json::json!({"kind": "every", "every_secs": 60}));
+        }
+        if let Some(mins) = rest.strip_suffix(" minutes") {
+            if let Ok(n) = mins.trim().parse::<u64>() {
+                if n >= 1 && n * 60 <= 86400 {
+                    return Ok(serde_json::json!({"kind": "every", "every_secs": n * 60}));
+                }
+            }
+        }
+        if rest == "hour" || rest == "1 hour" {
+            return Ok(serde_json::json!({"kind": "every", "every_secs": 3600}));
+        }
+        if let Some(hrs) = rest.strip_suffix(" hours") {
+            if let Ok(n) = hrs.trim().parse::<u64>() {
+                if n >= 1 && n * 3600 <= 86400 {
+                    return Ok(serde_json::json!({"kind": "every", "every_secs": n * 3600}));
+                }
+            }
+        }
     }
 
-    let mut output = format!("Scheduled tasks ({}):\n\n", schedules.len());
-    for s in &schedules {
-        let enabled = s["enabled"].as_bool().unwrap_or(true);
-        let status = if enabled { "active" } else { "paused" };
-        output.push_str(&format!(
-            "  [{status}] {} — {}\n    Cron: {} | Agent: {}\n    Created: {}\n\n",
-            s["id"].as_str().unwrap_or("?"),
-            s["description"].as_str().unwrap_or("?"),
-            s["cron"].as_str().unwrap_or("?"),
-            s["agent"].as_str().unwrap_or("(self)"),
-            s["created_at"].as_str().unwrap_or("?"),
-        ));
-    }
-
-    Ok(output)
-}
-
-async fn tool_schedule_delete(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let id = input["id"].as_str().ok_or("Missing 'id' parameter")?;
-
-    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(id));
-
-    if schedules.len() == before {
-        return Err(format!("Schedule '{id}' not found."));
-    }
-
-    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
-    Ok(format!("Schedule '{id}' deleted."))
+    // Everything else → parse to cron expression, wrap as Cron variant
+    let cron_expr = parse_schedule_to_cron(input)?;
+    Ok(serde_json::json!({"kind": "cron", "expr": cron_expr}))
 }
 
 // ---------------------------------------------------------------------------
@@ -2261,7 +2166,14 @@ async fn tool_cron_create(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.ok_or("Agent ID required for cron_create")?;
-    kh.cron_create(agent_id, input.clone()).await
+
+    // If schedule is a natural-language string, convert to structured object
+    let mut job_json = input.clone();
+    if let Some(schedule_str) = input["schedule"].as_str() {
+        job_json["schedule"] = parse_nl_to_schedule(schedule_str)?;
+    }
+
+    kh.cron_create(agent_id, job_json).await
 }
 
 async fn tool_cron_list(
@@ -3390,9 +3302,9 @@ mod tests {
         assert!(names.contains(&"task_list"));
         assert!(names.contains(&"event_publish"));
         // 5 new Phase 3 tools
-        assert!(names.contains(&"schedule_create"));
-        assert!(names.contains(&"schedule_list"));
-        assert!(names.contains(&"schedule_delete"));
+        assert!(names.contains(&"cron_create"));
+        assert!(names.contains(&"cron_list"));
+        assert!(names.contains(&"cron_cancel"));
         assert!(names.contains(&"image_analyze"));
         assert!(names.contains(&"location_get"));
         assert!(names.contains(&"system_time"));
@@ -3873,6 +3785,66 @@ mod tests {
         assert!(parse_schedule_to_cron("every 0 minutes").is_err());
     }
 
+    // --- NL-to-schedule conversion tests ---
+
+    #[test]
+    fn test_parse_nl_to_schedule_every_minutes() {
+        let result = parse_nl_to_schedule("every 5 minutes").unwrap();
+        assert_eq!(result["kind"], "every");
+        assert_eq!(result["every_secs"], 300);
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_every_hour() {
+        let result = parse_nl_to_schedule("every 2 hours").unwrap();
+        assert_eq!(result["kind"], "every");
+        assert_eq!(result["every_secs"], 7200);
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_every_single() {
+        let result = parse_nl_to_schedule("every minute").unwrap();
+        assert_eq!(result["kind"], "every");
+        assert_eq!(result["every_secs"], 60);
+
+        let result = parse_nl_to_schedule("every hour").unwrap();
+        assert_eq!(result["kind"], "every");
+        assert_eq!(result["every_secs"], 3600);
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_daily_at() {
+        let result = parse_nl_to_schedule("daily at 9am").unwrap();
+        assert_eq!(result["kind"], "cron");
+        assert_eq!(result["expr"], "0 9 * * *");
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_weekdays() {
+        let result = parse_nl_to_schedule("weekdays at 6pm").unwrap();
+        assert_eq!(result["kind"], "cron");
+        assert_eq!(result["expr"], "0 18 * * 1-5");
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_cron_passthrough() {
+        let result = parse_nl_to_schedule("0 */5 * * *").unwrap();
+        assert_eq!(result["kind"], "cron");
+        assert_eq!(result["expr"], "0 */5 * * *");
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_shorthand() {
+        let result = parse_nl_to_schedule("hourly").unwrap();
+        assert_eq!(result["kind"], "cron");
+        assert_eq!(result["expr"], "0 * * * *");
+    }
+
+    #[test]
+    fn test_parse_nl_to_schedule_invalid() {
+        assert!(parse_nl_to_schedule("whenever I feel like it").is_err());
+    }
+
     // --- Image format detection tests ---
     #[test]
     fn test_detect_image_format_png() {
@@ -3976,10 +3948,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schedule_tools_without_kernel() {
+    async fn test_cron_tools_without_kernel() {
         let result = execute_tool(
             "test-id",
-            "schedule_list",
+            "cron_list",
             &serde_json::json!({}),
             None,
             None,

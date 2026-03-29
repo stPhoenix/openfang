@@ -3,7 +3,7 @@ name = "Collector Hand"
 description = "Autonomous intelligence collector — monitors any target continuously with change detection and knowledge graphs"
 category = "data"
 icon = "\U0001F50D"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "cron_create", "cron_list", "cron_cancel", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
 
 # ─── Configurable settings ───────────────────────────────────────────────────
 
@@ -174,7 +174,7 @@ Then recover state:
 ## Phase 1 — Schedule & Target Initialization
 
 On first run:
-1. Create collection schedule using schedule_create based on `update_frequency`
+1. Create collection schedule using cron_create based on `update_frequency`
 2. Parse the `target_subject` — identify what type of target it is:
    - Company: look for products, leadership, funding, partnerships, news
    - Person: look for publications, talks, job changes, social activity

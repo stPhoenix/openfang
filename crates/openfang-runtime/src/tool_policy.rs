@@ -236,8 +236,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 const SUBAGENT_DENY_ALWAYS: &[&str] = &[
     "cron_create",
     "cron_cancel",
-    "schedule_create",
-    "schedule_delete",
     "hand_activate",
     "hand_deactivate",
     "process_start",
@@ -416,8 +414,6 @@ mod tests {
         let tools: Vec<String> = vec![
             "cron_create",
             "cron_cancel",
-            "schedule_create",
-            "schedule_delete",
             "hand_activate",
             "hand_deactivate",
             "process_start",

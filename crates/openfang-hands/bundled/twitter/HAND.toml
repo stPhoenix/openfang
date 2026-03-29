@@ -3,7 +3,7 @@ name = "Twitter Hand"
 description = "Autonomous Twitter/X manager — content creation, scheduled posting, engagement, and performance tracking"
 category = "communication"
 icon = "\U0001D54F"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "cron_create", "cron_list", "cron_cancel", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
 
 [[requires]]
 key = "TWITTER_BEARER_TOKEN"
@@ -211,7 +211,7 @@ Recover state:
 ## Phase 1 — Schedule & Strategy Setup
 
 On first run:
-1. Create posting schedules using schedule_create based on `post_frequency`:
+1. Create posting schedules using cron_create based on `post_frequency`:
    - 1_daily: schedule at optimal time (10 AM)
    - 3_daily: schedule at 8 AM, 12 PM, 5 PM
    - 5_daily: schedule at 7 AM, 10 AM, 12 PM, 3 PM, 6 PM

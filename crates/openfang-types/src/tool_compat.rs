@@ -72,9 +72,9 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "task_complete"
             | "task_list"
             | "event_publish"
-            | "schedule_create"
-            | "schedule_list"
-            | "schedule_delete"
+            | "cron_create"
+            | "cron_list"
+            | "cron_cancel"
             | "image_analyze"
             | "location_get"
     )
@@ -196,9 +196,9 @@ mod tests {
             "task_complete",
             "task_list",
             "event_publish",
-            "schedule_create",
-            "schedule_list",
-            "schedule_delete",
+            "cron_create",
+            "cron_list",
+            "cron_cancel",
             "image_analyze",
             "location_get",
         ];

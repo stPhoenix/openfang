@@ -258,18 +258,18 @@ mod tests {
             if einstein_ids.contains(&id) {
                 let def = parse_bundled(id, toml_content, skill_content).unwrap();
                 assert!(
-                    def.tools.contains(&"schedule_create".to_string()),
-                    "Einstein hand '{}' must have schedule_create tool",
+                    def.tools.contains(&"cron_create".to_string()),
+                    "Einstein hand '{}' must have cron_create tool",
                     id
                 );
                 assert!(
-                    def.tools.contains(&"schedule_list".to_string()),
-                    "Einstein hand '{}' must have schedule_list tool",
+                    def.tools.contains(&"cron_list".to_string()),
+                    "Einstein hand '{}' must have cron_list tool",
                     id
                 );
                 assert!(
-                    def.tools.contains(&"schedule_delete".to_string()),
-                    "Einstein hand '{}' must have schedule_delete tool",
+                    def.tools.contains(&"cron_cancel".to_string()),
+                    "Einstein hand '{}' must have cron_cancel tool",
                     id
                 );
             }
@@ -332,18 +332,18 @@ mod tests {
             req_keys.contains(&"INFISICAL_CLIENT_SECRET"),
             "must require INFISICAL_CLIENT_SECRET"
         );
-        // Einstein scheduling tools
+        // Cron scheduling tools
         assert!(
-            def.tools.contains(&"schedule_create".to_string()),
-            "must have schedule_create"
+            def.tools.contains(&"cron_create".to_string()),
+            "must have cron_create"
         );
         assert!(
-            def.tools.contains(&"schedule_list".to_string()),
-            "must have schedule_list"
+            def.tools.contains(&"cron_list".to_string()),
+            "must have cron_list"
         );
         assert!(
-            def.tools.contains(&"schedule_delete".to_string()),
-            "must have schedule_delete"
+            def.tools.contains(&"cron_cancel".to_string()),
+            "must have cron_cancel"
         );
         // Memory tools
         assert!(

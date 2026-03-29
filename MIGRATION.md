@@ -241,9 +241,9 @@ These tools have no OpenClaw equivalent:
 | `task_complete` | Mark a task as complete |
 | `task_list` | List tasks by status |
 | `event_publish` | Publish a custom event to the event bus |
-| `schedule_create` | Create a scheduled job |
-| `schedule_list` | List scheduled jobs |
-| `schedule_delete` | Delete a scheduled job |
+| `cron_create` | Create a scheduled/cron job (supports natural language schedules) |
+| `cron_list` | List scheduled/cron jobs |
+| `cron_cancel` | Cancel a scheduled/cron job |
 | `image_analyze` | Analyze an image |
 | `location_get` | Get location information |
 

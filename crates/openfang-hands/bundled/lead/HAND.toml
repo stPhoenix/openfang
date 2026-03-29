@@ -3,7 +3,7 @@ name = "Lead Hand"
 description = "Autonomous lead generation — discovers, enriches, and delivers qualified leads on a schedule"
 category = "data"
 icon = "\U0001F4CA"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "cron_create", "cron_list", "cron_cancel", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query"]
 
 # ─── Configurable settings ───────────────────────────────────────────────────
 
@@ -188,7 +188,7 @@ Then set your approach:
 On first run:
 1. Check memory_recall for `lead_hand_state` — if it exists, you're resuming
 2. Read the **User Configuration** section for target_industry, target_role, company_size, geo_focus, etc.
-3. Create your delivery schedule using schedule_create based on `delivery_schedule` setting
+3. Create your delivery schedule using cron_create based on `delivery_schedule` setting
 4. Load any existing lead database from `leads_database.json` via file_read (if it exists)
 
 On subsequent runs:

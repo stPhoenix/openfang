@@ -3,7 +3,7 @@ name = "Predictor Hand"
 description = "Autonomous future predictor — collects signals, builds reasoning chains, makes calibrated predictions, and tracks accuracy"
 category = "data"
 icon = "\U0001F52E"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "cron_create", "cron_list", "cron_cancel", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query"]
 
 # ─── Configurable settings ───────────────────────────────────────────────────
 
@@ -194,7 +194,7 @@ Then recover state:
 ## Phase 1 — Schedule & Domain Setup
 
 On first run:
-1. Create report schedule using schedule_create based on `report_frequency`
+1. Create report schedule using cron_create based on `report_frequency`
 2. Build domain-specific query templates based on `prediction_domain`:
    - **Tech**: product launches, funding, adoption metrics, regulatory, open source
    - **Finance**: earnings, macro indicators, commodity prices, central bank, M&A

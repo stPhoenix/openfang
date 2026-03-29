@@ -5,7 +5,7 @@ category = "security"
 icon = "🔐"
 tools = [
   # Core Einstein tools (schedule + memory + knowledge graph + event bus)
-  "schedule_create", "schedule_list", "schedule_delete",
+  "cron_create", "cron_list", "cron_cancel",
   "memory_store", "memory_recall",
   "knowledge_add_entity", "knowledge_add_relation", "knowledge_query",
   "event_publish",
@@ -147,7 +147,7 @@ Run this every time you are activated (scheduled or on-demand).
 
 4. **Check for existing schedule**:
    ```
-   schedule_list
+   cron_list
    ```
    If no `infisical-sync` schedule exists, create one (see Phase 1).
 
@@ -167,7 +167,7 @@ If no schedule for this hand exists:
 
 2. Create schedule:
    ```
-   schedule_create
+   cron_create
      name: "infisical-sync"
      interval_minutes: <interval>
      description: "Pull secrets from Infisical into local vault"
@@ -175,7 +175,7 @@ If no schedule for this hand exists:
 
 3. Log to memory:
    ```
-   memory_store "infisical_sync_schedule_created" "<ISO timestamp>"
+   memory_store "infisical_sync_cron_created" "<ISO timestamp>"
    ```
 
 4. Add Infisical instance to knowledge graph:
