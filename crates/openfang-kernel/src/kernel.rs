@@ -5887,6 +5887,36 @@ impl KernelHandle for OpenFangKernel {
         Ok(result.response)
     }
 
+    async fn send_to_agent_with_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let id: AgentId = match agent_id.parse() {
+            Ok(id) => id,
+            Err(_) => self
+                .registry
+                .find_by_name(agent_id)
+                .map(|e| e.id)
+                .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.send_message(id, message),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(result.response),
+            Ok(Err(e)) => Err(format!("Send failed: {e}")),
+            Err(_) => Err(format!(
+                "agent_send timed out after {timeout_secs}s. \
+                 The target agent may still be processing. \
+                 Consider using agent_delegate or the task queue for long-running work."
+            )),
+        }
+    }
+
     fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
         self.registry
             .list()
@@ -6050,10 +6080,24 @@ impl KernelHandle for OpenFangKernel {
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String> {
-        self.memory
+        let task_id = self
+            .memory
             .task_post(title, description, assigned_to, created_by)
             .await
-            .map_err(|e| format!("Task post failed: {e}"))
+            .map_err(|e| format!("Task post failed: {e}"))?;
+
+        // Emit TaskEvent::Posted so proactive agents can react
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Task(TaskEvent::Posted {
+                task_id: task_id.clone(),
+                title: title.to_string(),
+            }),
+        );
+        OpenFangKernel::publish_event(self, event).await;
+
+        Ok(task_id)
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
@@ -6067,7 +6111,20 @@ impl KernelHandle for OpenFangKernel {
         self.memory
             .task_complete(task_id, result)
             .await
-            .map_err(|e| format!("Task complete failed: {e}"))
+            .map_err(|e| format!("Task complete failed: {e}"))?;
+
+        // Emit TaskEvent::Completed so agents watching for task completion are notified
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Task(TaskEvent::Completed {
+                task_id: task_id.to_string(),
+                result: result.to_string(),
+            }),
+        );
+        OpenFangKernel::publish_event(self, event).await;
+
+        Ok(())
     }
 
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
@@ -6603,6 +6660,138 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
+    }
+
+    async fn delegate_to_agent(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        timeout_secs: Option<u64>,
+    ) -> Result<String, String> {
+        let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(120));
+
+        // Phase 1: Spawn with capability inheritance check
+        let (agent_id_str, agent_name) =
+            self.spawn_agent_checked(manifest_toml, parent_id, parent_caps)
+                .await?;
+        let agent_id: AgentId = agent_id_str
+            .parse()
+            .map_err(|e| format!("Invalid agent ID: {e}"))?;
+
+        tracing::info!(
+            agent = %agent_name,
+            id = %agent_id,
+            timeout_secs = timeout.as_secs(),
+            "agent_delegate: specialist spawned, sending message"
+        );
+
+        // Phase 2: Send message with timeout
+        let result = tokio::time::timeout(timeout, self.send_message(agent_id, message)).await;
+
+        // Phase 3: Always clean up the specialist agent
+        if let Err(e) = self.kill_agent(agent_id) {
+            tracing::warn!(agent = %agent_id, "agent_delegate cleanup failed: {e}");
+        }
+
+        // Phase 4: Return result or error
+        match result {
+            Ok(Ok(loop_result)) => Ok(loop_result.response),
+            Ok(Err(e)) => Err(format!("Delegate to '{agent_name}' failed: {e}")),
+            Err(_) => {
+                // Check for progress updates from the agent
+                let progress = self
+                    .memory_recall(&format!("progress/{agent_id}"))
+                    .ok()
+                    .flatten()
+                    .map(|v| format!(" Last progress: {v}"))
+                    .unwrap_or_default();
+                Err(format!(
+                    "agent_delegate timed out after {}s for agent '{agent_name}'.{progress}",
+                    timeout.as_secs()
+                ))
+            }
+        }
+    }
+
+    async fn delegate_async(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        // Phase 1: Spawn with capability inheritance check
+        let (agent_id_str, agent_name) =
+            self.spawn_agent_checked(manifest_toml, parent_id, parent_caps)
+                .await?;
+        let agent_id: AgentId = agent_id_str
+            .parse()
+            .map_err(|e| format!("Invalid agent ID: {e}"))?;
+
+        let delegation_id = uuid::Uuid::new_v4().to_string();
+        let event_type = callback_event_type
+            .unwrap_or("delegation_completed")
+            .to_string();
+        let event_type_for_response = event_type.clone();
+        let message_owned = message.to_string();
+        let delegation_id_clone = delegation_id.clone();
+        let agent_name_clone = agent_name.clone();
+
+        tracing::info!(
+            delegation_id = %delegation_id,
+            agent = %agent_name,
+            id = %agent_id,
+            "agent_delegate_async: specialist spawned, running in background"
+        );
+
+        // Phase 2: Spawn background task to handle execution + cleanup + callback
+        if let Some(weak) = self.self_handle.get() {
+            if let Some(kernel) = weak.upgrade() {
+                tokio::spawn(async move {
+                    let result = kernel.send_message(agent_id, &message_owned).await;
+
+                    // Always clean up
+                    if let Err(e) = kernel.kill_agent(agent_id) {
+                        tracing::warn!(agent = %agent_id, "delegate_async cleanup failed: {e}");
+                    }
+
+                    // Publish completion event
+                    let (success, response) = match result {
+                        Ok(r) => (true, r.response),
+                        Err(e) => (false, format!("{e}")),
+                    };
+                    let payload = serde_json::json!({
+                        "type": event_type,
+                        "data": {
+                            "delegation_id": delegation_id_clone,
+                            "agent_id": agent_id.to_string(),
+                            "agent_name": agent_name_clone,
+                            "success": success,
+                            "result": response,
+                        }
+                    });
+                    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                    let event = Event::new(
+                        agent_id,
+                        EventTarget::Broadcast,
+                        EventPayload::Custom(payload_bytes),
+                    );
+                    kernel.publish_event(event).await;
+                });
+            }
+        }
+
+        // Phase 3: Return immediately
+        Ok(serde_json::json!({
+            "delegation_id": delegation_id,
+            "agent_id": agent_id_str,
+            "agent_name": agent_name,
+            "callback_event_type": event_type_for_response,
+        })
+        .to_string())
     }
 }
 

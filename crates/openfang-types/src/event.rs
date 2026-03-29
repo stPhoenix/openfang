@@ -82,8 +82,30 @@ pub enum EventPayload {
     Network(NetworkEvent),
     /// System event (health, resources).
     System(SystemEvent),
+    /// Task queue event (task posted, completed, etc.).
+    Task(TaskEvent),
     /// User-defined payload.
     Custom(Vec<u8>),
+}
+
+/// Task queue lifecycle event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum TaskEvent {
+    /// A task was posted to the queue.
+    Posted {
+        /// The task ID.
+        task_id: String,
+        /// The task title.
+        title: String,
+    },
+    /// A task was completed.
+    Completed {
+        /// The task ID.
+        task_id: String,
+        /// The completion result.
+        result: String,
+    },
 }
 
 /// A message between agents or from user to agent.

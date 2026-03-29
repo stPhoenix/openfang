@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
-use openfang_types::event::{Event, EventPayload, LifecycleEvent, SystemEvent};
+use openfang_types::event::{Event, EventPayload, LifecycleEvent, SystemEvent, TaskEvent};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -56,6 +56,8 @@ pub enum TriggerPattern {
     All,
     /// Match custom events by content substring.
     ContentMatch { substring: String },
+    /// Match when a task is completed (or any task if pattern is "*").
+    TaskCompleted { task_id_pattern: String },
 }
 
 /// A registered trigger definition.
@@ -362,6 +364,13 @@ fn matches_pattern(pattern: &TriggerPattern, event: &Event, description: &str) -
         TriggerPattern::ContentMatch { substring } => description
             .to_lowercase()
             .contains(&substring.to_lowercase()),
+        TriggerPattern::TaskCompleted { task_id_pattern } => {
+            if let EventPayload::Task(TaskEvent::Completed { task_id, .. }) = &event.payload {
+                task_id_pattern == "*" || task_id == task_id_pattern
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -447,6 +456,17 @@ fn describe_event(event: &Event) -> String {
             } => {
                 format!(
                     "Health check failed: agent {agent_id}, unresponsive for {unresponsive_secs}s"
+                )
+            }
+        },
+        EventPayload::Task(te) => match te {
+            TaskEvent::Posted { task_id, title } => {
+                format!("Task posted: '{title}' (id: {task_id})")
+            }
+            TaskEvent::Completed { task_id, result } => {
+                format!(
+                    "Task completed: id={task_id}, result={}",
+                    openfang_types::truncate_str(result, 200)
                 )
             }
         },

@@ -225,6 +225,9 @@ pub fn parse_condition(condition: &str) -> Option<TriggerPattern> {
             "lifecycle" => Some(TriggerPattern::Lifecycle),
             "system" => Some(TriggerPattern::System),
             "memory_update" => Some(TriggerPattern::MemoryUpdate),
+            "task_completed" => Some(TriggerPattern::TaskCompleted {
+                task_id_pattern: "*".to_string(),
+            }),
             other => {
                 warn!(condition = %condition, "Unknown event condition: {other}");
                 None

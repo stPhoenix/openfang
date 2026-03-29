@@ -37,6 +37,19 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// Send a message to another agent with a timeout in seconds.
+    /// Returns an error if the target agent does not respond within the deadline.
+    async fn send_to_agent_with_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        // Default: delegate to send_to_agent (no timeout enforcement)
+        let _ = timeout_secs;
+        self.send_to_agent(agent_id, message).await
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 
@@ -260,6 +273,36 @@ pub trait KernelHandle: Send + Sync {
     /// Called by the agent loop before long LLM calls to prevent heartbeat false-positives.
     fn touch_agent(&self, agent_id: &str) {
         let _ = agent_id;
+    }
+
+    /// Spawn a specialist agent, send it a message, get the response, and kill it.
+    /// Combines agent_spawn + agent_send + agent_kill into one atomic operation.
+    /// The spawned agent is always cleaned up, even on error or timeout.
+    async fn delegate_to_agent(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        timeout_secs: Option<u64>,
+    ) -> Result<String, String> {
+        let _ = (manifest_toml, message, parent_id, parent_caps, timeout_secs);
+        Err("Agent delegation not available".to_string())
+    }
+
+    /// Spawn a specialist agent asynchronously and return immediately.
+    /// A background task sends the message, collects the response, kills the agent,
+    /// and publishes a completion event.
+    async fn delegate_async(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (manifest_toml, message, parent_id, parent_caps, callback_event_type);
+        Err("Async agent delegation not available".to_string())
     }
 
     /// Spawn an agent with capability inheritance enforcement.

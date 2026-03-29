@@ -146,7 +146,14 @@ pub fn resolve_tool_access(tool_name: &str, policy: &ToolPolicy, depth: u32) -> 
 
 /// Check if a tool name is related to subagent spawning.
 fn is_subagent_tool(name: &str) -> bool {
-    name == "agent_spawn" || name == "agent_call" || name == "spawn_agent"
+    matches!(
+        name,
+        "agent_spawn"
+            | "agent_call"
+            | "spawn_agent"
+            | "agent_delegate"
+            | "agent_delegate_async"
+    )
 }
 
 /// Check if a tool name matches any expanded group tool names.
@@ -242,7 +249,12 @@ const SUBAGENT_DENY_ALWAYS: &[&str] = &[
 ];
 
 /// Tools denied to leaf subagents (depth >= max_depth - 1). Prevents deep spawn chains.
-const SUBAGENT_DENY_LEAF: &[&str] = &["agent_spawn", "agent_kill"];
+const SUBAGENT_DENY_LEAF: &[&str] = &[
+    "agent_spawn",
+    "agent_kill",
+    "agent_delegate",
+    "agent_delegate_async",
+];
 
 /// Filter a list of tools based on the current agent depth.
 ///

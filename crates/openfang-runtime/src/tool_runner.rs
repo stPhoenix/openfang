@@ -296,6 +296,8 @@ pub async fn execute_tool(
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
+        "agent_delegate" => tool_agent_delegate(input, kernel, caller_agent_id).await,
+        "agent_delegate_async" => tool_agent_delegate_async(input, kernel, caller_agent_id).await,
 
         // Self-inspection / self-modification tools
         "agent_self_inspect" => tool_agent_self_inspect(kernel, caller_agent_id),
@@ -650,7 +652,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
-                    "message": { "type": "string", "description": "The message to send to the agent" }
+                    "message": { "type": "string", "description": "The message to send to the agent" },
+                    "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for response (optional, default: no timeout)" }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -686,6 +689,45 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "agent_id": { "type": "string", "description": "The agent's UUID to kill" }
                 },
                 "required": ["agent_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_delegate".to_string(),
+            description: "Spawn a specialist agent, send it a task, get the result, and auto-cleanup. \
+                          Combines agent_spawn + agent_send + agent_kill into one atomic operation.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "manifest_toml": {
+                        "type": "string",
+                        "description": "TOML manifest for the specialist agent (must include name, module, [model], and [capabilities])"
+                    },
+                    "message": { "type": "string", "description": "The task/message to send to the specialist" },
+                    "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for response (default: 120)" }
+                },
+                "required": ["manifest_toml", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_delegate_async".to_string(),
+            description: "Spawn a specialist agent and send it a task asynchronously. Returns immediately \
+                          with a delegation_id. The specialist runs in the background and publishes a \
+                          'delegation_completed' event when done. Use triggers or event_publish conditions \
+                          to be notified of completion.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "manifest_toml": {
+                        "type": "string",
+                        "description": "TOML manifest for the specialist agent (must include name, module, [model], and [capabilities])"
+                    },
+                    "message": { "type": "string", "description": "The task/message to send to the specialist" },
+                    "callback_event_type": {
+                        "type": "string",
+                        "description": "Custom event type for completion notification (default: 'delegation_completed')"
+                    }
+                },
+                "required": ["manifest_toml", "message"]
             }),
         },
         // --- Self-inspection / self-modification tools ---
@@ -1635,9 +1677,16 @@ async fn tool_agent_send(
         ));
     }
 
+    let timeout_secs = input
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64());
+
     AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
-            kh.send_to_agent(agent_id, message).await
+            match timeout_secs {
+                Some(secs) => kh.send_to_agent_with_timeout(agent_id, message, secs).await,
+                None => kh.send_to_agent(agent_id, message).await,
+            }
         })
         .await
 }
@@ -1683,6 +1732,124 @@ fn tool_agent_kill(
         .ok_or("Missing 'agent_id' parameter")?;
     kh.kill_agent(agent_id)?;
     Ok(format!("Agent {agent_id} killed successfully."))
+}
+
+async fn tool_agent_delegate(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let manifest_toml = input["manifest_toml"]
+        .as_str()
+        .ok_or("Missing 'manifest_toml' parameter")?;
+    let message = input["message"]
+        .as_str()
+        .ok_or("Missing 'message' parameter")?;
+    let timeout_secs = input.get("timeout_seconds").and_then(|v| v.as_u64());
+
+    // Check + increment inter-agent call depth
+    let current_depth = AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0);
+    if current_depth >= MAX_AGENT_CALL_DEPTH {
+        return Err(format!(
+            "Inter-agent call depth exceeded (max {}). \
+             A->B->C chain is too deep. Use the task queue instead.",
+            MAX_AGENT_CALL_DEPTH
+        ));
+    }
+
+    // Resolve parent capabilities for inheritance check
+    let parent_caps = if let Some(pid) = caller_agent_id {
+        if let Ok(manifest_json) = kh.get_agent_manifest(pid) {
+            manifest_json
+                .get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .and_then(|t| t.as_array())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .map(|t| openfang_types::capability::Capability::ToolInvoke(t.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    AGENT_CALL_DEPTH
+        .scope(std::cell::Cell::new(current_depth + 1), async {
+            kh.delegate_to_agent(
+                manifest_toml,
+                message,
+                caller_agent_id,
+                &parent_caps,
+                timeout_secs,
+            )
+            .await
+        })
+        .await
+}
+
+async fn tool_agent_delegate_async(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let manifest_toml = input["manifest_toml"]
+        .as_str()
+        .ok_or("Missing 'manifest_toml' parameter")?;
+    let message = input["message"]
+        .as_str()
+        .ok_or("Missing 'message' parameter")?;
+    let callback_event_type = input
+        .get("callback_event_type")
+        .and_then(|v| v.as_str());
+
+    // Check depth
+    let current_depth = AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0);
+    if current_depth >= MAX_AGENT_CALL_DEPTH {
+        return Err(format!(
+            "Inter-agent call depth exceeded (max {}). \
+             A->B->C chain is too deep. Use the task queue instead.",
+            MAX_AGENT_CALL_DEPTH
+        ));
+    }
+
+    // Resolve parent capabilities
+    let parent_caps = if let Some(pid) = caller_agent_id {
+        if let Ok(manifest_json) = kh.get_agent_manifest(pid) {
+            manifest_json
+                .get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .and_then(|t| t.as_array())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .map(|t| openfang_types::capability::Capability::ToolInvoke(t.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    kh.delegate_async(
+        manifest_toml,
+        message,
+        caller_agent_id,
+        &parent_caps,
+        callback_event_type,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
