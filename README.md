@@ -31,6 +31,15 @@
 >
 > OpenFang is feature-complete but still pre-1.0. You may encounter rough edges or breaking changes between minor versions. We ship fast and fix fast. Pin to a specific commit for production use until v1.0. [Report issues here.](https://github.com/RightNow-AI/openfang/issues)
 
+### Fork Patches
+
+- **Taint tracking for inter-agent channels** — PII and secret auto-detection (email, SSN, phone, credit card, API keys) now guards `agent_send`, `memory_store`, `task_post`, and `event_publish`. Per-agent configurable: `block` (default), `approve` (one-time approval gate), or `allow`. New sinks: `agent_message`, `memory_store`, `data_channel`.
+- **Agent delegation tools** — `agent_delegate` and `agent_delegate_async` for structured task delegation between agents, with timeout support and `TaskEvent` completion triggers.
+- **Cron scheduling** — Replaced `schedule_*` tools with `cron_create`, `cron_list`, `cron_cancel` for consistent scheduling with natural language support.
+- **Self-inspection & self-modification** — Agents can now inspect and modify their own manifests at runtime via `agent_self_inspect` and `agent_self_modify`.
+- **Auth-gated reads** — `require_auth_for_reads` flag enforces authentication on most GET endpoints.
+- **Bug fixes** — Resolved 10+ issues (#771, #811, #752, #772, #661, #875, #872, #867, #824, #833, #766).
+
 ---
 
 ## What is OpenFang?
