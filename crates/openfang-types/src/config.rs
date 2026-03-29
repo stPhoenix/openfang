@@ -803,6 +803,35 @@ pub enum ExecSecurityMode {
     Full,
 }
 
+/// Resource limits applied to child processes via `setrlimit` on Unix.
+///
+/// These limits are enforced in the subprocess sandbox to prevent resource
+/// abuse (fork bombs, memory exhaustion, CPU hogging) by shell commands
+/// and Python/Node.js skill processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceLimits {
+    /// Maximum virtual memory in bytes. Default: 512 MB.
+    pub max_memory_bytes: u64,
+    /// Maximum CPU time in seconds. Default: 30.
+    pub max_cpu_secs: u64,
+    /// Maximum file size in bytes. Default: 100 MB.
+    pub max_file_bytes: u64,
+    /// Maximum number of child processes. Default: 50.
+    pub max_processes: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: 512 * 1024 * 1024,
+            max_cpu_secs: 30,
+            max_file_bytes: 100 * 1024 * 1024,
+            max_processes: 50,
+        }
+    }
+}
+
 /// Shell/exec security policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -822,6 +851,9 @@ pub struct ExecPolicy {
     /// produce no stdout/stderr output for this duration. Default: 30.
     #[serde(default = "default_no_output_timeout")]
     pub no_output_timeout_secs: u64,
+    /// Resource limits applied to child processes via setrlimit (Unix only).
+    #[serde(default)]
+    pub resource_limits: ResourceLimits,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -843,6 +875,7 @@ impl Default for ExecPolicy {
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
+            resource_limits: ResourceLimits::default(),
         }
     }
 }

@@ -362,6 +362,25 @@ pub async fn send_message(
         );
     }
 
+    // SECURITY: Scan incoming message for prompt injection patterns.
+    {
+        use openfang_types::prompt_guard;
+        let verdict = prompt_guard::scan_all(&req.message);
+        if verdict.has_critical() {
+            let patterns: Vec<&str> = verdict
+                .findings()
+                .iter()
+                .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                .map(|f| f.pattern.as_str())
+                .collect();
+            tracing::warn!(
+                agent_id = %id,
+                patterns = ?patterns,
+                "Prompt injection detected in API message"
+            );
+        }
+    }
+
     // Resolve file attachments into image content blocks.
     // Pass them as content_blocks so the LLM receives them in the current turn
     // (not as a separate session message which the LLM may not process).
@@ -579,7 +598,8 @@ pub async fn get_agent_session(
                                         msg.get_mut("tools").and_then(|v| v.as_array_mut())
                                     {
                                         if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
-                                            tool_obj["result"] = serde_json::Value::String(result.clone());
+                                            tool_obj["result"] =
+                                                serde_json::Value::String(result.clone());
                                             tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }
@@ -6784,6 +6804,8 @@ pub async fn mcp_http(
                 None
             },
             Some(&*state.kernel.process_manager),
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
 
@@ -11519,9 +11541,10 @@ pub async fn wizard_spawn(
             );
         }
     };
-    match state.kernel.spawn_agent(
-        toml::from_str::<AgentManifest>(&toml).unwrap_or(plan.manifest),
-    ) {
+    match state
+        .kernel
+        .spawn_agent(toml::from_str::<AgentManifest>(&toml).unwrap_or(plan.manifest))
+    {
         Ok(agent_id) => (
             StatusCode::OK,
             Json(serde_json::json!({

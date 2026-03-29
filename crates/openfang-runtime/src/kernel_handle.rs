@@ -308,7 +308,13 @@ pub trait KernelHandle: Send + Sync {
         parent_caps: &[openfang_types::capability::Capability],
         callback_event_type: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (manifest_toml, message, parent_id, parent_caps, callback_event_type);
+        let _ = (
+            manifest_toml,
+            message,
+            parent_id,
+            parent_caps,
+            callback_event_type,
+        );
         Err("Async agent delegation not available".to_string())
     }
 

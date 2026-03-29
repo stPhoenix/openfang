@@ -199,6 +199,18 @@ pub async fn run_python_agent(
         }
     }
 
+    // SECURITY: Apply resource limits to the Python child process (Unix only).
+    // Prevents runaway scripts from exhausting system resources.
+    #[cfg(unix)]
+    {
+        let limits = openfang_types::config::ResourceLimits::default();
+        // SAFETY: pre_exec runs after fork(), before exec(). setrlimit is
+        // async-signal-safe per POSIX.
+        unsafe {
+            cmd.pre_exec(move || crate::subprocess_sandbox::apply_resource_limits(&limits));
+        }
+    }
+
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             PythonError::PythonNotFound(format!(

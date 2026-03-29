@@ -105,63 +105,34 @@ impl SkillVerifier {
     /// Scan prompt content (Markdown body from SKILL.md) for injection attacks.
     ///
     /// This catches the common patterns used in the 341 malicious skills
-    /// discovered on ClawHub (Feb 2026).
+    /// discovered on ClawHub (Feb 2026). Delegates to the shared `prompt_guard`
+    /// module for pattern matching.
     pub fn scan_prompt_content(content: &str) -> Vec<SkillWarning> {
+        use openfang_types::prompt_guard::{self, FindingSeverity};
+
         let mut warnings = Vec::new();
-        let lower = content.to_lowercase();
 
-        // --- Critical: prompt override attempts ---
-        let injection_patterns = [
-            "ignore previous instructions",
-            "ignore all previous",
-            "disregard previous",
-            "forget your instructions",
-            "you are now",
-            "new instructions:",
-            "system prompt override",
-            "ignore the above",
-            "do not follow",
-            "override system",
-        ];
-        for pattern in &injection_patterns {
-            if lower.contains(pattern) {
-                warnings.push(SkillWarning {
-                    severity: WarningSeverity::Critical,
-                    message: format!("Prompt injection detected: contains '{pattern}'"),
-                });
-            }
-        }
-
-        // --- Warning: data exfiltration patterns ---
-        let exfil_patterns = [
-            "send to http",
-            "send to https",
-            "post to http",
-            "post to https",
-            "exfiltrate",
-            "forward all",
-            "send all data",
-            "base64 encode and send",
-            "upload to",
-        ];
-        for pattern in &exfil_patterns {
-            if lower.contains(pattern) {
-                warnings.push(SkillWarning {
-                    severity: WarningSeverity::Warning,
-                    message: format!("Potential data exfiltration pattern: '{pattern}'"),
-                });
-            }
-        }
-
-        // --- Warning: shell command references in prompt text ---
-        let shell_patterns = ["rm -rf", "chmod ", "sudo "];
-        for pattern in &shell_patterns {
-            if lower.contains(pattern) {
-                warnings.push(SkillWarning {
-                    severity: WarningSeverity::Warning,
-                    message: format!("Shell command reference in prompt: '{pattern}'"),
-                });
-            }
+        // Use the shared prompt_guard scanner for injection, exfiltration, and shell patterns.
+        let verdict = prompt_guard::scan_all(content);
+        for finding in verdict.findings() {
+            let severity = match finding.severity {
+                FindingSeverity::Critical => WarningSeverity::Critical,
+                FindingSeverity::Warning => WarningSeverity::Warning,
+                FindingSeverity::Info => WarningSeverity::Info,
+            };
+            let message = match finding.category {
+                "prompt_injection" => {
+                    format!("Prompt injection detected: contains '{}'", finding.pattern)
+                }
+                "data_exfiltration" => {
+                    format!("Potential data exfiltration pattern: '{}'", finding.pattern)
+                }
+                "shell_reference" => {
+                    format!("Shell command reference in prompt: '{}'", finding.pattern)
+                }
+                _ => format!("{}: '{}'", finding.category, finding.pattern),
+            };
+            warnings.push(SkillWarning { severity, message });
         }
 
         // --- Info: excessive length ---

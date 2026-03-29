@@ -113,6 +113,11 @@ async fn execute_python(
     // Python needs PYTHONIOENCODING for UTF-8 output
     cmd.env("PYTHONIOENCODING", "utf-8");
 
+    // NOTE: Resource limits for skill processes are applied via the runtime's
+    // subprocess_sandbox when skills are executed through the tool_runner path.
+    // Direct skill execution here does not apply rlimits — use Docker sandbox
+    // for full isolation of untrusted skills.
+
     let mut child = cmd
         .spawn()
         .map_err(|e| SkillError::ExecutionFailed(format!("Failed to spawn Python: {e}")))?;

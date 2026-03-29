@@ -82,10 +82,66 @@ pub fn validate_executable_path(path: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Shell/exec allowlisting
+// Resource limits (Unix only)
 // ---------------------------------------------------------------------------
 
-use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+use openfang_types::config::{ExecPolicy, ExecSecurityMode, ResourceLimits};
+
+/// Apply resource limits to the current process via `setrlimit`.
+///
+/// This is designed to be called from a `pre_exec` closure on the child process
+/// after `fork()` but before `exec()`. Only calls POSIX async-signal-safe
+/// functions (`setrlimit` is async-signal-safe per POSIX).
+///
+/// # Safety
+/// Must only be called in a `pre_exec` context (after fork, before exec).
+#[cfg(unix)]
+pub fn apply_resource_limits(limits: &ResourceLimits) -> Result<(), std::io::Error> {
+    use std::io::{Error, ErrorKind};
+
+    // On Linux, __rlimit_resource_t is u32; on macOS it's c_int.
+    // Using libc::rlimit directly and calling setrlimit via the raw syscall
+    // avoids cross-platform type mismatches.
+    macro_rules! set_limit {
+        ($resource:expr, $value:expr) => {
+            if $value > 0 {
+                let rlim = libc::rlimit {
+                    rlim_cur: $value as libc::rlim_t,
+                    rlim_max: $value as libc::rlim_t,
+                };
+                let ret = unsafe { libc::setrlimit($resource, &rlim) };
+                if ret != 0 {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "setrlimit({}) failed: {}",
+                            stringify!($resource),
+                            Error::last_os_error()
+                        ),
+                    ));
+                }
+            }
+        };
+    }
+
+    // RLIMIT_AS: Maximum virtual memory (address space) in bytes.
+    set_limit!(libc::RLIMIT_AS, limits.max_memory_bytes);
+
+    // RLIMIT_CPU: Maximum CPU time in seconds.
+    set_limit!(libc::RLIMIT_CPU, limits.max_cpu_secs);
+
+    // RLIMIT_FSIZE: Maximum file size in bytes.
+    set_limit!(libc::RLIMIT_FSIZE, limits.max_file_bytes);
+
+    // RLIMIT_NPROC: Maximum number of processes for this user.
+    set_limit!(libc::RLIMIT_NPROC, limits.max_processes);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shell/exec allowlisting
+// ---------------------------------------------------------------------------
 
 /// SECURITY: Check for shell metacharacters that enable command injection.
 ///

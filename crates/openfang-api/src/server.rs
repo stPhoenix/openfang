@@ -242,10 +242,7 @@ pub async fn build_router(
         )
         .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
         // Wizard endpoints
-        .route(
-            "/api/wizard/plan",
-            axum::routing::post(routes::wizard_plan),
-        )
+        .route("/api/wizard/plan", axum::routing::post(routes::wizard_plan))
         .route(
             "/api/wizard/spawn",
             axum::routing::post(routes::wizard_spawn),

@@ -102,6 +102,89 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// Returns true for tools whose output comes from untrusted external sources
+/// and should be scanned for prompt injection before feeding to the LLM.
+fn is_high_risk_tool_result(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "web_fetch" | "web_search" | "agent_send" | "agent_delegate" | "agent_delegate_async"
+    ) || tool_name.starts_with("mcp_")
+}
+
+/// Apply the prompt guard policy to a tool result, scanning for injection
+/// patterns and optionally sanitizing or blocking the content.
+fn apply_prompt_guard_to_result(
+    content: &str,
+    tool_name: &str,
+    policy: &openfang_types::prompt_guard::PromptGuardPolicy,
+) -> String {
+    use openfang_types::prompt_guard::{self, PromptGuardMode};
+
+    match policy.mode {
+        PromptGuardMode::Off => content.to_string(),
+        PromptGuardMode::Warn => {
+            let verdict = prompt_guard::scan_all(content);
+            if verdict.has_critical() {
+                let patterns: Vec<&str> = verdict
+                    .findings()
+                    .iter()
+                    .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                    .map(|f| f.pattern.as_str())
+                    .collect();
+                warn!(
+                    tool = tool_name,
+                    patterns = ?patterns,
+                    "Prompt injection detected in tool result (warn mode — passing through)"
+                );
+            }
+            content.to_string()
+        }
+        PromptGuardMode::Sanitize => {
+            let verdict = prompt_guard::scan_all(content);
+            if verdict.has_critical() {
+                let patterns: Vec<&str> = verdict
+                    .findings()
+                    .iter()
+                    .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                    .map(|f| f.pattern.as_str())
+                    .collect();
+                warn!(
+                    tool = tool_name,
+                    patterns = ?patterns,
+                    "Prompt injection detected in tool result — sanitizing"
+                );
+                prompt_guard::sanitize(content)
+            } else {
+                content.to_string()
+            }
+        }
+        PromptGuardMode::Block => {
+            let verdict = prompt_guard::scan_all(content);
+            if verdict.has_critical() {
+                let patterns: Vec<&str> = verdict
+                    .findings()
+                    .iter()
+                    .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                    .map(|f| f.pattern.as_str())
+                    .collect();
+                warn!(
+                    tool = tool_name,
+                    patterns = ?patterns,
+                    "Prompt injection detected in tool result — blocking"
+                );
+                format!(
+                    "[SECURITY] Tool '{}' returned content containing prompt injection patterns ({}). \
+                     The result has been blocked for safety. Do NOT retry this tool with the same input.",
+                    tool_name,
+                    patterns.join(", ")
+                )
+            } else {
+                content.to_string()
+            }
+        }
+    }
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -778,6 +861,8 @@ pub async fn run_agent_loop(
                             tts_engine,
                             docker_config,
                             process_manager,
+                            Some(&manifest.capabilities),
+                            Some(&manifest.prompt_guard),
                         ),
                     )
                     .await
@@ -813,6 +898,18 @@ pub async fn run_agent_loop(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
+
+                    // Prompt guard: scan/sanitize tool results from high-risk tools
+                    // before they are fed back to the LLM as context.
+                    let content = if is_high_risk_tool_result(&tool_call.name) {
+                        apply_prompt_guard_to_result(
+                            &content,
+                            &tool_call.name,
+                            &manifest.prompt_guard,
+                        )
+                    } else {
+                        content
+                    };
 
                     // Append warning if verdict was Warn
                     let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
@@ -1931,6 +2028,8 @@ pub async fn run_agent_loop_streaming(
                             tts_engine,
                             docker_config,
                             process_manager,
+                            Some(&manifest.capabilities),
+                            Some(&manifest.prompt_guard),
                         ),
                     )
                     .await
@@ -1966,6 +2065,17 @@ pub async fn run_agent_loop_streaming(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
+
+                    // Prompt guard: scan/sanitize tool results from high-risk tools
+                    let content = if is_high_risk_tool_result(&tool_call.name) {
+                        apply_prompt_guard_to_result(
+                            &content,
+                            &tool_call.name,
+                            &manifest.prompt_guard,
+                        )
+                    } else {
+                        content
+                    };
 
                     // Append warning if verdict was Warn
                     let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {

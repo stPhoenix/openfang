@@ -2889,20 +2889,16 @@ impl OpenFangKernel {
         model: &str,
         explicit_provider: Option<&str>,
     ) -> KernelResult<()> {
-        let catalog_entry = self
-            .model_catalog
-            .read()
-            .ok()
-            .and_then(|catalog| {
-                // When the caller specifies a provider, use provider-aware lookup
-                // so we resolve the model on the correct provider — not a builtin
-                // from a different provider that happens to share the same name (#833).
-                if let Some(ep) = explicit_provider {
-                    catalog.find_model_for_provider(model, ep).cloned()
-                } else {
-                    catalog.find_model(model).cloned()
-                }
-            });
+        let catalog_entry = self.model_catalog.read().ok().and_then(|catalog| {
+            // When the caller specifies a provider, use provider-aware lookup
+            // so we resolve the model on the correct provider — not a builtin
+            // from a different provider that happens to share the same name (#833).
+            if let Some(ep) = explicit_provider {
+                catalog.find_model_for_provider(model, ep).cloned()
+            } else {
+                catalog.find_model(model).cloned()
+            }
+        });
         let provider = if let Some(ep) = explicit_provider {
             // User explicitly set the provider — use it as-is
             Some(ep.to_string())
@@ -6682,9 +6678,9 @@ impl KernelHandle for OpenFangKernel {
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(120));
 
         // Phase 1: Spawn with capability inheritance check
-        let (agent_id_str, agent_name) =
-            self.spawn_agent_checked(manifest_toml, parent_id, parent_caps)
-                .await?;
+        let (agent_id_str, agent_name) = self
+            .spawn_agent_checked(manifest_toml, parent_id, parent_caps)
+            .await?;
         let agent_id: AgentId = agent_id_str
             .parse()
             .map_err(|e| format!("Invalid agent ID: {e}"))?;
@@ -6733,9 +6729,9 @@ impl KernelHandle for OpenFangKernel {
         callback_event_type: Option<&str>,
     ) -> Result<String, String> {
         // Phase 1: Spawn with capability inheritance check
-        let (agent_id_str, agent_name) =
-            self.spawn_agent_checked(manifest_toml, parent_id, parent_caps)
-                .await?;
+        let (agent_id_str, agent_name) = self
+            .spawn_agent_checked(manifest_toml, parent_id, parent_caps)
+            .await?;
         let agent_id: AgentId = agent_id_str
             .parse()
             .map_err(|e| format!("Invalid agent ID: {e}"))?;
@@ -6912,6 +6908,7 @@ mod tests {
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             taint_policy: Default::default(),
+            prompt_guard: Default::default(),
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -6950,6 +6947,7 @@ mod tests {
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             taint_policy: Default::default(),
+            prompt_guard: Default::default(),
         }
     }
 

@@ -460,7 +460,10 @@ mod tests {
     fn test_policy_defaults() {
         let mgr = default_manager();
         let policy = mgr.policy();
-        assert_eq!(policy.require_approval, vec!["shell_exec".to_string(), "agent_self_modify".to_string()]);
+        assert_eq!(
+            policy.require_approval,
+            vec!["shell_exec".to_string(), "agent_self_modify".to_string()]
+        );
         assert_eq!(policy.timeout_secs, 60);
         assert!(!policy.auto_approve_autonomous);
     }

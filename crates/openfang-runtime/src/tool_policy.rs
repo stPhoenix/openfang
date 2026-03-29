@@ -148,11 +148,7 @@ pub fn resolve_tool_access(tool_name: &str, policy: &ToolPolicy, depth: u32) -> 
 fn is_subagent_tool(name: &str) -> bool {
     matches!(
         name,
-        "agent_spawn"
-            | "agent_call"
-            | "spawn_agent"
-            | "agent_delegate"
-            | "agent_delegate_async"
+        "agent_spawn" | "agent_call" | "spawn_agent" | "agent_delegate" | "agent_delegate_async"
     )
 }
 

@@ -497,6 +497,11 @@ pub struct AgentManifest {
     /// Default: block mode (hard deny on taint violations).
     #[serde(default)]
     pub taint_policy: crate::taint::TaintPolicy,
+    /// Per-agent prompt injection guard policy. Controls scanning and enforcement
+    /// on incoming messages, tool results, and inter-agent payloads.
+    /// Default: warn mode (scan and log, but allow through).
+    #[serde(default)]
+    pub prompt_guard: crate::prompt_guard::PromptGuardPolicy,
 }
 
 fn default_true() -> bool {
@@ -532,6 +537,7 @@ impl Default for AgentManifest {
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
             taint_policy: crate::taint::TaintPolicy::default(),
+            prompt_guard: crate::prompt_guard::PromptGuardPolicy::default(),
         }
     }
 }
@@ -790,6 +796,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
             taint_policy: Default::default(),
+            prompt_guard: Default::default(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

@@ -111,7 +111,8 @@ pub async fn auth(
     // is enabled. Allows the SPA to render before login in permissive mode.
     // SECURITY: /api/agents is GET-only (listing). POST (spawn) requires auth.
     if !auth_state.require_auth_for_reads {
-        let is_dashboard_public = is_get && (path == "/api/agents"
+        let is_dashboard_public = is_get
+            && (path == "/api/agents"
             || path == "/api/profiles"
             || path == "/api/config"
             || path.starts_with("/api/uploads/")
@@ -291,10 +292,7 @@ mod tests {
             .route("/api/agents", get(ok))
             .route("/api/budget", get(ok))
             .route("/api/auth/check", get(ok))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_state,
-                auth,
-            ))
+            .layer(axum::middleware::from_fn_with_state(auth_state, auth))
     }
 
     fn strict_auth_state() -> AuthState {

@@ -788,6 +788,28 @@ async fn dispatch_message(
         // Other slash commands pass through to the agent
     }
 
+    // --- Prompt injection guard ---
+    // Scan incoming channel messages for injection patterns before routing.
+    // Default mode is Warn (log and allow through). Agents can override via manifest.
+    {
+        use openfang_types::prompt_guard;
+        let verdict = prompt_guard::scan_all(&text);
+        if verdict.has_critical() {
+            let patterns: Vec<&str> = verdict
+                .findings()
+                .iter()
+                .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                .map(|f| f.pattern.as_str())
+                .collect();
+            tracing::warn!(
+                channel = ct_str,
+                sender = %message.sender.display_name,
+                patterns = ?patterns,
+                "Prompt injection detected in incoming channel message"
+            );
+        }
+    }
+
     // Check broadcast routing first
     if router.has_broadcast(&message.sender.platform_id) {
         let targets = router.resolve_broadcast(&message.sender.platform_id);

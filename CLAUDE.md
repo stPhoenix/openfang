@@ -10,7 +10,10 @@ OpenFang is an open-source Agent Operating System written in Rust (14 crates).
 After every feature implementation, run ALL THREE checks:
 ```bash
 cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
-cargo test --workspace                 # All tests must pass (currently 1744+)
+cargo test --workspace -j 4 -- --test-threads=4  # All tests must pass (currently 1744+)
+# NOTE: -j 4 and --test-threads=4 are required on Linux to prevent
+# systemd-oomd from killing the user session due to memory pressure
+# (27 debug test binaries, ~500-660MB each, overwhelm the cgroup limit)
 cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 ```
 

@@ -7,6 +7,9 @@ use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
+use openfang_types::agent::ManifestCapabilities;
+use openfang_types::capability::{check_capabilities, Capability, CapabilityCheck};
+use openfang_types::prompt_guard::{self, PromptGuardMode, PromptGuardPolicy};
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use openfang_types::tool_compat::normalize_tool_name;
@@ -92,9 +95,8 @@ fn detect_pii_patterns(text: &str) -> Vec<&'static str> {
     static RE_EMAIL: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
         regex_lite::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap()
     });
-    static RE_SSN: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap()
-    });
+    static RE_SSN: LazyLock<regex_lite::Regex> =
+        LazyLock::new(|| regex_lite::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
     static RE_PHONE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
         regex_lite::Regex::new(r"\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b").unwrap()
     });
@@ -146,6 +148,11 @@ fn detect_taint_labels(text: &str) -> HashSet<TaintLabel> {
     }
     if detect_secret_patterns(text) {
         labels.insert(TaintLabel::Secret);
+    }
+    // Detect inter-agent taint marker injected by tool_agent_send/tool_agent_delegate.
+    // This prevents untrusted agent output from flowing into shell_exec.
+    if text.contains("[taint:untrusted_agent]") {
+        labels.insert(TaintLabel::UntrustedAgent);
     }
     labels
 }
@@ -232,7 +239,10 @@ async fn enforce_taint_policy(
     let policy = kh.get_taint_policy(agent_id);
 
     // Check if all detected labels are in the allow list.
-    if detected_labels.iter().all(|l| policy.allow_labels.contains(l)) {
+    if detected_labels
+        .iter()
+        .all(|l| policy.allow_labels.contains(l))
+    {
         return None; // All labels exempted.
     }
 
@@ -307,6 +317,8 @@ pub async fn execute_tool(
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    agent_capabilities: Option<&ManifestCapabilities>,
+    prompt_guard_policy: Option<&PromptGuardPolicy>,
 ) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
@@ -321,6 +333,35 @@ pub async fn execute_tool(
                 content: format!(
                     "Permission denied: agent does not have capability to use tool '{tool_name}'"
                 ),
+                is_error: true,
+            };
+        }
+    }
+
+    // Fine-grained capability checks for sensitive tools.
+    // These go beyond the tool-name allowlist: they verify the agent has
+    // permission for the *specific target* (agent, memory key, shell command).
+    if let Some(caps) = agent_capabilities {
+        let denied = match tool_name {
+            "agent_send" => {
+                let target = input["agent_id"].as_str().unwrap_or("*");
+                check_agent_message_capability(caps, target)
+            }
+            "memory_store" => {
+                let key = input["key"].as_str().unwrap_or("*");
+                check_memory_write_capability(caps, key)
+            }
+            "memory_recall" => {
+                let key = input["key"].as_str().unwrap_or("*");
+                check_memory_read_capability(caps, key)
+            }
+            _ => None,
+        };
+        if let Some(reason) = denied {
+            warn!(tool_name, %reason, "Fine-grained capability denied");
+            return ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: reason,
                 is_error: true,
             };
         }
@@ -480,12 +521,47 @@ pub async fn execute_tool(
         // Inter-agent tools (require kernel handle)
         "agent_send" => {
             let message = input["message"].as_str().unwrap_or("");
+
+            // Prompt injection scan on inter-agent payloads
+            let effective_mode = prompt_guard_policy
+                .map(|p| p.mode)
+                .unwrap_or(PromptGuardMode::Warn);
+            if effective_mode != PromptGuardMode::Off {
+                let verdict = prompt_guard::scan_for_injection(message);
+                if !verdict.is_empty() {
+                    let pattern_names: Vec<&str> =
+                        verdict.iter().map(|f| f.pattern.as_str()).collect();
+                    warn!(
+                        tool = "agent_send",
+                        patterns = ?pattern_names,
+                        "Prompt injection detected in agent_send payload"
+                    );
+                    if effective_mode == PromptGuardMode::Block {
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!(
+                                "agent_send blocked: prompt injection detected in message ({})",
+                                pattern_names.join(", ")
+                            ),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
+
+            // Taint check for PII/secrets
             if let Some(violation) = check_taint_agent_message(message) {
                 let labels = detect_taint_labels(message);
                 if let Some(blocked) = enforce_taint_policy(
-                    &violation, &labels, kernel, caller_agent_id,
-                    "agent_send", tool_use_id,
-                ).await {
+                    &violation,
+                    &labels,
+                    kernel,
+                    caller_agent_id,
+                    "agent_send",
+                    tool_use_id,
+                )
+                .await
+                {
                     return blocked;
                 }
             }
@@ -504,14 +580,23 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => {
             let key = input["key"].as_str().unwrap_or("");
-            let value_str = input.get("value").map(|v| v.to_string()).unwrap_or_default();
+            let value_str = input
+                .get("value")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             if let Some(violation) = check_taint_memory_store(key, &value_str) {
                 let combined = format!("{key} {value_str}");
                 let labels = detect_taint_labels(&combined);
                 if let Some(blocked) = enforce_taint_policy(
-                    &violation, &labels, kernel, caller_agent_id,
-                    "memory_store", tool_use_id,
-                ).await {
+                    &violation,
+                    &labels,
+                    kernel,
+                    caller_agent_id,
+                    "memory_store",
+                    tool_use_id,
+                )
+                .await
+                {
                     return blocked;
                 }
             }
@@ -528,9 +613,15 @@ pub async fn execute_tool(
             if let Some(violation) = check_taint_data_channel(&combined) {
                 let labels = detect_taint_labels(&combined);
                 if let Some(blocked) = enforce_taint_policy(
-                    &violation, &labels, kernel, caller_agent_id,
-                    "task_post", tool_use_id,
-                ).await {
+                    &violation,
+                    &labels,
+                    kernel,
+                    caller_agent_id,
+                    "task_post",
+                    tool_use_id,
+                )
+                .await
+                {
                     return blocked;
                 }
             }
@@ -541,14 +632,23 @@ pub async fn execute_tool(
         "task_list" => tool_task_list(input, kernel).await,
         "event_publish" => {
             let event_type = input["event_type"].as_str().unwrap_or("");
-            let payload_str = input.get("payload").map(|v| v.to_string()).unwrap_or_default();
+            let payload_str = input
+                .get("payload")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             let combined = format!("{event_type} {payload_str}");
             if let Some(violation) = check_taint_data_channel(&combined) {
                 let labels = detect_taint_labels(&combined);
                 if let Some(blocked) = enforce_taint_policy(
-                    &violation, &labels, kernel, caller_agent_id,
-                    "event_publish", tool_use_id,
-                ).await {
+                    &violation,
+                    &labels,
+                    kernel,
+                    caller_agent_id,
+                    "event_publish",
+                    tool_use_id,
+                )
+                .await
+                {
                     return blocked;
                 }
             }
@@ -1840,6 +1940,20 @@ async fn tool_shell_exec(
     // Prevent child from inheriting stdin (avoids blocking on Windows)
     cmd.stdin(std::process::Stdio::null());
 
+    // SECURITY: Apply resource limits to the child process (Unix only).
+    // Prevents fork bombs, memory exhaustion, and CPU abuse.
+    #[cfg(unix)]
+    {
+        let limits = exec_policy
+            .map(|p| p.resource_limits.clone())
+            .unwrap_or_default();
+        // SAFETY: pre_exec runs after fork(), before exec(). setrlimit is
+        // async-signal-safe per POSIX, so this is safe in a pre_exec context.
+        unsafe {
+            cmd.pre_exec(move || crate::subprocess_sandbox::apply_resource_limits(&limits));
+        }
+    }
+
     let result =
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
@@ -1884,6 +1998,69 @@ async fn tool_shell_exec(
 }
 
 // ---------------------------------------------------------------------------
+// Fine-grained capability checks for sensitive tools
+// ---------------------------------------------------------------------------
+
+/// Check if the agent has `AgentMessage` capability for the given target.
+fn check_agent_message_capability(caps: &ManifestCapabilities, target: &str) -> Option<String> {
+    if caps.agent_message.is_empty() {
+        // No agent_message capabilities declared — allow by default
+        // (backwards compat: agents without explicit caps are unrestricted).
+        return None;
+    }
+    let required = Capability::AgentMessage(target.to_string());
+    let granted: Vec<Capability> = caps
+        .agent_message
+        .iter()
+        .map(|p| Capability::AgentMessage(p.clone()))
+        .collect();
+    match check_capabilities(&granted, &required) {
+        CapabilityCheck::Granted => None,
+        CapabilityCheck::Denied(_) => Some(format!(
+            "Capability denied: agent does not have AgentMessage permission for target '{target}'"
+        )),
+    }
+}
+
+/// Check if the agent has `MemoryWrite` capability for the given key.
+fn check_memory_write_capability(caps: &ManifestCapabilities, key: &str) -> Option<String> {
+    if caps.memory_write.is_empty() {
+        return None;
+    }
+    let required = Capability::MemoryWrite(key.to_string());
+    let granted: Vec<Capability> = caps
+        .memory_write
+        .iter()
+        .map(|p| Capability::MemoryWrite(p.clone()))
+        .collect();
+    match check_capabilities(&granted, &required) {
+        CapabilityCheck::Granted => None,
+        CapabilityCheck::Denied(_) => Some(format!(
+            "Capability denied: agent does not have MemoryWrite permission for key '{key}'"
+        )),
+    }
+}
+
+/// Check if the agent has `MemoryRead` capability for the given key.
+fn check_memory_read_capability(caps: &ManifestCapabilities, key: &str) -> Option<String> {
+    if caps.memory_read.is_empty() {
+        return None;
+    }
+    let required = Capability::MemoryRead(key.to_string());
+    let granted: Vec<Capability> = caps
+        .memory_read
+        .iter()
+        .map(|p| Capability::MemoryRead(p.clone()))
+        .collect();
+    match check_capabilities(&granted, &required) {
+        CapabilityCheck::Granted => None,
+        CapabilityCheck::Denied(_) => Some(format!(
+            "Capability denied: agent does not have MemoryRead permission for key '{key}'"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inter-agent tools
 // ---------------------------------------------------------------------------
 
@@ -1917,18 +2094,21 @@ async fn tool_agent_send(
         ));
     }
 
-    let timeout_secs = input
-        .get("timeout_seconds")
-        .and_then(|v| v.as_u64());
+    let timeout_secs = input.get("timeout_seconds").and_then(|v| v.as_u64());
 
-    AGENT_CALL_DEPTH
+    let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
             match timeout_secs {
                 Some(secs) => kh.send_to_agent_with_timeout(agent_id, message, secs).await,
                 None => kh.send_to_agent(agent_id, message).await,
             }
         })
-        .await
+        .await;
+
+    // Tag inter-agent results with UntrustedAgent taint marker.
+    // This ensures that if the calling agent passes this output into shell_exec,
+    // the taint system will block it (TaintSink::shell_exec blocks UntrustedAgent).
+    result.map(|r| format!("[taint:untrusted_agent] {r}"))
 }
 
 async fn tool_agent_spawn(
@@ -2020,7 +2200,7 @@ async fn tool_agent_delegate(
         vec![]
     };
 
-    AGENT_CALL_DEPTH
+    let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
             kh.delegate_to_agent(
                 manifest_toml,
@@ -2031,7 +2211,10 @@ async fn tool_agent_delegate(
             )
             .await
         })
-        .await
+        .await;
+
+    // Tag delegated agent results with UntrustedAgent taint marker.
+    result.map(|r| format!("[taint:untrusted_agent] {r}"))
 }
 
 async fn tool_agent_delegate_async(
@@ -2046,9 +2229,7 @@ async fn tool_agent_delegate_async(
     let message = input["message"]
         .as_str()
         .ok_or("Missing 'message' parameter")?;
-    let callback_event_type = input
-        .get("callback_event_type")
-        .and_then(|v| v.as_str());
+    let callback_event_type = input.get("callback_event_type").and_then(|v| v.as_str());
 
     // Check depth
     let current_depth = AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0);
@@ -2101,7 +2282,8 @@ fn tool_agent_self_inspect(
     caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
-    let agent_id = caller_agent_id.ok_or("No caller agent ID — this tool can only be used by a running agent")?;
+    let agent_id = caller_agent_id
+        .ok_or("No caller agent ID — this tool can only be used by a running agent")?;
     let manifest_json = kh.get_agent_manifest(agent_id)?;
     serde_json::to_string_pretty(&manifest_json)
         .map_err(|e| format!("Failed to format manifest: {e}"))
@@ -2113,10 +2295,18 @@ async fn tool_agent_self_modify(
     caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
-    let agent_id = caller_agent_id.ok_or("No caller agent ID — this tool can only be used by a running agent")?;
+    let agent_id = caller_agent_id
+        .ok_or("No caller agent ID — this tool can only be used by a running agent")?;
     // Build the changes object from input, excluding the "reason" field
     let mut changes = serde_json::Map::new();
-    for field in &["system_prompt", "description", "name", "model", "provider", "tags"] {
+    for field in &[
+        "system_prompt",
+        "description",
+        "name",
+        "model",
+        "provider",
+        "tags",
+    ] {
         if let Some(val) = input.get(*field) {
             if !val.is_null() {
                 changes.insert(field.to_string(), val.clone());
@@ -2126,7 +2316,8 @@ async fn tool_agent_self_modify(
     if changes.is_empty() {
         return Err("No recognized fields to modify. Supported: system_prompt, description, name, model, provider, tags".to_string());
     }
-    kh.update_agent_manifest(agent_id, serde_json::Value::Object(changes)).await
+    kh.update_agent_manifest(agent_id, serde_json::Value::Object(changes))
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3802,6 +3993,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(
@@ -3831,6 +4024,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -3857,6 +4052,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -3883,6 +4080,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -3909,6 +4108,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -3935,6 +4136,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -3961,6 +4164,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -3988,6 +4193,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -4019,6 +4226,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
@@ -4064,6 +4273,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         // Should NOT be the capability-check denial — it should normalize to file_write
@@ -4100,6 +4311,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -4329,6 +4542,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);
@@ -4374,6 +4589,8 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // agent_capabilities
+            None, // prompt_guard_policy
         )
         .await;
         assert!(result.is_error);

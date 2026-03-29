@@ -408,6 +408,7 @@ mod tests {
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],
                 taint_policy: Default::default(),
+                prompt_guard: Default::default(),
             },
             state: AgentState::Created,
             mode: AgentMode::default(),

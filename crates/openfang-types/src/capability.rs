@@ -165,6 +165,21 @@ pub fn capability_matches(granted: &Capability, required: &Capability) -> bool {
     }
 }
 
+/// Check whether a set of granted capabilities covers a required capability.
+///
+/// Returns `Granted` if any granted capability matches the required one,
+/// or `Denied` with a descriptive reason.
+pub fn check_capabilities(granted: &[Capability], required: &Capability) -> CapabilityCheck {
+    if granted.iter().any(|g| capability_matches(g, required)) {
+        CapabilityCheck::Granted
+    } else {
+        CapabilityCheck::Denied(format!(
+            "Required capability {:?} not covered by any grant",
+            required
+        ))
+    }
+}
+
 /// Validate that child capabilities are a subset of parent capabilities.
 /// This prevents privilege escalation: a restricted parent cannot create
 /// an unrestricted child.
