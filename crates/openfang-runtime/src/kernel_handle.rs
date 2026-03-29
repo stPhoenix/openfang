@@ -130,6 +130,13 @@ pub trait KernelHandle: Send + Sync {
         Err("Cron scheduler not available".to_string())
     }
 
+    /// Get the taint policy for an agent. Returns the default (block mode) if
+    /// the agent has no custom policy or the agent ID is unknown.
+    fn get_taint_policy(&self, agent_id: &str) -> openfang_types::taint::TaintPolicy {
+        let _ = agent_id;
+        openfang_types::taint::TaintPolicy::default()
+    }
+
     /// Check if a tool requires approval based on current policy.
     fn requires_approval(&self, tool_name: &str) -> bool {
         let _ = tool_name;

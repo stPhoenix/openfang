@@ -6375,6 +6375,15 @@ impl KernelHandle for OpenFangKernel {
         self.deactivate_hand(uuid).map_err(|e| format!("{e}"))
     }
 
+    fn get_taint_policy(&self, agent_id: &str) -> openfang_types::taint::TaintPolicy {
+        if let Ok(aid) = agent_id.parse::<AgentId>() {
+            if let Some(entry) = self.registry.get(aid) {
+                return entry.manifest.taint_policy.clone();
+            }
+        }
+        openfang_types::taint::TaintPolicy::default()
+    }
+
     fn requires_approval(&self, tool_name: &str) -> bool {
         self.approval_manager.requires_approval(tool_name)
     }
@@ -6902,6 +6911,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            taint_policy: Default::default(),
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -6939,6 +6949,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            taint_policy: Default::default(),
         }
     }
 

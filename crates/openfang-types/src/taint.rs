@@ -146,12 +146,37 @@ impl TaintSink {
         }
     }
 
-    /// Sink for sending messages to another agent -- blocks secrets.
+    /// Sink for sending messages to another agent -- blocks secrets and PII.
     pub fn agent_message() -> Self {
         let mut blocked = HashSet::new();
         blocked.insert(TaintLabel::Secret);
+        blocked.insert(TaintLabel::Pii);
         Self {
             name: "agent_message".to_string(),
+            blocked_labels: blocked,
+        }
+    }
+
+    /// Sink for shared memory writes -- blocks secrets and PII to prevent
+    /// sensitive data from leaking into the shared memory namespace.
+    pub fn memory_store() -> Self {
+        let mut blocked = HashSet::new();
+        blocked.insert(TaintLabel::Secret);
+        blocked.insert(TaintLabel::Pii);
+        Self {
+            name: "memory_store".to_string(),
+            blocked_labels: blocked,
+        }
+    }
+
+    /// Sink for inter-agent data channels (task_post, event_publish) --
+    /// blocks secrets and PII.
+    pub fn data_channel() -> Self {
+        let mut blocked = HashSet::new();
+        blocked.insert(TaintLabel::Secret);
+        blocked.insert(TaintLabel::Pii);
+        Self {
+            name: "data_channel".to_string(),
             blocked_labels: blocked,
         }
     }
@@ -180,6 +205,43 @@ impl fmt::Display for TaintViolation {
 }
 
 impl std::error::Error for TaintViolation {}
+
+/// Enforcement mode for taint policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaintMode {
+    /// Hard block — taint violations are rejected immediately.
+    #[default]
+    Block,
+    /// Approval gate — ask user for one-time permission on violation.
+    Approve,
+    /// Allow all — skip taint checks entirely for this agent.
+    Allow,
+}
+
+/// Per-agent taint enforcement policy.
+///
+/// Controls whether PII/secret detection blocks tool execution, asks the
+/// user for approval, or is skipped entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaintPolicy {
+    /// Enforcement mode.
+    pub mode: TaintMode,
+    /// Labels to exempt from checks. For example, `["Pii"]` allows PII
+    /// forwarding while still blocking secrets.
+    #[serde(default)]
+    pub allow_labels: HashSet<TaintLabel>,
+}
+
+impl Default for TaintPolicy {
+    fn default() -> Self {
+        Self {
+            mode: TaintMode::Block,
+            allow_labels: HashSet::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -221,6 +283,70 @@ mod tests {
         assert!(clean.check_sink(&TaintSink::shell_exec()).is_ok());
         assert!(clean.check_sink(&TaintSink::net_fetch()).is_ok());
         assert!(clean.check_sink(&TaintSink::agent_message()).is_ok());
+        assert!(clean.check_sink(&TaintSink::memory_store()).is_ok());
+        assert!(clean.check_sink(&TaintSink::data_channel()).is_ok());
+    }
+
+    #[test]
+    fn test_agent_message_blocks_pii() {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Pii);
+        let tainted = TaintedValue::new("john@example.com", labels, "user_data");
+
+        let sink = TaintSink::agent_message();
+        let result = tainted.check_sink(&sink);
+        assert!(result.is_err());
+        let violation = result.unwrap_err();
+        assert_eq!(violation.label, TaintLabel::Pii);
+        assert_eq!(violation.sink_name, "agent_message");
+    }
+
+    #[test]
+    fn test_memory_store_blocks_pii() {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Pii);
+        let tainted = TaintedValue::new("555-12-3456", labels, "user_data");
+        assert!(tainted.check_sink(&TaintSink::memory_store()).is_err());
+    }
+
+    #[test]
+    fn test_memory_store_blocks_secret() {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Secret);
+        let tainted = TaintedValue::new("sk-abc123", labels, "env_var");
+        assert!(tainted.check_sink(&TaintSink::memory_store()).is_err());
+    }
+
+    #[test]
+    fn test_data_channel_blocks_pii() {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Pii);
+        let tainted = TaintedValue::new("user SSN", labels, "task_desc");
+        assert!(tainted.check_sink(&TaintSink::data_channel()).is_err());
+    }
+
+    #[test]
+    fn test_data_channel_allows_external_network() {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::ExternalNetwork);
+        let tainted = TaintedValue::new("fetched content", labels, "http_response");
+        // ExternalNetwork is NOT blocked by data_channel
+        assert!(tainted.check_sink(&TaintSink::data_channel()).is_ok());
+    }
+
+    #[test]
+    fn test_taint_policy_defaults() {
+        let policy = TaintPolicy::default();
+        assert_eq!(policy.mode, TaintMode::Block);
+        assert!(policy.allow_labels.is_empty());
+    }
+
+    #[test]
+    fn test_taint_mode_serde() {
+        let json = serde_json::json!({"mode": "approve", "allow_labels": ["Pii"]});
+        let policy: TaintPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(policy.mode, TaintMode::Approve);
+        assert!(policy.allow_labels.contains(&TaintLabel::Pii));
     }
 
     #[test]

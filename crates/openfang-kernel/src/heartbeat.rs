@@ -335,6 +335,7 @@ mod tests {
                 exec_policy: None,
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],
+                taint_policy: Default::default(),
             },
             state,
             mode: AgentMode::default(),

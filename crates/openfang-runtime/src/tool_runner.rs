@@ -81,6 +81,192 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// PII / secret heuristic detectors for taint tracking
+// ---------------------------------------------------------------------------
+
+/// Detect PII patterns in free text. Returns descriptions of matched patterns.
+fn detect_pii_patterns(text: &str) -> Vec<&'static str> {
+    use std::sync::LazyLock;
+
+    static RE_EMAIL: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap()
+    });
+    static RE_SSN: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap()
+    });
+    static RE_PHONE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b").unwrap()
+    });
+    static RE_CC: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{3,4}\b").unwrap()
+    });
+
+    let mut found = Vec::new();
+    if RE_EMAIL.is_match(text) {
+        found.push("email address");
+    }
+    if RE_SSN.is_match(text) {
+        found.push("SSN");
+    }
+    if RE_PHONE.is_match(text) {
+        found.push("phone number");
+    }
+    if RE_CC.is_match(text) {
+        found.push("credit card number");
+    }
+    found
+}
+
+/// Detect secret-like patterns in free text (API keys, tokens, etc.).
+fn detect_secret_patterns(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let markers = [
+        "sk-",
+        "pk_",
+        "api_key=",
+        "apikey=",
+        "token=",
+        "secret=",
+        "password=",
+        "bearer ",
+        "authorization:",
+        "aws_secret",
+        "private_key",
+        "-----begin",
+    ];
+    markers.iter().any(|p| lower.contains(p))
+}
+
+/// Build taint labels from heuristic detection results.
+fn detect_taint_labels(text: &str) -> HashSet<TaintLabel> {
+    let mut labels = HashSet::new();
+    if !detect_pii_patterns(text).is_empty() {
+        labels.insert(TaintLabel::Pii);
+    }
+    if detect_secret_patterns(text) {
+        labels.insert(TaintLabel::Secret);
+    }
+    labels
+}
+
+/// Check if an agent message should be blocked by taint tracking.
+///
+/// Scans the message body for PII and secret patterns and checks against
+/// `TaintSink::agent_message()`.
+fn check_taint_agent_message(message: &str) -> Option<String> {
+    let labels = detect_taint_labels(message);
+    if labels.is_empty() {
+        return None;
+    }
+    let tainted = TaintedValue::new(message, labels, "llm_tool_call");
+    if let Err(violation) = tainted.check_sink(&TaintSink::agent_message()) {
+        warn!(
+            message = crate::str_utils::safe_truncate_str(message, 80),
+            %violation,
+            "Agent message taint check failed"
+        );
+        return Some(violation.to_string());
+    }
+    None
+}
+
+/// Check if a memory store operation should be blocked by taint tracking.
+fn check_taint_memory_store(key: &str, value: &str) -> Option<String> {
+    let combined = format!("{key} {value}");
+    let labels = detect_taint_labels(&combined);
+    if labels.is_empty() {
+        return None;
+    }
+    let tainted = TaintedValue::new(&combined, labels, "llm_tool_call");
+    if let Err(violation) = tainted.check_sink(&TaintSink::memory_store()) {
+        warn!(%violation, "Memory store taint check failed");
+        return Some(violation.to_string());
+    }
+    None
+}
+
+/// Check if a data channel operation (task_post, event_publish) should be
+/// blocked by taint tracking.
+fn check_taint_data_channel(text: &str) -> Option<String> {
+    let labels = detect_taint_labels(text);
+    if labels.is_empty() {
+        return None;
+    }
+    let tainted = TaintedValue::new(text, labels, "llm_tool_call");
+    if let Err(violation) = tainted.check_sink(&TaintSink::data_channel()) {
+        warn!(%violation, "Data channel taint check failed");
+        return Some(violation.to_string());
+    }
+    None
+}
+
+/// Enforce taint policy: given a violation string, check the agent's taint
+/// policy and either block, ask for approval, or allow the operation.
+///
+/// Returns `Some(ToolResult)` if the operation should be blocked, `None` if
+/// it should proceed.
+async fn enforce_taint_policy(
+    violation: &str,
+    detected_labels: &HashSet<TaintLabel>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    tool_name: &str,
+    tool_use_id: &str,
+) -> Option<ToolResult> {
+    use openfang_types::taint::TaintMode;
+
+    let kh = match kernel {
+        Some(kh) => kh,
+        None => {
+            // No kernel = no policy lookup, fall back to hard block.
+            return Some(ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Taint violation: {violation}"),
+                is_error: true,
+            });
+        }
+    };
+
+    let agent_id = caller_agent_id.unwrap_or("unknown");
+    let policy = kh.get_taint_policy(agent_id);
+
+    // Check if all detected labels are in the allow list.
+    if detected_labels.iter().all(|l| policy.allow_labels.contains(l)) {
+        return None; // All labels exempted.
+    }
+
+    match policy.mode {
+        TaintMode::Allow => None,
+        TaintMode::Block => Some(ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: format!("Taint violation: {violation}"),
+            is_error: true,
+        }),
+        TaintMode::Approve => {
+            let summary = format!("Taint: {violation}");
+            match kh.request_approval(agent_id, tool_name, &summary).await {
+                Ok(true) => {
+                    debug!(tool_name, "Taint violation approved by user — proceeding");
+                    None
+                }
+                Ok(false) => Some(ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "Taint violation denied: {violation}. Approval was denied or timed out."
+                    ),
+                    is_error: true,
+                }),
+                Err(e) => Some(ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!("Taint approval error: {e}"),
+                    is_error: true,
+                }),
+            }
+        }
+    }
+}
+
 tokio::task_local! {
     /// Tracks the current inter-agent call depth within a task.
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
@@ -292,7 +478,19 @@ pub async fn execute_tool(
         }
 
         // Inter-agent tools (require kernel handle)
-        "agent_send" => tool_agent_send(input, kernel).await,
+        "agent_send" => {
+            let message = input["message"].as_str().unwrap_or("");
+            if let Some(violation) = check_taint_agent_message(message) {
+                let labels = detect_taint_labels(message);
+                if let Some(blocked) = enforce_taint_policy(
+                    &violation, &labels, kernel, caller_agent_id,
+                    "agent_send", tool_use_id,
+                ).await {
+                    return blocked;
+                }
+            }
+            tool_agent_send(input, kernel).await
+        }
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
@@ -304,16 +502,58 @@ pub async fn execute_tool(
         "agent_self_modify" => tool_agent_self_modify(input, kernel, caller_agent_id).await,
 
         // Shared memory tools
-        "memory_store" => tool_memory_store(input, kernel),
+        "memory_store" => {
+            let key = input["key"].as_str().unwrap_or("");
+            let value_str = input.get("value").map(|v| v.to_string()).unwrap_or_default();
+            if let Some(violation) = check_taint_memory_store(key, &value_str) {
+                let combined = format!("{key} {value_str}");
+                let labels = detect_taint_labels(&combined);
+                if let Some(blocked) = enforce_taint_policy(
+                    &violation, &labels, kernel, caller_agent_id,
+                    "memory_store", tool_use_id,
+                ).await {
+                    return blocked;
+                }
+            }
+            tool_memory_store(input, kernel)
+        }
         "memory_recall" => tool_memory_recall(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
-        "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
+        "task_post" => {
+            let title = input["title"].as_str().unwrap_or("");
+            let description = input["description"].as_str().unwrap_or("");
+            let combined = format!("{title} {description}");
+            if let Some(violation) = check_taint_data_channel(&combined) {
+                let labels = detect_taint_labels(&combined);
+                if let Some(blocked) = enforce_taint_policy(
+                    &violation, &labels, kernel, caller_agent_id,
+                    "task_post", tool_use_id,
+                ).await {
+                    return blocked;
+                }
+            }
+            tool_task_post(input, kernel, caller_agent_id).await
+        }
         "task_claim" => tool_task_claim(kernel, caller_agent_id).await,
         "task_complete" => tool_task_complete(input, kernel).await,
         "task_list" => tool_task_list(input, kernel).await,
-        "event_publish" => tool_event_publish(input, kernel).await,
+        "event_publish" => {
+            let event_type = input["event_type"].as_str().unwrap_or("");
+            let payload_str = input.get("payload").map(|v| v.to_string()).unwrap_or_default();
+            let combined = format!("{event_type} {payload_str}");
+            if let Some(violation) = check_taint_data_channel(&combined) {
+                let labels = detect_taint_labels(&combined);
+                if let Some(blocked) = enforce_taint_policy(
+                    &violation, &labels, kernel, caller_agent_id,
+                    "event_publish", tool_use_id,
+                ).await {
+                    return blocked;
+                }
+            }
+            tool_event_publish(input, kernel).await
+        }
 
         // Knowledge graph tools
         "knowledge_add_entity" => tool_knowledge_add_entity(input, kernel).await,
@@ -4226,5 +4466,103 @@ mod tests {
         assert_eq!(output["title"], "Test");
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Taint detection & enforcement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_pii_email() {
+        let patterns = detect_pii_patterns("Contact john@example.com for details");
+        assert!(patterns.contains(&"email address"));
+    }
+
+    #[test]
+    fn test_detect_pii_ssn() {
+        let patterns = detect_pii_patterns("SSN is 123-45-6789");
+        assert!(patterns.contains(&"SSN"));
+    }
+
+    #[test]
+    fn test_detect_pii_phone() {
+        let patterns = detect_pii_patterns("Call me at (555) 123-4567");
+        assert!(patterns.contains(&"phone number"));
+    }
+
+    #[test]
+    fn test_detect_pii_credit_card() {
+        let patterns = detect_pii_patterns("Card: 4111 1111 1111 1111");
+        assert!(patterns.contains(&"credit card number"));
+    }
+
+    #[test]
+    fn test_detect_pii_none() {
+        let patterns = detect_pii_patterns("Hello, please process the weekly report");
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_detect_secret_patterns_positive() {
+        assert!(detect_secret_patterns("Here is my key: sk-abc123xyz"));
+        assert!(detect_secret_patterns("Set api_key=12345"));
+        assert!(detect_secret_patterns("Authorization: Bearer tok"));
+        assert!(detect_secret_patterns("-----BEGIN RSA PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn test_detect_secret_patterns_clean() {
+        assert!(!detect_secret_patterns("Hello, process the report"));
+        assert!(!detect_secret_patterns("The sky is blue"));
+    }
+
+    #[test]
+    fn test_check_taint_agent_message_blocks_secret() {
+        let result = check_taint_agent_message("Here is the key: sk-abc123xyz");
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Secret"));
+    }
+
+    #[test]
+    fn test_check_taint_agent_message_blocks_pii_email() {
+        let result = check_taint_agent_message("Contact john@example.com for details");
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Pii"));
+    }
+
+    #[test]
+    fn test_check_taint_agent_message_blocks_pii_ssn() {
+        let result = check_taint_agent_message("SSN is 123-45-6789");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_taint_agent_message_allows_clean() {
+        let result = check_taint_agent_message("Hello, please process the report");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_taint_memory_store_blocks_secret() {
+        let result = check_taint_memory_store("config", "api_key=sk-12345");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_taint_memory_store_allows_clean() {
+        let result = check_taint_memory_store("notes", "remember to buy milk");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_taint_data_channel_blocks_pii() {
+        let result = check_taint_data_channel("Send report to john@example.com");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_taint_data_channel_allows_clean() {
+        let result = check_taint_data_channel("Weekly status update completed");
+        assert!(result.is_none());
     }
 }
