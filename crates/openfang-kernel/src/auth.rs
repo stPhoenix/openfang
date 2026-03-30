@@ -34,6 +34,17 @@ impl fmt::Display for UserRole {
     }
 }
 
+impl From<UserRole> for openfang_types::sender::SenderRole {
+    fn from(role: UserRole) -> Self {
+        match role {
+            UserRole::Viewer => openfang_types::sender::SenderRole::Viewer,
+            UserRole::User => openfang_types::sender::SenderRole::User,
+            UserRole::Admin => openfang_types::sender::SenderRole::Admin,
+            UserRole::Owner => openfang_types::sender::SenderRole::Owner,
+        }
+    }
+}
+
 impl UserRole {
     /// Parse a role from a string.
     pub fn from_str_role(s: &str) -> Self {

@@ -17,6 +17,7 @@ pub mod message;
 pub mod model_catalog;
 pub mod prompt_guard;
 pub mod scheduler;
+pub mod sender;
 pub mod serde_compat;
 pub mod taint;
 pub mod tool;

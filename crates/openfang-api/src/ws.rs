@@ -505,6 +505,7 @@ async fn handle_text_message(
                 Some(kernel_handle),
                 None,
                 None,
+                None, // sender_role: WebSocket callers don't have RBAC role yet
                 ws_content_blocks,
             ) {
                 Ok((mut rx, handle)) => {

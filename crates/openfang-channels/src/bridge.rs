@@ -213,6 +213,44 @@ pub trait ChannelBridgeHandle: Send + Sync {
         Ok(())
     }
 
+    /// Resolve the sender's verified identity from channel + platform ID.
+    ///
+    /// Returns `None` when RBAC is not configured. When RBAC is enabled,
+    /// maps the platform identity to an OpenFang user with a verified role.
+    async fn resolve_sender(
+        &self,
+        _channel_type: &str,
+        _platform_id: &str,
+    ) -> Option<openfang_types::sender::SenderContext> {
+        None
+    }
+
+    /// Send a message with verified sender context.
+    ///
+    /// The sender context carries the sender's verified role through the kernel
+    /// to the agent loop, enabling per-role tool restrictions.
+    /// Default: falls back to `send_message()` (no sender context).
+    async fn send_message_with_sender(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        _sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> Result<String, String> {
+        self.send_message(agent_id, message).await
+    }
+
+    /// Send structured content blocks with verified sender context.
+    ///
+    /// Default: falls back to `send_message_with_blocks()` (no sender context).
+    async fn send_message_with_sender_and_blocks(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<ContentBlock>,
+        _sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> Result<String, String> {
+        self.send_message_with_blocks(agent_id, blocks).await
+    }
+
     /// Get per-channel overrides for a given channel type.
     ///
     /// Returns `None` if the channel is not configured or has no overrides.
@@ -936,6 +974,12 @@ async fn dispatch_message(
         return;
     }
 
+    // Resolve verified sender identity (role, platform ID) for the agent loop.
+    // Returns None when RBAC is not configured — agent gets full access.
+    let sender_ctx = handle
+        .resolve_sender(ct_str, sender_user_id(message))
+        .await;
+
     // Build channel key for re-resolution lookups
     let channel_key = format!("{:?}", message.channel);
 
@@ -986,8 +1030,10 @@ async fn dispatch_message(
         text.clone()
     };
 
-    // Send to agent and relay response
-    let result = handle.send_message(agent_id, &prefixed_text).await;
+    // Send to agent with verified sender context for per-role tool restrictions
+    let result = handle
+        .send_message_with_sender(agent_id, &prefixed_text, sender_ctx.as_ref())
+        .await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -1013,7 +1059,9 @@ async fn dispatch_message(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message(new_id, &text).await;
+                let retry = handle
+                    .send_message_with_sender(new_id, &text, sender_ctx.as_ref())
+                    .await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {
@@ -1371,6 +1419,11 @@ async fn dispatch_with_blocks(
         return;
     }
 
+    // Resolve verified sender identity for per-role tool restrictions
+    let sender_ctx = handle
+        .resolve_sender(ct_str, sender_user_id(message))
+        .await;
+
     let _ = adapter.send_typing(&message.sender).await;
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
@@ -1384,7 +1437,7 @@ async fn dispatch_with_blocks(
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
     let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
+        .send_message_with_sender_and_blocks(agent_id, blocks.clone(), sender_ctx.as_ref())
         .await;
 
     typing_task.abort();
@@ -1410,7 +1463,9 @@ async fn dispatch_with_blocks(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message_with_blocks(new_id, blocks).await;
+                let retry = handle
+                    .send_message_with_sender_and_blocks(new_id, blocks, sender_ctx.as_ref())
+                    .await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {

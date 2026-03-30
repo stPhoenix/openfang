@@ -846,6 +846,70 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .map_err(|e| e.to_string())
     }
 
+    async fn resolve_sender(
+        &self,
+        channel_type: &str,
+        platform_id: &str,
+    ) -> Option<openfang_types::sender::SenderContext> {
+        if !self.kernel.auth.is_enabled() {
+            return None; // RBAC not configured — no verified identity
+        }
+
+        let user_id = self.kernel.auth.identify(channel_type, platform_id)?;
+        let identity = self.kernel.auth.get_user(user_id)?;
+        let sender_role: openfang_types::sender::SenderRole = identity.role.into();
+
+        Some(openfang_types::sender::SenderContext {
+            platform_id: platform_id.to_string(),
+            display_name: identity.name,
+            role: Some(sender_role),
+        })
+    }
+
+    async fn send_message_with_sender(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_with_sender(agent_id, message, sender)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        if result.silent {
+            return Ok(String::new());
+        }
+        Ok(result.response)
+    }
+
+    async fn send_message_with_sender_and_blocks(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> Result<String, String> {
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                openfang_types::message::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "[Image]".to_string()
+        } else {
+            text
+        };
+        let result = self
+            .kernel
+            .send_message_with_sender_and_blocks(agent_id, &text, blocks, sender)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
     async fn record_delivery(
         &self,
         agent_id: AgentId,
@@ -1126,6 +1190,29 @@ pub async fn start_channel_bridge_with_config(
         kernel: kernel.clone(),
         started_at: Instant::now(),
     };
+
+    // Security advisory: warn when RBAC is enabled but channels have open DM policy
+    if kernel.auth.is_enabled() {
+        use openfang_types::config::DmPolicy;
+        let check_channel = |name: &str, overrides: &openfang_types::config::ChannelOverrides, allowed_users_empty: bool| {
+            if overrides.dm_policy == DmPolicy::Respond && allowed_users_empty {
+                warn!(
+                    channel = name,
+                    "Channel has dm_policy=respond with RBAC enabled but no allowed_users. \
+                     Consider setting dm_policy='allowed_only' for defense in depth."
+                );
+            }
+        };
+        if let Some(ref tg) = config.telegram {
+            check_channel("telegram", &tg.overrides, tg.allowed_users.is_empty());
+        }
+        if let Some(ref dc) = config.discord {
+            check_channel("discord", &dc.overrides, dc.allowed_users.is_empty());
+        }
+        if let Some(ref wa) = config.whatsapp {
+            check_channel("whatsapp", &wa.overrides, wa.allowed_users.is_empty());
+        }
+    }
 
     // Collect all adapters to start
     let mut adapters: Vec<(Arc<dyn ChannelAdapter>, Option<String>)> = Vec::new();

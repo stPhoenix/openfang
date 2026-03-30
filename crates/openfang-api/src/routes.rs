@@ -405,6 +405,7 @@ pub async fn send_message(
             content_blocks,
             req.sender_id,
             req.sender_name,
+            None, // sender_role: API callers don't have RBAC role yet
         )
         .await
     {
@@ -1460,6 +1461,7 @@ pub async fn send_message_stream(
         Some(kernel_handle),
         req.sender_id,
         req.sender_name,
+        None, // sender_role: API callers don't have RBAC role yet
         None, // SSE streaming doesn't support image attachments yet
     ) {
         Ok(pair) => pair,
@@ -8616,7 +8618,7 @@ pub async fn run_schedule(
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle), None, None)
+        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle), None, None, None)
         .await
     {
         Ok(result) => (

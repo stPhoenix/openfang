@@ -268,6 +268,7 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    sender_role: Option<openfang_types::sender::SenderRole>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -472,10 +473,19 @@ pub async fn run_agent_loop(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        // For Viewer role, strip all tools from the LLM request so the model
+        // responds conversationally without attempting tool calls.
+        let request_tools =
+            if sender_role == Some(openfang_types::sender::SenderRole::Viewer) {
+                vec![]
+            } else {
+                available_tools.to_vec()
+            };
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
-            tools: available_tools.to_vec(),
+            tools: request_tools,
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
@@ -747,8 +757,24 @@ pub async fn run_agent_loop(
                 });
 
                 // Build allowed tool names list for capability enforcement
-                let allowed_tool_names: Vec<String> =
+                let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
+
+                // Per-role tool filtering: restrict tools based on verified sender role
+                if let Some(role) = sender_role {
+                    let before = allowed_tool_names.len();
+                    allowed_tool_names =
+                        openfang_types::sender::filter_tools_by_role(&allowed_tool_names, role);
+                    let removed = before - allowed_tool_names.len();
+                    if removed > 0 {
+                        info!(
+                            role = %role,
+                            removed = removed,
+                            "Filtered tools by sender role"
+                        );
+                    }
+                }
+
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -1450,6 +1476,7 @@ pub async fn run_agent_loop_streaming(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    sender_role: Option<openfang_types::sender::SenderRole>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1666,10 +1693,18 @@ pub async fn run_agent_loop_streaming(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        // For Viewer role, strip all tools from the streaming LLM request
+        let request_tools =
+            if sender_role == Some(openfang_types::sender::SenderRole::Viewer) {
+                vec![]
+            } else {
+                available_tools.to_vec()
+            };
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
-            tools: available_tools.to_vec(),
+            tools: request_tools,
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
@@ -1915,8 +1950,24 @@ pub async fn run_agent_loop_streaming(
                     content: MessageContent::Blocks(assistant_blocks),
                 });
 
-                let allowed_tool_names: Vec<String> =
+                let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
+
+                // Per-role tool filtering (streaming path)
+                if let Some(role) = sender_role {
+                    let before = allowed_tool_names.len();
+                    allowed_tool_names =
+                        openfang_types::sender::filter_tools_by_role(&allowed_tool_names, role);
+                    let removed = before - allowed_tool_names.len();
+                    if removed > 0 {
+                        info!(
+                            role = %role,
+                            removed = removed,
+                            "Filtered tools by sender role (streaming)"
+                        );
+                    }
+                }
+
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -3284,6 +3335,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should complete without error");
@@ -3337,6 +3389,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should complete without error");
@@ -3392,6 +3445,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should complete without error");
@@ -3445,6 +3499,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should complete without error");
@@ -3491,6 +3546,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3615,6 +3671,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should recover via retry");
@@ -3662,6 +3719,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Loop should complete with fallback");
@@ -3717,6 +3775,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4605,6 +4664,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Agent loop should complete");
@@ -4672,6 +4732,7 @@ mod tests {
             None,
             None,
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Normal loop should complete");
@@ -4735,6 +4796,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_role
         )
         .await
         .expect("Streaming loop should complete");

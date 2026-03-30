@@ -1472,8 +1472,58 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
-        self.send_message_with_handle(agent_id, message, handle, None, None)
+        self.send_message_with_handle(agent_id, message, handle, None, None, None)
             .await
+    }
+
+    /// Send a message with verified sender context (used by channel bridges).
+    ///
+    /// Threads the sender's role through to the agent loop for per-role tool restrictions.
+    pub async fn send_message_with_sender(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle(
+            agent_id,
+            message,
+            handle,
+            sender.map(|s| s.platform_id.clone()),
+            sender.map(|s| s.display_name.clone()),
+            sender.and_then(|s| s.role),
+        )
+        .await
+    }
+
+    /// Send structured content blocks with verified sender context (used by channel bridges).
+    pub async fn send_message_with_sender_and_blocks(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        sender: Option<&openfang_types::sender::SenderContext>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            Some(blocks),
+            sender.map(|s| s.platform_id.clone()),
+            sender.map(|s| s.display_name.clone()),
+            sender.and_then(|s| s.role),
+        )
+        .await
     }
 
     /// Send a multimodal message (text + images) to an agent and get a response.
@@ -1498,6 +1548,7 @@ impl OpenFangKernel {
             Some(blocks),
             None,
             None,
+            None,
         )
         .await
     }
@@ -1510,6 +1561,7 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
     ) -> KernelResult<AgentLoopResult> {
         self.send_message_with_handle_and_blocks(
             agent_id,
@@ -1518,6 +1570,7 @@ impl OpenFangKernel {
             None,
             sender_id,
             sender_name,
+            sender_role,
         )
         .await
     }
@@ -1531,6 +1584,7 @@ impl OpenFangKernel {
     /// Per-agent locking ensures that concurrent messages for the same agent
     /// are serialized (preventing session corruption), while messages for
     /// different agents run in parallel.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_with_handle_and_blocks(
         &self,
         agent_id: AgentId,
@@ -1539,6 +1593,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -1576,6 +1631,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                sender_role,
             )
             .await
         };
@@ -1626,6 +1682,7 @@ impl OpenFangKernel {
     ///
     /// WASM and Python agents don't support true streaming — they execute
     /// synchronously and emit a single `TextDelta` + `ContentComplete` pair.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_message_streaming(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -1633,6 +1690,7 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
@@ -1903,6 +1961,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                sender_role,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2003,6 +2062,7 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                sender_role,
             )
             .await;
 
@@ -2259,6 +2319,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2464,6 +2525,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                sender_role,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2574,6 +2636,7 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            sender_role,
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -5468,7 +5531,7 @@ impl OpenFangKernel {
                 let kh: Arc<dyn KernelHandle> = self.clone();
                 match tokio::time::timeout(
                     timeout,
-                    self.send_message_with_handle(agent_id, message, Some(kh), None, None),
+                    self.send_message_with_handle(agent_id, message, Some(kh), None, None, None),
                 )
                 .await
                 {

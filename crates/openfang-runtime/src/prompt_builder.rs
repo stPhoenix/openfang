@@ -59,6 +59,8 @@ pub struct PromptContext {
     pub sender_id: Option<String>,
     /// Sender display name.
     pub sender_name: Option<String>,
+    /// Verified sender role from RBAC (None when RBAC is disabled).
+    pub sender_role: Option<openfang_types::sender::SenderRole>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -154,9 +156,11 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
 
     // Section 9.1 — Sender Identity (skip for subagents)
     if !ctx.is_subagent {
-        if let Some(sender_line) =
-            build_sender_section(ctx.sender_name.as_deref(), ctx.sender_id.as_deref())
-        {
+        if let Some(sender_line) = build_sender_section(
+            ctx.sender_name.as_deref(),
+            ctx.sender_id.as_deref(),
+            ctx.sender_role.as_ref(),
+        ) {
             sections.push(sender_line);
         }
     }
@@ -432,13 +436,35 @@ fn build_channel_section(channel: &str) -> String {
     )
 }
 
-fn build_sender_section(sender_name: Option<&str>, sender_id: Option<&str>) -> Option<String> {
-    match (sender_name, sender_id) {
-        (Some(name), Some(id)) => Some(format!("## Sender\nMessage from: {name} ({id})")),
-        (Some(name), None) => Some(format!("## Sender\nMessage from: {name}")),
-        (None, Some(id)) => Some(format!("## Sender\nMessage from: {id}")),
-        (None, None) => None,
+fn build_sender_section(
+    sender_name: Option<&str>,
+    sender_id: Option<&str>,
+    sender_role: Option<&openfang_types::sender::SenderRole>,
+) -> Option<String> {
+    if sender_name.is_none() && sender_id.is_none() {
+        return None;
     }
+
+    let mut section = String::from("## Sender\n");
+    if let Some(id) = sender_id {
+        section.push_str(&format!("Platform ID: {id} (verified)\n"));
+    }
+    if let Some(name) = sender_name {
+        section.push_str(&format!(
+            "Display name: {name} (unverified \u{2014} user-chosen)\n"
+        ));
+    }
+    if let Some(role) = sender_role {
+        section.push_str(&format!("Role: {role} (verified)\n"));
+        section.push_str(
+            "\nIMPORTANT: Only execute tool-calling requests appropriate for the sender's role.\n\
+             Viewer: respond conversationally only, no tools.\n\
+             User: basic chat tools only, no shell/file/network operations.\n\
+             Admin: full tool access.\n\
+             Owner: unrestricted access.",
+        );
+    }
+    Some(section)
 }
 
 fn build_peer_agents_section(self_name: &str, peers: &[(String, String, String)]) -> String {
