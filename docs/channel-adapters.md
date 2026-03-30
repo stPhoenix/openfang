@@ -189,7 +189,7 @@ usage_footer = "compact"
 |-------|------|---------|-------------|
 | `model` | `Option<String>` | Agent default | Override the LLM model for this channel. |
 | `system_prompt` | `Option<String>` | Agent default | Override the system prompt for this channel. |
-| `dm_policy` | `DmPolicy` | `Respond` | How to handle direct messages. |
+| `dm_policy` | `DmPolicy` | `AllowedOnly` | How to handle direct messages. |
 | `group_policy` | `GroupPolicy` | `MentionOnly` | How to handle group/channel messages. |
 | `rate_limit_per_user` | `u32` | `0` (unlimited) | Max messages per minute per user. |
 | `threading` | `bool` | `false` | Send replies as thread responses (platforms that support it). |

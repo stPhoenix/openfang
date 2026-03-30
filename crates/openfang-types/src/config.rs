@@ -1,5 +1,6 @@
 //! Configuration types for the OpenFang kernel.
 
+use crate::prompt_guard::PromptGuardPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,9 +30,9 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
     /// Respond to all DMs.
-    #[default]
     Respond,
-    /// Only respond to DMs from allowed users.
+    /// Only respond to DMs from allowed users (RBAC check enforced).
+    #[default]
     AllowedOnly,
     /// Ignore all DMs.
     Ignore,
@@ -93,6 +94,10 @@ pub struct ChannelOverrides {
     /// Defaults to true. Set to false to suppress automatic reactions (e.g. on Telegram).
     #[serde(default = "default_true")]
     pub lifecycle_reactions: bool,
+    /// Prompt injection guard policy for incoming messages.
+    /// Default: Warn (scan and log, but allow through).
+    #[serde(default)]
+    pub prompt_guard: PromptGuardPolicy,
 }
 
 impl Default for ChannelOverrides {
@@ -108,6 +113,7 @@ impl Default for ChannelOverrides {
             usage_footer: None,
             typing_mode: None,
             lifecycle_reactions: true,
+            prompt_guard: PromptGuardPolicy::default(),
         }
     }
 }
@@ -1739,6 +1745,55 @@ pub struct ChannelsConfig {
     pub wecom: Option<WeComConfig>,
     /// MQTT pub/sub configuration (None = disabled).
     pub mqtt: Option<MqttConfig>,
+}
+
+impl ChannelsConfig {
+    /// Returns `true` if at least one channel adapter is configured.
+    pub fn any_configured(&self) -> bool {
+        self.telegram.is_some()
+            || self.discord.is_some()
+            || self.slack.is_some()
+            || self.whatsapp.is_some()
+            || self.signal.is_some()
+            || self.matrix.is_some()
+            || self.email.is_some()
+            || self.teams.is_some()
+            || self.mattermost.is_some()
+            || self.irc.is_some()
+            || self.google_chat.is_some()
+            || self.twitch.is_some()
+            || self.rocketchat.is_some()
+            || self.zulip.is_some()
+            || self.xmpp.is_some()
+            || self.line.is_some()
+            || self.viber.is_some()
+            || self.messenger.is_some()
+            || self.reddit.is_some()
+            || self.mastodon.is_some()
+            || self.bluesky.is_some()
+            || self.feishu.is_some()
+            || self.revolt.is_some()
+            || self.nextcloud.is_some()
+            || self.guilded.is_some()
+            || self.keybase.is_some()
+            || self.threema.is_some()
+            || self.nostr.is_some()
+            || self.webex.is_some()
+            || self.pumble.is_some()
+            || self.flock.is_some()
+            || self.twist.is_some()
+            || self.mumble.is_some()
+            || self.dingtalk.is_some()
+            || self.dingtalk_stream.is_some()
+            || self.discourse.is_some()
+            || self.gitter.is_some()
+            || self.ntfy.is_some()
+            || self.gotify.is_some()
+            || self.webhook.is_some()
+            || self.linkedin.is_some()
+            || self.wecom.is_some()
+            || self.mqtt.is_some()
+    }
 }
 
 /// Telegram channel adapter configuration.
@@ -3948,7 +4003,7 @@ mod tests {
     #[test]
     fn test_channel_overrides_defaults() {
         let ov = ChannelOverrides::default();
-        assert_eq!(ov.dm_policy, DmPolicy::Respond);
+        assert_eq!(ov.dm_policy, DmPolicy::AllowedOnly);
         assert_eq!(ov.group_policy, GroupPolicy::MentionOnly);
         assert_eq!(ov.rate_limit_per_user, 0);
         assert!(!ov.threading);
@@ -4024,7 +4079,7 @@ mod tests {
         let ov: ChannelOverrides = serde_json::from_str(json).unwrap();
         assert!(!ov.lifecycle_reactions);
         // Other fields should have their defaults
-        assert_eq!(ov.dm_policy, DmPolicy::Respond);
+        assert_eq!(ov.dm_policy, DmPolicy::AllowedOnly);
         assert!(ov.model.is_none());
     }
 

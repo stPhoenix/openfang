@@ -731,6 +731,12 @@ impl OpenFangKernel {
         let auth = AuthManager::new(&config.users);
         if auth.is_enabled() {
             info!("RBAC enabled with {} users", auth.user_count());
+        } else if config.channels.any_configured() {
+            warn!(
+                "One or more channels are configured but RBAC is disabled (no [[users]] in config). \
+                 Anyone who can reach the bot can interact with it. \
+                 Add [[users]] entries to config.toml for access control."
+            );
         }
 
         // Initialize model catalog, detect provider auth, and apply URL overrides
