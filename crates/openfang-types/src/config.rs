@@ -1030,6 +1030,11 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// SHA-256 hash of the API key (hex-encoded). When set, takes precedence
+    /// over `api_key` for authentication — the plaintext key is not needed in config.
+    /// Generate with: `echo -n "your-api-key" | sha256sum | cut -d' ' -f1`
+    #[serde(default)]
+    pub api_key_hash: Option<String>,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1177,8 +1182,9 @@ pub struct AuthConfig {
     pub enabled: bool,
     /// Admin username.
     pub username: String,
-    /// SHA256 hash of the password (hex-encoded).
-    /// Generate with: openfang auth hash-password
+    /// Password hash in Argon2 PHC format (`$argon2id$v=19$...`).
+    /// Legacy SHA-256 hex hashes are accepted and auto-migrated on next login.
+    /// Generate with: `openfang auth hash-password`
     pub password_hash: String,
     /// Session token lifetime in hours (default: 168 = 7 days).
     pub session_ttl_hours: u64,
@@ -1351,6 +1357,7 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            api_key_hash: None,
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -1440,6 +1447,14 @@ impl std::fmt::Debug for KernelConfig {
                     "<empty>"
                 } else {
                     "<redacted>"
+                },
+            )
+            .field(
+                "api_key_hash",
+                &if self.api_key_hash.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
                 },
             )
             .field("mode", &self.mode)

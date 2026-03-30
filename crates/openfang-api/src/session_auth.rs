@@ -1,6 +1,10 @@
 //! Stateless session token authentication for the dashboard.
 //! Tokens are HMAC-SHA256 signed and contain username + expiry.
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -55,20 +59,65 @@ pub fn verify_session_token(token: &str, secret: &str) -> Option<String> {
     }
 }
 
-/// Hash a password with SHA256 for config storage.
-pub fn hash_password(password: &str) -> String {
-    use sha2::Digest;
-    hex::encode(Sha256::digest(password.as_bytes()))
+/// Result of password verification.
+pub struct PasswordVerifyResult {
+    pub valid: bool,
+    /// If true, the stored hash is legacy SHA-256 and should be re-hashed with Argon2.
+    pub needs_migration: bool,
 }
 
-/// Verify a password against a stored SHA256 hash (constant-time).
-pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let computed = hash_password(password);
-    use subtle::ConstantTimeEq;
-    if computed.len() != stored_hash.len() {
-        return false;
+/// Hash a password with Argon2id for config storage.
+/// Returns a PHC-format string: `$argon2id$v=19$m=...,t=...,p=...$<salt>$<hash>`
+pub fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2 hashing should not fail")
+        .to_string()
+}
+
+/// Verify a password against a stored hash.
+/// Supports both Argon2 PHC strings and legacy SHA-256 hex hashes.
+/// When a legacy hash matches, `needs_migration` is set so the caller can upgrade it.
+pub fn verify_password(password: &str, stored_hash: &str) -> PasswordVerifyResult {
+    if stored_hash.starts_with("$argon2") {
+        // Argon2 PHC format
+        let parsed = match PasswordHash::new(stored_hash) {
+            Ok(h) => h,
+            Err(_) => {
+                return PasswordVerifyResult {
+                    valid: false,
+                    needs_migration: false,
+                }
+            }
+        };
+        let valid = Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok();
+        PasswordVerifyResult {
+            valid,
+            needs_migration: false,
+        }
+    } else {
+        // Legacy SHA-256 hex format
+        let computed = legacy_sha256_hash(password);
+        use subtle::ConstantTimeEq;
+        let valid = if computed.len() != stored_hash.len() {
+            false
+        } else {
+            computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
+        };
+        PasswordVerifyResult {
+            valid,
+            needs_migration: valid,
+        }
     }
-    computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
+}
+
+/// Legacy SHA-256 hash for backward-compatible verification during migration.
+fn legacy_sha256_hash(password: &str) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(password.as_bytes()))
 }
 
 #[cfg(test)]
@@ -78,8 +127,37 @@ mod tests {
     #[test]
     fn test_hash_and_verify_password() {
         let hash = hash_password("secret123");
-        assert!(verify_password("secret123", &hash));
-        assert!(!verify_password("wrong", &hash));
+        assert!(hash.starts_with("$argon2"));
+        let result = verify_password("secret123", &hash);
+        assert!(result.valid);
+        assert!(!result.needs_migration);
+
+        let result = verify_password("wrong", &hash);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_legacy_sha256_verify_and_migration() {
+        // Simulate a legacy SHA-256 hash stored in config
+        let legacy_hash = legacy_sha256_hash("secret123");
+        assert_eq!(legacy_hash.len(), 64); // SHA-256 hex = 64 chars
+
+        let result = verify_password("secret123", &legacy_hash);
+        assert!(result.valid);
+        assert!(result.needs_migration);
+
+        let result = verify_password("wrong", &legacy_hash);
+        assert!(!result.valid);
+        assert!(!result.needs_migration);
+    }
+
+    #[test]
+    fn test_argon2_hashes_are_unique() {
+        let h1 = hash_password("same");
+        let h2 = hash_password("same");
+        assert_ne!(h1, h2); // Different salts → different hashes
+        assert!(verify_password("same", &h1).valid);
+        assert!(verify_password("same", &h2).valid);
     }
 
     #[test]
@@ -104,6 +182,7 @@ mod tests {
 
     #[test]
     fn test_password_hash_length_mismatch() {
-        assert!(!verify_password("x", "short"));
+        let result = verify_password("x", "short");
+        assert!(!result.valid);
     }
 }

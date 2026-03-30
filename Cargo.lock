@@ -3957,6 +3957,7 @@ dependencies = [
 name = "openfang-api"
 version = "0.5.1"
 dependencies = [
+ "argon2",
  "async-trait",
  "axum",
  "base64 0.22.1",

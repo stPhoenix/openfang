@@ -47,6 +47,9 @@ pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Bod
 #[derive(Clone)]
 pub struct AuthState {
     pub api_key: String,
+    /// SHA-256 hash of the API key. When set, token auth compares against this
+    /// hash instead of the plaintext `api_key`.
+    pub api_key_hash: Option<String>,
     pub auth_enabled: bool,
     pub session_secret: String,
     pub require_auth_for_reads: bool,
@@ -168,11 +171,7 @@ pub async fn auth(
 
     // SECURITY: Use constant-time comparison to prevent timing attacks.
     let header_auth = api_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
+        verify_api_token(token, api_key, auth_state.api_key_hash.as_deref())
     });
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
@@ -184,11 +183,7 @@ pub async fn auth(
 
     // SECURITY: Use constant-time comparison to prevent timing attacks.
     let query_auth = query_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
+        verify_api_token(token, api_key, auth_state.api_key_hash.as_deref())
     });
 
     // Accept if either auth method matches
@@ -237,6 +232,28 @@ fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
                     .map(|v| v.to_string())
             })
         })
+}
+
+/// Verify a provided API token against the configured key.
+/// When `api_key_hash` is set, SHA-256 hashes the token and compares against the stored hash.
+/// Otherwise, compares the plaintext token directly. Both paths use constant-time comparison.
+fn verify_api_token(token: &str, plaintext_key: &str, api_key_hash: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
+    if let Some(stored_hash) = api_key_hash {
+        // Hash-based: SHA-256 the provided token, compare to stored hash.
+        use sha2::{Digest, Sha256};
+        let computed = hex::encode(Sha256::digest(token.as_bytes()));
+        if computed.len() != stored_hash.len() {
+            return false;
+        }
+        computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
+    } else {
+        // Plaintext comparison (existing behavior).
+        if token.len() != plaintext_key.len() {
+            return false;
+        }
+        token.as_bytes().ct_eq(plaintext_key.as_bytes()).into()
+    }
 }
 
 /// Security headers middleware — applied to ALL API responses.
@@ -298,6 +315,7 @@ mod tests {
     fn strict_auth_state() -> AuthState {
         AuthState {
             api_key: "test-secret".to_string(),
+            api_key_hash: None,
             auth_enabled: false,
             session_secret: String::new(),
             require_auth_for_reads: true,
@@ -307,6 +325,7 @@ mod tests {
     fn permissive_auth_state() -> AuthState {
         AuthState {
             api_key: "test-secret".to_string(),
+            api_key_hash: None,
             auth_enabled: false,
             session_secret: String::new(),
             require_auth_for_reads: false,

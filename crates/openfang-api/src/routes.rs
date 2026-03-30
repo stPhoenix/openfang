@@ -11374,7 +11374,10 @@ pub async fn auth_login(
         }
     };
 
-    if !username_ok || !crate::session_auth::verify_password(password, &auth_cfg.password_hash) {
+    let verify_result =
+        crate::session_auth::verify_password(password, &auth_cfg.password_hash);
+
+    if !username_ok || !verify_result.valid {
         // Audit log the failed attempt
         state.kernel.audit_log.record(
             "system",
@@ -11389,6 +11392,31 @@ pub async fn auth_login(
                 serde_json::json!({"error": "Invalid credentials"}).to_string(),
             ))
             .unwrap();
+    }
+
+    // Auto-migrate legacy SHA-256 password hash to Argon2 on successful login.
+    if verify_result.needs_migration {
+        let new_hash = crate::session_auth::hash_password(password);
+        let config_path = state.kernel.config.home_dir.join("config.toml");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut doc) = content.parse::<toml::Value>() {
+                if let Some(auth) = doc.get_mut("auth").and_then(|a| a.as_table_mut()) {
+                    auth.insert(
+                        "password_hash".to_string(),
+                        toml::Value::String(new_hash),
+                    );
+                    if let Ok(serialized) = toml::to_string_pretty(&doc) {
+                        if let Err(e) = std::fs::write(&config_path, serialized) {
+                            tracing::warn!("Failed to write migrated password hash: {e}");
+                        } else {
+                            tracing::info!(
+                                "Migrated dashboard password hash from SHA-256 to Argon2"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Derive the session secret the same way as server.rs
