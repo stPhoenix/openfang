@@ -104,7 +104,7 @@ pub struct OpenFangKernel {
     pub a2a_external_agents: std::sync::Mutex<Vec<(String, openfang_runtime::a2a::AgentCard)>>,
     /// Web tools context (multi-provider search + SSRF-protected fetch + caching).
     pub web_ctx: openfang_runtime::web_search::WebToolsContext,
-    /// Browser automation manager (Playwright bridge sessions).
+    /// Browser automation manager (native CDP over WebSocket).
     pub browser_ctx: openfang_runtime::browser::BrowserManager,
     /// Media understanding engine (image description, audio transcription).
     pub media_engine: openfang_runtime::media_understanding::MediaEngine,

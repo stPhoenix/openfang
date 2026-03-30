@@ -498,7 +498,7 @@ fn run_returns_python3(cmd: &str) -> bool {
 /// 1. CHROME_PATH / CHROMIUM_PATH env vars
 /// 2. Common binary names on PATH (chromium, chromium-browser, google-chrome, etc.)
 /// 3. Well-known install paths (Windows Program Files, macOS Applications, Linux /usr)
-/// 4. Playwright cache (~/.cache/ms-playwright/chromium-*)
+/// 4. Legacy Playwright cache (~/.cache/ms-playwright/chromium-*)
 fn check_chromium_available() -> bool {
     // 1. Env vars
     for var in &["CHROME_PATH", "CHROMIUM_PATH"] {
@@ -559,7 +559,7 @@ fn check_chromium_available() -> bool {
         }
     }
 
-    // 4. Playwright cache
+    // 4. Legacy Playwright cache (may contain usable Chromium binaries)
     if let Some(home) = std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())
@@ -844,26 +844,23 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        // Browser hand requires python3 (non-optional) + chromium (optional).
-        // requirements_met only reflects non-optional requirements.
-        // degraded = active + any requirement (including optional) unsatisfied.
+        // Browser hand requires chromium (non-optional) for native CDP automation.
         let instance = reg.activate("browser", HashMap::new()).unwrap();
         let r = reg.readiness("browser").unwrap();
         assert!(r.active);
 
         // Check individual requirements
         let reqs = reg.check_requirements("browser").unwrap();
-        let python_met = reqs.iter().any(|(req, ok)| req.key == "python3" && *ok);
         let chromium_met = reqs.iter().any(|(req, ok)| req.key == "chromium" && *ok);
 
-        // requirements_met only gates on non-optional (python3)
-        assert_eq!(r.requirements_met, python_met);
+        // requirements_met gates on the chromium requirement
+        assert_eq!(r.requirements_met, chromium_met);
 
         // degraded = active + any requirement unsatisfied
-        if python_met && chromium_met {
+        if chromium_met {
             assert!(!r.degraded); // all met, not degraded
         } else {
-            assert!(r.degraded); // something is missing, degraded
+            assert!(r.degraded); // chromium missing, degraded
         }
 
         reg.deactivate(instance.instance_id).unwrap();

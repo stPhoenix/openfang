@@ -94,7 +94,7 @@ All compiled into the binary. No downloading, no pip install, no Docker pull.
 | **Predictor** | Superforecasting engine. Collects signals from multiple sources, builds calibrated reasoning chains, makes predictions with confidence intervals, and tracks its own accuracy using Brier scores. Has a contrarian mode that deliberately argues against consensus. |
 | **Researcher** | Deep autonomous researcher. Cross-references multiple sources, evaluates credibility using CRAAP criteria (Currency, Relevance, Authority, Accuracy, Purpose), generates cited reports with APA formatting, supports multiple languages. |
 | **Twitter** | Autonomous Twitter/X account manager. Creates content in 7 rotating formats, schedules posts for optimal engagement, responds to mentions, tracks performance metrics. Has an approval queue — nothing posts without your OK. |
-| **Browser** | Web automation agent. Navigates sites, fills forms, clicks buttons, handles multi-step workflows. Uses Playwright bridge with session persistence. **Mandatory purchase approval gate** — it will never spend your money without explicit confirmation. |
+| **Browser** | Web automation agent. Navigates sites, fills forms, clicks buttons, handles multi-step workflows. Native CDP browser with session persistence. **Mandatory purchase approval gate** — it will never spend your money without explicit confirmation. |
 
 ```bash
 # Activate the Researcher Hand — it starts working immediately

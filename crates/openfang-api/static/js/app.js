@@ -100,8 +100,8 @@ function toolIcon(toolName) {
   // Cron/schedule
   if (n.indexOf('cron_') === 0 || n.indexOf('schedule_') === 0)
     return '<svg ' + s + '><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
-  // Browser/playwright
-  if (n.indexOf('browser_') === 0 || n.indexOf('playwright_') === 0)
+  // Browser (native CDP)
+  if (n.indexOf('browser_') === 0)
     return '<svg ' + s + '><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>';
   // Container/docker
   if (n.indexOf('container_') === 0 || n.indexOf('docker_') === 0)
