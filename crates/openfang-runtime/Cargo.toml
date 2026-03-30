@@ -35,6 +35,15 @@ http = "1"
 tokio-tungstenite = "0.24"
 shlex = "1"
 
+# Optional ML/NER dependencies (behind `ner` feature)
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[features]
+default = []
+ner = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -1151,6 +1151,35 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// PII detection configuration (regex + optional NER).
+    #[serde(default)]
+    pub pii: PiiConfig,
+}
+
+/// PII detection configuration.
+///
+/// Controls whether ML-based NER is used alongside regex for PII detection.
+/// Configure in `[pii]` section of config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PiiConfig {
+    /// Enable ML-based NER detection globally. Individual agents can override
+    /// via `taint_policy.ner_enabled`.
+    pub ner_enabled: bool,
+    /// Directory containing the ONNX NER model files (model.onnx, tokenizer.json).
+    pub model_dir: PathBuf,
+    /// Minimum confidence threshold for NER detections (0.0–1.0).
+    pub confidence_threshold: f32,
+}
+
+impl Default for PiiConfig {
+    fn default() -> Self {
+        Self {
+            ner_enabled: false,
+            model_dir: PathBuf::from("~/.openfang/models/ner"),
+            confidence_threshold: 0.85,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1394,6 +1423,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            pii: PiiConfig::default(),
         }
     }
 }

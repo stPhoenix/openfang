@@ -88,8 +88,26 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
 // PII / secret heuristic detectors for taint tracking
 // ---------------------------------------------------------------------------
 
-/// Detect PII patterns in free text. Returns descriptions of matched patterns.
-fn detect_pii_patterns(text: &str) -> Vec<&'static str> {
+/// A single PII detection hit, from either regex or NER.
+#[derive(Debug, Clone)]
+struct PiiMatch {
+    /// Human-readable kind (e.g. "email address", "PERSON").
+    kind: &'static str,
+    /// Byte offset start (inclusive) in the source text.
+    start: usize,
+    /// Byte offset end (exclusive) in the source text.
+    end: usize,
+    /// Confidence score: 1.0 for regex matches, model score for NER.
+    confidence: f32,
+    /// Placeholder used when redacting (e.g. "[EMAIL]", "[PERSON]").
+    placeholder: &'static str,
+}
+
+/// Detect PII patterns in free text using regex and optionally NER.
+///
+/// When `ner_enabled` is true and the `ner` feature is active with a loaded model,
+/// ML-based NER runs alongside regex to detect person names and other entities.
+fn detect_pii_patterns(text: &str, ner_enabled: bool, ner_confidence: f32) -> Vec<PiiMatch> {
     use std::sync::LazyLock;
 
     static RE_EMAIL: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
@@ -104,20 +122,121 @@ fn detect_pii_patterns(text: &str) -> Vec<&'static str> {
         regex_lite::Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{3,4}\b").unwrap()
     });
 
-    let mut found = Vec::new();
-    if RE_EMAIL.is_match(text) {
-        found.push("email address");
+    let mut matches = Vec::new();
+
+    for m in RE_EMAIL.find_iter(text) {
+        matches.push(PiiMatch {
+            kind: "email address",
+            start: m.start(),
+            end: m.end(),
+            confidence: 1.0,
+            placeholder: "[EMAIL]",
+        });
     }
-    if RE_SSN.is_match(text) {
-        found.push("SSN");
+    for m in RE_SSN.find_iter(text) {
+        matches.push(PiiMatch {
+            kind: "SSN",
+            start: m.start(),
+            end: m.end(),
+            confidence: 1.0,
+            placeholder: "[SSN]",
+        });
     }
-    if RE_PHONE.is_match(text) {
-        found.push("phone number");
+    for m in RE_PHONE.find_iter(text) {
+        matches.push(PiiMatch {
+            kind: "phone number",
+            start: m.start(),
+            end: m.end(),
+            confidence: 1.0,
+            placeholder: "[PHONE]",
+        });
     }
-    if RE_CC.is_match(text) {
-        found.push("credit card number");
+    for m in RE_CC.find_iter(text) {
+        matches.push(PiiMatch {
+            kind: "credit card number",
+            start: m.start(),
+            end: m.end(),
+            confidence: 1.0,
+            placeholder: "[CREDIT_CARD]",
+        });
     }
-    found
+
+    // Run NER if enabled and available.
+    #[cfg(feature = "ner")]
+    if ner_enabled {
+        if let Some(engine) = crate::ner_engine::global_ner_engine() {
+            let entities = engine.predict(text, Some(ner_confidence));
+            for entity in entities {
+                if entity.entity_type.is_pii() {
+                    matches.push(PiiMatch {
+                        kind: entity.entity_type.label_str(),
+                        start: entity.start,
+                        end: entity.end,
+                        confidence: entity.confidence,
+                        placeholder: entity.entity_type.pii_placeholder(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Suppress unused-variable warnings when `ner` feature is off.
+    #[cfg(not(feature = "ner"))]
+    {
+        let _ = (ner_enabled, ner_confidence);
+    }
+
+    // Deduplicate overlapping spans: keep the one with higher confidence.
+    dedup_overlapping_spans(&mut matches);
+
+    matches
+}
+
+/// Remove overlapping PII matches, keeping the higher-confidence one.
+fn dedup_overlapping_spans(matches: &mut Vec<PiiMatch>) {
+    if matches.len() < 2 {
+        return;
+    }
+    matches.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut i = 0;
+    while i + 1 < matches.len() {
+        if matches[i + 1].start < matches[i].end {
+            // Overlapping — remove the lower-confidence one
+            if matches[i].confidence >= matches[i + 1].confidence {
+                matches.remove(i + 1);
+            } else {
+                matches.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Replace detected PII spans with placeholders.
+fn redact_pii(text: &str, matches: &[PiiMatch]) -> String {
+    if matches.is_empty() {
+        return text.to_string();
+    }
+    let mut sorted: Vec<&PiiMatch> = matches.iter().collect();
+    sorted.sort_by(|a, b| b.start.cmp(&a.start));
+
+    let mut result = text.to_string();
+    for m in sorted {
+        if m.start < result.len() && m.end <= result.len() {
+            result.replace_range(m.start..m.end, m.placeholder);
+        }
+    }
+    result
+}
+
+/// Format a human-readable summary of detected PII for violation messages.
+fn format_pii_violation(matches: &[PiiMatch]) -> String {
+    let kinds: Vec<&str> = matches.iter().map(|m| m.kind).collect();
+    let mut unique: Vec<&str> = kinds.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    format!("PII detected: {}", unique.join(", "))
 }
 
 /// Detect secret-like patterns in free text (API keys, tokens, etc.).
@@ -141,9 +260,14 @@ fn detect_secret_patterns(text: &str) -> bool {
 }
 
 /// Build taint labels from heuristic detection results.
+///
+/// Uses regex-only PII detection (no NER) for fast taint labeling in the
+/// general path. NER-augmented detection is handled by [`enforce_pii`] for
+/// PII-specific enforcement.
 fn detect_taint_labels(text: &str) -> HashSet<TaintLabel> {
     let mut labels = HashSet::new();
-    if !detect_pii_patterns(text).is_empty() {
+    // Regex-only check (fast path, ner_enabled=false)
+    if !detect_pii_patterns(text, false, 0.0).is_empty() {
         labels.insert(TaintLabel::Pii);
     }
     if detect_secret_patterns(text) {
@@ -272,6 +396,84 @@ async fn enforce_taint_policy(
                     content: format!("Taint approval error: {e}"),
                     is_error: true,
                 }),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PII-specific enforcement (block / redact / approve)
+// ---------------------------------------------------------------------------
+
+/// Result of PII enforcement check.
+enum PiiEnforcement {
+    /// No PII detected — proceed with original text.
+    Clean,
+    /// PII detected and redacted — proceed with modified text.
+    Redacted(String),
+    /// PII detected and blocked — return this error result.
+    Blocked(ToolResult),
+}
+
+/// Run PII detection (regex + optional NER) and apply the agent's `pii_action`.
+///
+/// This handles the PII-specific path. Secret and UntrustedAgent labels are
+/// still handled by the existing `check_taint_*` / `enforce_taint_policy` flow.
+async fn enforce_pii(
+    text: &str,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    tool_name: &str,
+    tool_use_id: &str,
+) -> PiiEnforcement {
+    use openfang_types::taint::PiiAction;
+
+    // Look up agent's taint policy to get NER + pii_action settings.
+    let policy = match kernel {
+        Some(kh) => kh.get_taint_policy(caller_agent_id.unwrap_or("unknown")),
+        None => openfang_types::taint::TaintPolicy::default(),
+    };
+
+    // If PII label is in allow_labels, skip the PII-specific check entirely.
+    if policy.allow_labels.contains(&TaintLabel::Pii) {
+        return PiiEnforcement::Clean;
+    }
+
+    let matches = detect_pii_patterns(text, policy.ner_enabled, policy.ner_confidence);
+    if matches.is_empty() {
+        return PiiEnforcement::Clean;
+    }
+
+    let violation_msg = format_pii_violation(&matches);
+    warn!(tool_name, %violation_msg, "PII detected in outgoing data");
+
+    match policy.pii_action {
+        PiiAction::Block => PiiEnforcement::Blocked(ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: format!("PII blocked: {violation_msg}"),
+            is_error: true,
+        }),
+        PiiAction::Redact => {
+            let redacted = redact_pii(text, &matches);
+            debug!(tool_name, "PII redacted in outgoing data");
+            PiiEnforcement::Redacted(redacted)
+        }
+        PiiAction::Approve => {
+            // Delegate to the existing approval gate.
+            let mut labels = HashSet::new();
+            labels.insert(TaintLabel::Pii);
+            match enforce_taint_policy(
+                &violation_msg,
+                &labels,
+                kernel,
+                caller_agent_id,
+                tool_name,
+                tool_use_id,
+            )
+            .await
+            {
+                Some(blocked) => PiiEnforcement::Blocked(blocked),
+                None => PiiEnforcement::Clean, // User approved
             }
         }
     }
@@ -549,23 +751,43 @@ pub async fn execute_tool(
                 }
             }
 
-            // Taint check for PII/secrets
-            if let Some(violation) = check_taint_agent_message(message) {
-                let labels = detect_taint_labels(message);
-                if let Some(blocked) = enforce_taint_policy(
-                    &violation,
-                    &labels,
-                    kernel,
-                    caller_agent_id,
-                    "agent_send",
-                    tool_use_id,
-                )
-                .await
-                {
-                    return blocked;
+            // PII-specific enforcement (block / redact / approve).
+            let effective_input = match enforce_pii(
+                message, kernel, caller_agent_id, "agent_send", tool_use_id,
+            ).await {
+                PiiEnforcement::Blocked(result) => return result,
+                PiiEnforcement::Redacted(redacted) => {
+                    let mut patched = input.clone();
+                    patched["message"] = serde_json::Value::String(redacted);
+                    patched
+                }
+                PiiEnforcement::Clean => input.clone(),
+            };
+
+            // Secret / untrusted-agent taint check (non-PII labels).
+            let check_text = effective_input["message"].as_str().unwrap_or(message);
+            if let Some(violation) = check_taint_agent_message(check_text) {
+                let labels = detect_taint_labels(check_text);
+                // Only enforce if non-PII labels remain (secrets, untrusted agent).
+                let non_pii: HashSet<TaintLabel> = labels.into_iter()
+                    .filter(|l| !matches!(l, TaintLabel::Pii))
+                    .collect();
+                if !non_pii.is_empty() {
+                    if let Some(blocked) = enforce_taint_policy(
+                        &violation,
+                        &non_pii,
+                        kernel,
+                        caller_agent_id,
+                        "agent_send",
+                        tool_use_id,
+                    )
+                    .await
+                    {
+                        return blocked;
+                    }
                 }
             }
-            tool_agent_send(input, kernel).await
+            tool_agent_send(&effective_input, kernel).await
         }
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
@@ -584,23 +806,48 @@ pub async fn execute_tool(
                 .get("value")
                 .map(|v| v.to_string())
                 .unwrap_or_default();
-            if let Some(violation) = check_taint_memory_store(key, &value_str) {
-                let combined = format!("{key} {value_str}");
-                let labels = detect_taint_labels(&combined);
-                if let Some(blocked) = enforce_taint_policy(
-                    &violation,
-                    &labels,
-                    kernel,
-                    caller_agent_id,
-                    "memory_store",
-                    tool_use_id,
-                )
-                .await
-                {
-                    return blocked;
+            let combined = format!("{key} {value_str}");
+
+            // PII-specific enforcement (block / redact / approve).
+            let effective_input = match enforce_pii(
+                &combined, kernel, caller_agent_id, "memory_store", tool_use_id,
+            ).await {
+                PiiEnforcement::Blocked(result) => return result,
+                PiiEnforcement::Redacted(redacted) => {
+                    let mut patched = input.clone();
+                    patched["value"] = serde_json::Value::String(redacted);
+                    patched
+                }
+                PiiEnforcement::Clean => input.clone(),
+            };
+
+            // Secret taint check (non-PII labels).
+            let eff_val = effective_input
+                .get("value")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if let Some(violation) = check_taint_memory_store(key, &eff_val) {
+                let labels_combined = format!("{key} {eff_val}");
+                let labels = detect_taint_labels(&labels_combined);
+                let non_pii: HashSet<TaintLabel> = labels.into_iter()
+                    .filter(|l| !matches!(l, TaintLabel::Pii))
+                    .collect();
+                if !non_pii.is_empty() {
+                    if let Some(blocked) = enforce_taint_policy(
+                        &violation,
+                        &non_pii,
+                        kernel,
+                        caller_agent_id,
+                        "memory_store",
+                        tool_use_id,
+                    )
+                    .await
+                    {
+                        return blocked;
+                    }
                 }
             }
-            tool_memory_store(input, kernel)
+            tool_memory_store(&effective_input, kernel)
         }
         "memory_recall" => tool_memory_recall(input, kernel),
 
@@ -610,22 +857,47 @@ pub async fn execute_tool(
             let title = input["title"].as_str().unwrap_or("");
             let description = input["description"].as_str().unwrap_or("");
             let combined = format!("{title} {description}");
-            if let Some(violation) = check_taint_data_channel(&combined) {
-                let labels = detect_taint_labels(&combined);
-                if let Some(blocked) = enforce_taint_policy(
-                    &violation,
-                    &labels,
-                    kernel,
-                    caller_agent_id,
-                    "task_post",
-                    tool_use_id,
-                )
-                .await
-                {
-                    return blocked;
+
+            // PII-specific enforcement.
+            let effective_input = match enforce_pii(
+                &combined, kernel, caller_agent_id, "task_post", tool_use_id,
+            ).await {
+                PiiEnforcement::Blocked(result) => return result,
+                PiiEnforcement::Redacted(redacted) => {
+                    let mut patched = input.clone();
+                    patched["description"] = serde_json::Value::String(redacted);
+                    patched
+                }
+                PiiEnforcement::Clean => input.clone(),
+            };
+
+            // Secret taint check.
+            let eff_combined = format!(
+                "{} {}",
+                effective_input["title"].as_str().unwrap_or(""),
+                effective_input["description"].as_str().unwrap_or("")
+            );
+            if let Some(violation) = check_taint_data_channel(&eff_combined) {
+                let labels = detect_taint_labels(&eff_combined);
+                let non_pii: HashSet<TaintLabel> = labels.into_iter()
+                    .filter(|l| !matches!(l, TaintLabel::Pii))
+                    .collect();
+                if !non_pii.is_empty() {
+                    if let Some(blocked) = enforce_taint_policy(
+                        &violation,
+                        &non_pii,
+                        kernel,
+                        caller_agent_id,
+                        "task_post",
+                        tool_use_id,
+                    )
+                    .await
+                    {
+                        return blocked;
+                    }
                 }
             }
-            tool_task_post(input, kernel, caller_agent_id).await
+            tool_task_post(&effective_input, kernel, caller_agent_id).await
         }
         "task_claim" => tool_task_claim(kernel, caller_agent_id).await,
         "task_complete" => tool_task_complete(input, kernel).await,
@@ -637,22 +909,47 @@ pub async fn execute_tool(
                 .map(|v| v.to_string())
                 .unwrap_or_default();
             let combined = format!("{event_type} {payload_str}");
-            if let Some(violation) = check_taint_data_channel(&combined) {
-                let labels = detect_taint_labels(&combined);
-                if let Some(blocked) = enforce_taint_policy(
-                    &violation,
-                    &labels,
-                    kernel,
-                    caller_agent_id,
-                    "event_publish",
-                    tool_use_id,
-                )
-                .await
-                {
-                    return blocked;
+
+            // PII-specific enforcement.
+            let effective_input = match enforce_pii(
+                &combined, kernel, caller_agent_id, "event_publish", tool_use_id,
+            ).await {
+                PiiEnforcement::Blocked(result) => return result,
+                PiiEnforcement::Redacted(redacted) => {
+                    let mut patched = input.clone();
+                    patched["payload"] = serde_json::Value::String(redacted);
+                    patched
+                }
+                PiiEnforcement::Clean => input.clone(),
+            };
+
+            // Secret taint check.
+            let eff_payload = effective_input
+                .get("payload")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let eff_combined = format!("{event_type} {eff_payload}");
+            if let Some(violation) = check_taint_data_channel(&eff_combined) {
+                let labels = detect_taint_labels(&eff_combined);
+                let non_pii: HashSet<TaintLabel> = labels.into_iter()
+                    .filter(|l| !matches!(l, TaintLabel::Pii))
+                    .collect();
+                if !non_pii.is_empty() {
+                    if let Some(blocked) = enforce_taint_policy(
+                        &violation,
+                        &non_pii,
+                        kernel,
+                        caller_agent_id,
+                        "event_publish",
+                        tool_use_id,
+                    )
+                    .await
+                    {
+                        return blocked;
+                    }
                 }
             }
-            tool_event_publish(input, kernel).await
+            tool_event_publish(&effective_input, kernel).await
         }
 
         // Knowledge graph tools
@@ -4691,32 +4988,81 @@ mod tests {
 
     #[test]
     fn test_detect_pii_email() {
-        let patterns = detect_pii_patterns("Contact john@example.com for details");
-        assert!(patterns.contains(&"email address"));
+        let matches = detect_pii_patterns("Contact john@example.com for details", false, 0.0);
+        assert!(matches.iter().any(|m| m.kind == "email address"));
+        let email = matches.iter().find(|m| m.kind == "email address").unwrap();
+        assert_eq!(&"Contact john@example.com for details"[email.start..email.end], "john@example.com");
+        assert_eq!(email.placeholder, "[EMAIL]");
     }
 
     #[test]
     fn test_detect_pii_ssn() {
-        let patterns = detect_pii_patterns("SSN is 123-45-6789");
-        assert!(patterns.contains(&"SSN"));
+        let matches = detect_pii_patterns("SSN is 123-45-6789", false, 0.0);
+        assert!(matches.iter().any(|m| m.kind == "SSN"));
     }
 
     #[test]
     fn test_detect_pii_phone() {
-        let patterns = detect_pii_patterns("Call me at (555) 123-4567");
-        assert!(patterns.contains(&"phone number"));
+        let matches = detect_pii_patterns("Call me at (555) 123-4567", false, 0.0);
+        assert!(matches.iter().any(|m| m.kind == "phone number"));
     }
 
     #[test]
     fn test_detect_pii_credit_card() {
-        let patterns = detect_pii_patterns("Card: 4111 1111 1111 1111");
-        assert!(patterns.contains(&"credit card number"));
+        let matches = detect_pii_patterns("Card: 4111 1111 1111 1111", false, 0.0);
+        assert!(matches.iter().any(|m| m.kind == "credit card number"));
     }
 
     #[test]
     fn test_detect_pii_none() {
-        let patterns = detect_pii_patterns("Hello, please process the weekly report");
-        assert!(patterns.is_empty());
+        let matches = detect_pii_patterns("Hello, please process the weekly report", false, 0.0);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_redact_pii_email() {
+        let matches = detect_pii_patterns("Send to john@example.com please", false, 0.0);
+        let redacted = redact_pii("Send to john@example.com please", &matches);
+        assert_eq!(redacted, "Send to [EMAIL] please");
+    }
+
+    #[test]
+    fn test_redact_pii_multiple() {
+        let text = "Contact john@example.com, SSN 123-45-6789";
+        let matches = detect_pii_patterns(text, false, 0.0);
+        let redacted = redact_pii(text, &matches);
+        assert!(redacted.contains("[EMAIL]"));
+        assert!(redacted.contains("[SSN]"));
+        assert!(!redacted.contains("john@example.com"));
+        assert!(!redacted.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn test_redact_pii_empty() {
+        let redacted = redact_pii("Hello world", &[]);
+        assert_eq!(redacted, "Hello world");
+    }
+
+    #[test]
+    fn test_dedup_overlapping_spans() {
+        let mut matches = vec![
+            PiiMatch { kind: "a", start: 0, end: 10, confidence: 0.9, placeholder: "[A]" },
+            PiiMatch { kind: "b", start: 5, end: 15, confidence: 0.95, placeholder: "[B]" },
+        ];
+        dedup_overlapping_spans(&mut matches);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, "b"); // higher confidence wins
+    }
+
+    #[test]
+    fn test_format_pii_violation() {
+        let matches = vec![
+            PiiMatch { kind: "email address", start: 0, end: 5, confidence: 1.0, placeholder: "[EMAIL]" },
+            PiiMatch { kind: "SSN", start: 10, end: 20, confidence: 1.0, placeholder: "[SSN]" },
+        ];
+        let msg = format_pii_violation(&matches);
+        assert!(msg.contains("email address"));
+        assert!(msg.contains("SSN"));
     }
 
     #[test]

@@ -36,6 +36,10 @@ reqwest = { workspace = true }
 cron = "0.15"
 zeroize = { workspace = true }
 
+[features]
+default = []
+ner = ["openfang-runtime/ner"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -551,6 +551,32 @@ impl OpenFangKernel {
             warn!("Config: {}", w);
         }
 
+        // Initialize NER engine for ML-based PII detection (if enabled).
+        #[cfg(feature = "ner")]
+        if config.pii.ner_enabled {
+            let model_dir = if config.pii.model_dir.starts_with("~") {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(config.pii.model_dir.strip_prefix("~/").unwrap_or(config.pii.model_dir.as_ref()))
+            } else {
+                config.pii.model_dir.clone()
+            };
+            if model_dir.join("model.onnx").exists() {
+                match openfang_runtime::ner_engine::init_global_ner_engine(
+                    &model_dir,
+                    config.pii.confidence_threshold,
+                ) {
+                    Ok(()) => info!("NER PII detection engine loaded"),
+                    Err(e) => warn!("NER engine init failed, falling back to regex-only PII: {e}"),
+                }
+            } else {
+                info!(
+                    path = %model_dir.display(),
+                    "NER model not found — using regex-only PII detection"
+                );
+            }
+        }
+
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;

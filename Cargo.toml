@@ -130,6 +130,11 @@ html-escape = "0.2"
 # Lightweight regex
 regex-lite = "0.1"
 
+# ML / NER inference (optional, behind `ner` feature)
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+ndarray = "0.17"
+
 # MCP SDK (official Rust implementation)
 rmcp = { version = "1.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 
