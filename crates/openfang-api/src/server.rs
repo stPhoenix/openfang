@@ -206,6 +206,11 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_tools).put(routes::set_agent_tools),
         )
         .route(
+            "/api/agents/{id}/taint-policy",
+            axum::routing::get(routes::get_agent_taint_policy)
+                .put(routes::set_agent_taint_policy),
+        )
+        .route(
             "/api/agents/{id}/skills",
             axum::routing::get(routes::get_agent_skills).put(routes::set_agent_skills),
         )

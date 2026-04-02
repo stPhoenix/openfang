@@ -161,6 +161,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2 2 2 0 0 0-2 2v6"/><path d="M10 10.5V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.9-5.7-2.4L3.4 16a2 2 0 0 1 3.2-2.4L8 15"/></svg></span>
               <span class="nav-label">Hands</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'tools' }" @click="navigate('tools')" :aria-current="page === 'tools' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+              <span class="nav-label">Tools</span>
+            </a>
           </div>
         </template>
       </div>
@@ -927,12 +931,28 @@
                       <template x-if="!editingProvider">
                         <span>
                           <span class="detail-value" x-text="detailAgent.model_provider"></span>
-                          <button class="btn btn-ghost btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" @click="editingProvider = true; newProviderValue = detailAgent.model_provider">Change</button>
+                          <button class="btn btn-ghost btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" @click="editingProvider = true; newProviderValue = detailAgent.model_provider; loadAgentModelOptions()">Change</button>
                         </span>
                       </template>
                       <template x-if="editingProvider">
                         <span class="flex gap-1" style="align-items:center">
-                          <input class="form-input" style="width:160px;font-size:12px" x-model="newProviderValue" placeholder="provider" @keydown.enter="changeProvider()" @keydown.escape="editingProvider = false">
+                          <select class="form-select" style="width:200px;font-size:12px" x-model="newProviderValue" @change="onAgentProviderChange()">
+                            <template x-if="agentProvidersLoading"><option disabled>Loading...</option></template>
+                            <template x-if="!agentProvidersLoading && agentProviders.filter(p => !p.is_local).length > 0">
+                              <optgroup label="Cloud">
+                                <template x-for="p in agentProviders.filter(p => !p.is_local)" :key="p.id">
+                                  <option :value="p.id" x-text="p.display_name" :selected="p.id === newProviderValue"></option>
+                                </template>
+                              </optgroup>
+                            </template>
+                            <template x-if="!agentProvidersLoading && agentProviders.filter(p => p.is_local).length > 0">
+                              <optgroup label="Local">
+                                <template x-for="p in agentProviders.filter(p => p.is_local)" :key="p.id">
+                                  <option :value="p.id" x-text="p.display_name" :selected="p.id === newProviderValue"></option>
+                                </template>
+                              </optgroup>
+                            </template>
+                          </select>
                           <button class="btn btn-primary btn-sm" @click="changeProvider()" :disabled="modelSaving" style="padding:2px 10px">
                             <span x-show="!modelSaving">Save</span><span x-show="modelSaving">...</span>
                           </button>
@@ -944,12 +964,18 @@
                       <template x-if="!editingModel">
                         <span>
                           <span class="detail-value" x-text="detailAgent.model_name"></span>
-                          <button class="btn btn-ghost btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" @click="editingModel = true; newModelValue = detailAgent.model_provider + '/' + detailAgent.model_name">Change</button>
+                          <button class="btn btn-ghost btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" @click="editingModel = true; newProviderValue = detailAgent.model_provider; newModelValue = detailAgent.model_name; loadAgentModelOptions()">Change</button>
                         </span>
                       </template>
                       <template x-if="editingModel">
                         <span class="flex gap-1" style="align-items:center">
-                          <input class="form-input" style="width:240px;font-size:12px" x-model="newModelValue" placeholder="provider/model" @keydown.enter="changeModel()" @keydown.escape="editingModel = false">
+                          <select class="form-select" style="width:280px;font-size:12px" x-model="newModelValue">
+                            <template x-if="agentModelsLoading"><option disabled>Loading...</option></template>
+                            <template x-if="!agentModelsLoading && agentFilteredModels.length === 0"><option disabled>No models for this provider</option></template>
+                            <template x-for="m in agentFilteredModels" :key="m.id">
+                              <option :value="m.id" x-text="m.display_name || m.id" :selected="m.id === newModelValue"></option>
+                            </template>
+                          </select>
                           <button class="btn btn-primary btn-sm" @click="changeModel()" :disabled="modelSaving" style="padding:2px 10px">
                             <span x-show="!modelSaving">Save</span><span x-show="modelSaving">...</span>
                           </button>
@@ -1065,9 +1091,17 @@
                           <span class="badge" style="cursor:pointer" @click="removeAllowTool(t)" :title="'Click to remove ' + t"><span x-text="t"></span> &times;</span>
                         </template>
                       </div>
-                      <div class="flex gap-1">
-                        <input class="form-input" style="font-size:12px;flex:1" x-model="newAllowTool" placeholder="tool name" @keydown.enter="addAllowTool()">
-                        <button class="btn btn-ghost btn-sm" @click="addAllowTool()">Add</button>
+                      <div style="position:relative" x-data="{ open: false, q: '' }">
+                        <input class="form-input" style="font-size:12px;width:100%" x-model="q" placeholder="Search and add tools..." @focus="open = true" @click="open = true" @keydown.escape="open = false">
+                        <div x-show="open" @click.outside="open = false" style="position:absolute;z-index:50;top:100%;left:0;right:0;max-height:200px;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-top:4px;box-shadow:0 4px 12px rgba(0,0,0,0.2)">
+                          <template x-for="t in availableTools.filter(function(n) { return toolFilters.tool_allowlist.indexOf(n) === -1 && (!q || n.toLowerCase().indexOf(q.toLowerCase()) !== -1) })" :key="'ald-'+t">
+                            <div class="text-xs" style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border)" @mouseenter="$el.style.background='var(--hover)'" @mouseleave="$el.style.background=''" @click="addAllowTool(t); q = ''; open = false">
+                              <code x-text="t" style="color:var(--accent)"></code>
+                              <span class="text-dim" x-show="availableToolDescs[t]" x-text="' — ' + (availableToolDescs[t] || '').substring(0, 60)"></span>
+                            </div>
+                          </template>
+                          <div class="text-xs text-dim" style="padding:6px 10px" x-show="availableTools.filter(function(n) { return toolFilters.tool_allowlist.indexOf(n) === -1 && (!q || n.toLowerCase().indexOf(q.toLowerCase()) !== -1) }).length === 0">No matching tools</div>
+                        </div>
                       </div>
                     </div>
                     <div class="form-group">
@@ -1077,11 +1111,76 @@
                           <span class="badge badge-danger" style="cursor:pointer" @click="removeBlockTool(t)" :title="'Click to remove ' + t"><span x-text="t"></span> &times;</span>
                         </template>
                       </div>
-                      <div class="flex gap-1">
-                        <input class="form-input" style="font-size:12px;flex:1" x-model="newBlockTool" placeholder="tool name" @keydown.enter="addBlockTool()">
-                        <button class="btn btn-ghost btn-sm" @click="addBlockTool()">Add</button>
+                      <div style="position:relative" x-data="{ open: false, q: '' }">
+                        <input class="form-input" style="font-size:12px;width:100%" x-model="q" placeholder="Search and add tools..." @focus="open = true" @click="open = true" @keydown.escape="open = false">
+                        <div x-show="open" @click.outside="open = false" style="position:absolute;z-index:50;top:100%;left:0;right:0;max-height:200px;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-top:4px;box-shadow:0 4px 12px rgba(0,0,0,0.2)">
+                          <template x-for="t in availableTools.filter(function(n) { return toolFilters.tool_blocklist.indexOf(n) === -1 && (!q || n.toLowerCase().indexOf(q.toLowerCase()) !== -1) })" :key="'bld-'+t">
+                            <div class="text-xs" style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border)" @mouseenter="$el.style.background='var(--hover)'" @mouseleave="$el.style.background=''" @click="addBlockTool(t); q = ''; open = false">
+                              <code x-text="t" style="color:var(--accent)"></code>
+                              <span class="text-dim" x-show="availableToolDescs[t]" x-text="' — ' + (availableToolDescs[t] || '').substring(0, 60)"></span>
+                            </div>
+                          </template>
+                          <div class="text-xs text-dim" style="padding:6px 10px" x-show="availableTools.filter(function(n) { return toolFilters.tool_blocklist.indexOf(n) === -1 && (!q || n.toLowerCase().indexOf(q.toLowerCase()) !== -1) }).length === 0">No matching tools</div>
+                        </div>
                       </div>
                     </div>
+                  </div>
+
+                  <!-- PII / Taint Policy -->
+                  <div class="mt-4" style="border-top:1px solid var(--border);padding-top:16px">
+                    <h4 style="margin-bottom:8px;font-size:13px">PII &amp; Data Protection</h4>
+                    <p class="text-xs text-dim" style="margin-bottom:12px">Controls how PII and secrets are handled in cross-agent communication, shared memory, and outbound requests.</p>
+                    <div class="form-group">
+                      <label style="font-size:12px">Taint Mode</label>
+                      <select class="form-select" x-model="taintPolicy.mode">
+                        <option value="block">Block (hard deny on violations)</option>
+                        <option value="approve">Approve (ask user permission)</option>
+                        <option value="allow">Allow (skip taint checks)</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label style="font-size:12px">PII Action</label>
+                      <select class="form-select" x-model="taintPolicy.pii_action">
+                        <option value="block">Block (reject operation)</option>
+                        <option value="redact">Redact (replace with placeholders)</option>
+                        <option value="approve">Approve (ask user permission)</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label style="font-size:12px;display:flex;align-items:center;gap:8px">
+                        <input type="checkbox" x-model="taintPolicy.ner_enabled" style="width:auto">
+                        Enable ML-based NER Detection
+                      </label>
+                      <p class="text-xs text-dim">Uses ONNX model to detect person names, organizations, and other entities as PII.</p>
+                    </div>
+                    <div class="form-group" x-show="taintPolicy.ner_enabled">
+                      <label style="font-size:12px">NER Confidence Threshold</label>
+                      <div class="flex gap-2" style="align-items:center">
+                        <input type="range" x-model.number="taintPolicy.ner_confidence" min="0.5" max="1.0" step="0.05" style="flex:1">
+                        <span class="text-xs" style="min-width:35px;text-align:right" x-text="taintPolicy.ner_confidence.toFixed(2)"></span>
+                      </div>
+                    </div>
+                    <div class="form-group">
+                      <label style="font-size:12px">Exempt Labels</label>
+                      <p class="text-xs text-dim mb-1">Labels exempt from taint checks (e.g. allow PII forwarding).</p>
+                      <div class="flex flex-wrap gap-1 mb-1">
+                        <template x-for="(lbl, i) in taintPolicy.allow_labels" :key="'tl-'+i">
+                          <span class="badge" style="cursor:pointer" @click="taintPolicy.allow_labels.splice(i, 1)" :title="'Click to remove ' + lbl"><span x-text="lbl"></span> &times;</span>
+                        </template>
+                      </div>
+                      <div class="flex gap-1">
+                        <select class="form-select" style="font-size:12px;flex:1" x-ref="newTaintLabel">
+                          <option value="">Add label...</option>
+                          <template x-for="l in ['Pii','Secret','ExternalNetwork','UntrustedAgent'].filter(function(l) { return taintPolicy.allow_labels.indexOf(l) === -1 })" :key="l">
+                            <option :value="l" x-text="l"></option>
+                          </template>
+                        </select>
+                        <button class="btn btn-ghost btn-sm" @click="if ($refs.newTaintLabel.value) { taintPolicy.allow_labels.push($refs.newTaintLabel.value); $refs.newTaintLabel.value = ''; }">Add</button>
+                      </div>
+                    </div>
+                    <button class="btn btn-primary mt-2" @click="saveTaintPolicy()" :disabled="taintSaving">
+                      <span x-show="!taintSaving">Save PII Policy</span><span x-show="taintSaving">Saving...</span>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -2724,8 +2823,13 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <div class="hand-step-label">Configure</div>
                     </div>
                     <div class="hand-step-line" :class="{ done: setupStep > 2 }"></div>
-                    <div class="hand-step-item" :class="{ active: setupStep === 3 }">
-                      <div class="hand-step-num" x-text="setupHasReqs ? '3' : '2'"></div>
+                    <div class="hand-step-item" :class="{ active: setupStep === 3, done: setupStep > 3 }">
+                      <div class="hand-step-num" x-text="setupStep > 3 ? '\u2713' : (setupHasReqs ? '3' : '2')"></div>
+                      <div class="hand-step-label">Model</div>
+                    </div>
+                    <div class="hand-step-line" :class="{ done: setupStep > 3 }"></div>
+                    <div class="hand-step-item" :class="{ active: setupStep === 4 }">
+                      <div class="hand-step-num" x-text="setupHasReqs ? '4' : '3'"></div>
                       <div class="hand-step-label">Launch</div>
                     </div>
                   </div>
@@ -2932,8 +3036,54 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     </template>
                   </div>
 
-                  <!-- ═══ Step 3: Launch ═══ -->
+                  <!-- ═══ Step 3: Model Selection ═══ -->
                   <div class="hand-wizard-body" x-show="setupStep === 3">
+                    <div class="form-group">
+                      <label style="font-size:13px;font-weight:600;margin-bottom:8px;display:block">Provider</label>
+                      <select class="form-select" x-model="handProvider" @change="onHandProviderChange()">
+                        <template x-if="handProvidersLoading">
+                          <option disabled>Loading providers&hellip;</option>
+                        </template>
+                        <template x-if="!handProvidersLoading && handProviders.length === 0">
+                          <option disabled>No providers available</option>
+                        </template>
+                        <template x-if="!handProvidersLoading && handProviders.filter(p => !p.is_local).length > 0">
+                          <optgroup label="Cloud">
+                            <template x-for="p in handProviders.filter(p => !p.is_local)" :key="p.id">
+                              <option :value="p.id" x-text="p.display_name"></option>
+                            </template>
+                          </optgroup>
+                        </template>
+                        <template x-if="!handProvidersLoading && handProviders.filter(p => p.is_local).length > 0">
+                          <optgroup label="Local">
+                            <template x-for="p in handProviders.filter(p => p.is_local)" :key="p.id">
+                              <option :value="p.id" x-text="p.display_name"></option>
+                            </template>
+                          </optgroup>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="form-group" style="margin-top:16px">
+                      <label style="font-size:13px;font-weight:600;margin-bottom:8px;display:block">Model</label>
+                      <select class="form-select" x-model="handModel">
+                        <template x-if="handModelsLoading">
+                          <option disabled>Loading models&hellip;</option>
+                        </template>
+                        <template x-if="!handModelsLoading && handFilteredModels.length === 0">
+                          <option disabled>No models available for this provider</option>
+                        </template>
+                        <template x-for="m in handFilteredModels" :key="m.id">
+                          <option :value="m.id" x-text="m.display_name || m.id"></option>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="text-xs text-dim" style="margin-top:12px">
+                      Pre-populated from the hand's defaults. Change to use a different provider or model.
+                    </div>
+                  </div>
+
+                  <!-- ═══ Step 4: Launch ═══ -->
+                  <div class="hand-wizard-body" x-show="setupStep === 4">
                     <div class="launch-summary">
                       <div class="launch-summary-icon" x-text="setupWizard.icon"></div>
                       <div class="launch-summary-title" x-text="setupWizard.name"></div>
@@ -2956,12 +3106,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         </template>
 
                         <!-- Provider / Model -->
-                        <template x-if="setupWizard.agent">
-                          <div class="launch-summary-row">
-                            <span class="row-label">Model</span>
-                            <span class="row-value" x-text="(setupWizard.agent.provider || 'default') + ' / ' + (setupWizard.agent.model || 'default')"></span>
-                          </div>
-                        </template>
+                        <div class="launch-summary-row">
+                          <span class="row-label">Model</span>
+                          <span class="row-value" x-text="(handProvider || 'default') + ' / ' + (handModel || 'default')"></span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2970,7 +3118,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <div class="hand-wizard-nav">
                     <div>
                       <button class="btn btn-ghost" @click="closeSetupWizard()">Cancel</button>
-                      <button class="btn btn-ghost" x-show="(setupStep === 2 && setupHasReqs) || setupStep === 3" @click="setupPrevStep()" style="margin-left:4px">Back</button>
+                      <button class="btn btn-ghost" x-show="(setupStep === 2 && setupHasReqs) || setupStep === 3 || setupStep === 4" @click="setupPrevStep()" style="margin-left:4px">Back</button>
                     </div>
                     <div class="flex gap-2">
                       <!-- Step 1: Install + Verify + Next -->
@@ -2988,8 +3136,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <template x-if="setupStep === 2">
                         <button class="btn btn-primary" @click="setupNextStep()">Next</button>
                       </template>
-                      <!-- Step 3: Activate -->
+                      <!-- Step 3: Next (Model) -->
                       <template x-if="setupStep === 3">
+                        <button class="btn btn-primary" @click="setupNextStep()">Next</button>
+                      </template>
+                      <!-- Step 4: Activate -->
+                      <template x-if="setupStep === 4">
                         <button class="btn btn-success btn-launch" @click="launchHand()" :disabled="activatingId" x-text="activatingId ? 'Activating...' : 'Activate ' + setupWizard.name"></button>
                       </template>
                     </div>
@@ -3188,6 +3340,76 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <span style="color:var(--success);font-size:1.2rem">\u2713</span>
               <span x-text="activateResult"></span>
             </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: Tools -->
+    <template x-if="page === 'tools'">
+      <div x-data="toolsPage">
+        <div class="page-header"><h2>Tools</h2></div>
+        <div class="page-body" x-init="loadTools()">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading tools...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadTools()">Retry</button>
+          </div>
+          <div x-show="!loading && !loadError">
+
+          <div class="grid grid-cols-3 gap-4 mb-4">
+            <div class="card stat-card">
+              <div class="stat-label">Total Tools</div>
+              <div class="stat-value" x-text="tools.length"></div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-label">Built-in</div>
+              <div class="stat-value" x-text="builtinCount"></div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-label">MCP</div>
+              <div class="stat-value" x-text="mcpCount"></div>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mb-4" style="align-items:center">
+            <input class="form-input" style="flex:1;max-width:320px" x-model="searchQuery" placeholder="Search tools...">
+            <select class="form-select" style="width:140px" x-model="filterSource">
+              <option value="all">All Sources</option>
+              <option value="built-in">Built-in</option>
+              <option value="mcp">MCP</option>
+            </select>
+            <span class="text-xs text-dim" x-text="filteredTools.length + ' of ' + tools.length"></span>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:180px">Name</th>
+                  <th style="width:90px">Category</th>
+                  <th style="width:70px">Source</th>
+                  <th>Description</th>
+                  <th style="width:80px">Params</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="tool in filteredTools" :key="tool.name">
+                  <tr>
+                    <td><code class="text-xs" x-text="tool.name" style="color:var(--accent)"></code></td>
+                    <td><span class="badge badge-dim" style="font-size:10px" x-text="toolCategory(tool.name)"></span></td>
+                    <td><span class="badge" :class="tool.source === 'mcp' ? 'badge-warn' : 'badge-success'" style="font-size:10px" x-text="tool.source"></span></td>
+                    <td><span class="text-xs" x-text="tool.description"></span></td>
+                    <td>
+                      <span class="text-xs text-dim" x-text="schemaParams(tool.schema).length || '-'"></span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
           </div>
         </div>
       </div>

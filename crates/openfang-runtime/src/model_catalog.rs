@@ -906,6 +906,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::NotRequired,
             model_count: 0,
         },
+        // ── Claude Code Direct (Anthropic API via CLI OAuth) ──────
+        ProviderInfo {
+            id: "claude-code-direct".into(),
+            display_name: "Claude Direct API".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            base_url: "https://api.anthropic.com".into(),
+            key_required: false,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── Qwen Code CLI ──────────────────────────────────────────
         ProviderInfo {
             id: "qwen-code".into(),
@@ -989,10 +999,20 @@ fn builtin_aliases() -> HashMap<String, String> {
         // Venice aliases
         ("venice", "venice-uncensored"),
         // Claude Code aliases
-        ("claude-code", "claude-code/sonnet"),
-        ("claude-code-opus", "claude-code/opus"),
-        ("claude-code-sonnet", "claude-code/sonnet"),
-        ("claude-code-haiku", "claude-code/haiku"),
+        ("claude-code", "claude-code/claude-sonnet-4-6"),
+        ("claude-code-opus", "claude-code/claude-opus-4-6"),
+        ("claude-code-sonnet", "claude-code/claude-sonnet-4-6"),
+        ("claude-code-haiku", "claude-code/claude-haiku-4-5-20251001"),
+        ("claude-code/opus", "claude-code/claude-opus-4-6"),
+        ("claude-code/sonnet", "claude-code/claude-sonnet-4-6"),
+        ("claude-code/haiku", "claude-code/claude-haiku-4-5-20251001"),
+        ("claude-code-direct", "claude-code-direct/claude-sonnet-4-6"),
+        ("claude-code-direct-opus", "claude-code-direct/claude-opus-4-6"),
+        ("claude-code-direct-sonnet", "claude-code-direct/claude-sonnet-4-6"),
+        ("claude-code-direct-haiku", "claude-code-direct/claude-haiku-4-5-20251001"),
+        ("claude-code-direct/opus", "claude-code-direct/claude-opus-4-6"),
+        ("claude-code-direct/sonnet", "claude-code-direct/claude-sonnet-4-6"),
+        ("claude-code-direct/haiku", "claude-code-direct/claude-haiku-4-5-20251001"),
         // Qwen Code aliases
         ("qwen-code", "qwen-code/qwen3-coder"),
         ("qwen-coder", "qwen-code/qwen3-coder"),
@@ -3685,8 +3705,8 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
         // Claude Code CLI (3) — subprocess-based
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
-            id: "claude-code/opus".into(),
-            display_name: "Claude Opus (CLI)".into(),
+            id: "claude-code/claude-opus-4-6".into(),
+            display_name: "Claude Opus 4.6 (CLI)".into(),
             provider: "claude-code".into(),
             tier: ModelTier::Frontier,
             context_window: 200_000,
@@ -3696,11 +3716,11 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: true,
-            aliases: vec!["claude-code-opus".into()],
+            aliases: vec!["claude-code-opus".into(), "claude-code/opus".into()],
         },
         ModelCatalogEntry {
-            id: "claude-code/sonnet".into(),
-            display_name: "Claude Sonnet (CLI)".into(),
+            id: "claude-code/claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6 (CLI)".into(),
             provider: "claude-code".into(),
             tier: ModelTier::Smart,
             context_window: 200_000,
@@ -3710,11 +3730,11 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: true,
-            aliases: vec!["claude-code".into(), "claude-code-sonnet".into()],
+            aliases: vec!["claude-code".into(), "claude-code-sonnet".into(), "claude-code/sonnet".into()],
         },
         ModelCatalogEntry {
-            id: "claude-code/haiku".into(),
-            display_name: "Claude Haiku (CLI)".into(),
+            id: "claude-code/claude-haiku-4-5-20251001".into(),
+            display_name: "Claude Haiku 4.5 (CLI)".into(),
             provider: "claude-code".into(),
             tier: ModelTier::Fast,
             context_window: 200_000,
@@ -3724,7 +3744,52 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: true,
-            aliases: vec!["claude-code-haiku".into()],
+            aliases: vec!["claude-code-haiku".into(), "claude-code/haiku".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // Claude Code Direct (3) — Anthropic API via CLI OAuth token
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "claude-code-direct/claude-opus-4-6".into(),
+            display_name: "Claude Opus 4.6 (Direct)".into(),
+            provider: "claude-code-direct".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 5.0,
+            output_cost_per_m: 25.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["claude-code-direct-opus".into(), "claude-code-direct/opus".into()],
+        },
+        ModelCatalogEntry {
+            id: "claude-code-direct/claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6 (Direct)".into(),
+            provider: "claude-code-direct".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            input_cost_per_m: 3.0,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["claude-code-direct".into(), "claude-code-direct-sonnet".into(), "claude-code-direct/sonnet".into()],
+        },
+        ModelCatalogEntry {
+            id: "claude-code-direct/claude-haiku-4-5-20251001".into(),
+            display_name: "Claude Haiku 4.5 (Direct)".into(),
+            provider: "claude-code-direct".into(),
+            tier: ModelTier::Fast,
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.25,
+            output_cost_per_m: 1.25,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["claude-code-direct-haiku".into(), "claude-code-direct/haiku".into()],
         },
         // ══════════════════════════════════════════════════════════════
         // Qwen Code CLI (3) — subprocess-based, free via Qwen OAuth
@@ -3905,7 +3970,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 41);
+        assert_eq!(catalog.list_providers().len(), 42);
     }
 
     #[test]
@@ -4275,16 +4340,16 @@ mod tests {
         let catalog = ModelCatalog::new();
         let models = catalog.models_by_provider("claude-code");
         assert_eq!(models.len(), 3);
-        assert!(models.iter().any(|m| m.id == "claude-code/opus"));
-        assert!(models.iter().any(|m| m.id == "claude-code/sonnet"));
-        assert!(models.iter().any(|m| m.id == "claude-code/haiku"));
+        assert!(models.iter().any(|m| m.id == "claude-code/claude-opus-4-6"));
+        assert!(models.iter().any(|m| m.id == "claude-code/claude-sonnet-4-6"));
+        assert!(models.iter().any(|m| m.id == "claude-code/claude-haiku-4-5-20251001"));
     }
 
     #[test]
     fn test_claude_code_aliases() {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("claude-code").unwrap();
-        assert_eq!(entry.id, "claude-code/sonnet");
+        assert_eq!(entry.id, "claude-code/claude-sonnet-4-6");
     }
 
     #[test]

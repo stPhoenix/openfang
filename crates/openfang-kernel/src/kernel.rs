@@ -1355,12 +1355,30 @@ impl OpenFangKernel {
                     manifest.model.provider.is_empty() || manifest.model.provider == "default";
                 if provider_is_default || manifest.model.provider == entry.provider {
                     manifest.model.provider = entry.provider.clone();
-                    manifest.model.model = strip_provider_prefix(&entry.id, &entry.provider);
+                    let stripped = strip_provider_prefix(&entry.id, &entry.provider);
+                    // Resolve short aliases to canonical IDs so the manifest
+                    // always stores the full model name (e.g. "sonnet" from
+                    // e.g. "claude-code-direct/claude-sonnet-4-6" → "claude-sonnet-4-6").
+                    manifest.model.model = catalog
+                        .resolve_alias(&stripped)
+                        .map(|s| s.to_string())
+                        .unwrap_or(stripped);
                     if manifest.model.api_key_env.is_none() {
                         manifest.model.api_key_env =
                             Some(self.config.resolve_api_key_env(&entry.provider));
                     }
                 }
+            }
+
+            // Normalize: strip provider prefix from model name if present
+            let normalized =
+                strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+            if normalized != manifest.model.model {
+                // Resolve alias after stripping to ensure canonical ID
+                manifest.model.model = catalog
+                    .resolve_alias(&normalized)
+                    .map(|s| s.to_string())
+                    .unwrap_or(normalized);
             }
         }
         if manifest.model.api_key_env.is_none()
@@ -1369,12 +1387,6 @@ impl OpenFangKernel {
         {
             manifest.model.api_key_env =
                 Some(self.config.resolve_api_key_env(&manifest.model.provider));
-        }
-
-        // Normalize: strip provider prefix from model name if present
-        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
-        if normalized != manifest.model.model {
-            manifest.model.model = normalized;
         }
 
         // Apply global budget defaults to agent resource quotas
@@ -3017,19 +3029,26 @@ impl OpenFangKernel {
             }
         };
 
-        // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
-        let normalized_model =
-            if let (Some(entry), Some(prov)) = (catalog_entry.as_ref(), provider.as_ref()) {
-                if entry.provider == *prov {
-                    strip_provider_prefix(&entry.id, prov)
-                } else {
-                    strip_provider_prefix(model, prov)
-                }
+        // Strip the provider prefix from the model name and resolve any remaining
+        // short aliases to canonical API model IDs (e.g. "sonnet" → "claude-sonnet-4-6").
+        let normalized_model = {
+            let stripped = if let (Some(entry), Some(prov)) =
+                (catalog_entry.as_ref(), provider.as_ref())
+            {
+                strip_provider_prefix(&entry.id, prov)
             } else if let Some(ref prov) = provider {
                 strip_provider_prefix(model, prov)
             } else {
                 model.to_string()
             };
+            // Defense-in-depth: resolve alias after stripping so short names
+            // like "sonnet" never survive into the manifest.
+            self.model_catalog
+                .read()
+                .ok()
+                .and_then(|cat| cat.resolve_alias(&stripped).map(|s| s.to_string()))
+                .unwrap_or(stripped)
+        };
 
         if let Some(provider) = provider {
             let api_key_env = Some(self.config.resolve_api_key_env(&provider));
@@ -3152,6 +3171,24 @@ impl OpenFangKernel {
             blocklist = ?blocklist,
             "Agent tool filters updated"
         );
+        Ok(())
+    }
+
+    /// Update taint/PII policy for an agent.
+    pub fn set_agent_taint_policy(
+        &self,
+        agent_id: AgentId,
+        policy: openfang_types::taint::TaintPolicy,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_taint_policy(agent_id, policy)
+            .map_err(KernelError::OpenFang)?;
+
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent(&entry);
+        }
+
+        info!(agent_id = %agent_id, "Agent taint policy updated");
         Ok(())
     }
 
@@ -3371,7 +3408,11 @@ impl OpenFangKernel {
         &self,
         hand_id: &str,
         config: std::collections::HashMap<String, serde_json::Value>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
     ) -> KernelResult<openfang_hands::HandInstance> {
+        let provider_override = provider_override.filter(|s| !s.is_empty());
+        let model_override = model_override.filter(|s| !s.is_empty());
         use openfang_hands::HandError;
 
         let def = self
@@ -3397,12 +3438,16 @@ impl OpenFangKernel {
 
         // Build an agent manifest from the hand definition.
         // If the hand declares provider/model as "default", inherit the kernel's configured LLM.
-        let hand_provider = if def.agent.provider == "default" {
+        let hand_provider = if let Some(ref p) = provider_override {
+            p.clone()
+        } else if def.agent.provider == "default" {
             self.config.default_model.provider.clone()
         } else {
             def.agent.provider.clone()
         };
-        let hand_model = if def.agent.model == "default" {
+        let hand_model = if let Some(ref m) = model_override {
+            m.clone()
+        } else if def.agent.model == "default" {
             self.config.default_model.model.clone()
         } else {
             def.agent.model.clone()
@@ -3938,7 +3983,7 @@ impl OpenFangKernel {
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
             for (hand_id, config, old_agent_id) in saved_hands {
-                match self.activate_hand(&hand_id, config) {
+                match self.activate_hand(&hand_id, config, None, None) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart
@@ -4008,7 +4053,7 @@ impl OpenFangKernel {
             // Each agent gets a 500ms delay before the next one starts.
             tokio::spawn(async move {
                 for (i, (id, name, schedule)) in bg_agents.into_iter().enumerate() {
-                    kernel.start_background_for_agent(id, &name, &schedule);
+                    kernel.start_background_for_agent(id, &name, &schedule, false);
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
@@ -4503,6 +4548,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         name: &str,
         schedule: &ScheduleMode,
+        immediate_first_tick: bool,
     ) {
         // For proactive agents, auto-register triggers from conditions
         if let ScheduleMode::Proactive { conditions } = schedule {
@@ -4521,7 +4567,7 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, immediate_first_tick, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
                     match k.send_message(aid, &msg).await {
@@ -4775,7 +4821,19 @@ impl OpenFangKernel {
                     skip_permissions: true,
                 };
                 match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, strip_provider_prefix(&fb_model_name, &fb_provider))),
+                    Ok(d) => {
+                        let stripped =
+                            strip_provider_prefix(&fb_model_name, &fb_provider);
+                        let resolved = self
+                            .model_catalog
+                            .read()
+                            .ok()
+                            .and_then(|cat| {
+                                cat.resolve_alias(&stripped).map(|s| s.to_string())
+                            })
+                            .unwrap_or(stripped);
+                        chain.push((d, resolved));
+                    }
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb_provider);
                     }
@@ -6424,7 +6482,7 @@ impl KernelHandle for OpenFangKernel {
         config: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         let instance = self
-            .activate_hand(hand_id, config)
+            .activate_hand(hand_id, config, None, None)
             .map_err(|e| format!("{e}"))?;
 
         Ok(serde_json::json!({
@@ -7200,7 +7258,7 @@ mod tests {
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
         let instance = kernel
-            .activate_hand("browser", HashMap::new())
+            .activate_hand("browser", HashMap::new(), None, None)
             .expect("browser hand should activate");
         let agent_id = instance.agent_id.expect("browser hand agent id");
         let entry = kernel

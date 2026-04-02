@@ -115,6 +115,29 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
 
     let lower = provider.to_lowercase();
 
+    // Skip providers whose base_url is empty (CLI-only providers like claude-code)
+    if base_url.is_empty() {
+        return ProbeResult {
+            error: Some("no base_url configured".into()),
+            ..Default::default()
+        };
+    }
+
+    // Anthropic API doesn't expose an OpenAI-compatible /models endpoint.
+    // Detect it by provider name or base_url and skip the probe — these are
+    // remote APIs, not local providers, so reachability is assumed.
+    if lower == "claude-code-direct"
+        || lower == "anthropic"
+        || base_url.contains("api.anthropic.com")
+    {
+        return ProbeResult {
+            reachable: true,
+            latency_ms: 0,
+            discovered_models: vec![],
+            error: None,
+        };
+    }
+
     // Ollama uses a non-OpenAI endpoint for model listing
     let (url, is_ollama) = if lower == "ollama" {
         // base_url is typically "http://localhost:11434/v1" — strip /v1 for the tags endpoint

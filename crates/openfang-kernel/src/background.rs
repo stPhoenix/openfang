@@ -50,6 +50,7 @@ impl BackgroundExecutor {
         agent_id: AgentId,
         agent_name: &str,
         schedule: &ScheduleMode,
+        immediate_first_tick: bool,
         send_message: F,
     ) where
         F: Fn(AgentId, String) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
@@ -72,6 +73,34 @@ impl BackgroundExecutor {
                 );
 
                 let handle = tokio::spawn(async move {
+                    // Fire an immediate first tick so the agent can bootstrap
+                    // (create cron jobs, store initial metrics, etc.) without
+                    // waiting for the full interval to elapse.
+                    if immediate_first_tick
+                        && busy
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        if let Ok(permit) = semaphore.clone().acquire_owned().await {
+                            let prompt = format!(
+                                "[AUTONOMOUS TICK] You are running in continuous mode. \
+                                 Check your goals, review shared memory for pending tasks, \
+                                 and take any necessary actions. Agent: {name}"
+                            );
+                            debug!(agent = %name, "Continuous loop: sending immediate first tick");
+                            let busy_clone = busy.clone();
+                            let jh = (send_message)(agent_id, prompt);
+                            tokio::spawn(async move {
+                                let _ = jh.await;
+                                drop(permit);
+                                busy_clone.store(false, Ordering::SeqCst);
+                            });
+                        } else {
+                            busy.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(interval) => {}
@@ -134,6 +163,30 @@ impl BackgroundExecutor {
                 );
 
                 let handle = tokio::spawn(async move {
+                    if immediate_first_tick
+                        && busy
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        if let Ok(permit) = semaphore.clone().acquire_owned().await {
+                            let prompt = format!(
+                                "[SCHEDULED TICK] You are running on a periodic schedule ({cron_owned}). \
+                                 Perform your routine duties. Agent: {name}"
+                            );
+                            debug!(agent = %name, "Periodic loop: sending immediate first tick");
+                            let busy_clone = busy.clone();
+                            let jh = (send_message)(agent_id, prompt);
+                            tokio::spawn(async move {
+                                let _ = jh.await;
+                                drop(permit);
+                                busy_clone.store(false, Ordering::SeqCst);
+                            });
+                        } else {
+                            busy.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(interval) => {}
@@ -378,7 +431,7 @@ mod tests {
             check_interval_secs: 1, // 1 second for fast test
         };
 
-        executor.start_agent(agent_id, "test-agent", &schedule, move |_id, _msg| {
+        executor.start_agent(agent_id, "test-agent", &schedule, false, move |_id, _msg| {
             let tc = tick_clone.clone();
             tokio::spawn(async move {
                 tc.fetch_add(1, Ordering::SeqCst);
@@ -415,7 +468,7 @@ mod tests {
         };
 
         // Each tick takes 3 seconds — should cause subsequent ticks to be skipped
-        executor.start_agent(agent_id, "slow-agent", &schedule, move |_id, _msg| {
+        executor.start_agent(agent_id, "slow-agent", &schedule, false, move |_id, _msg| {
             let tc = tick_clone.clone();
             tokio::spawn(async move {
                 tc.fetch_add(1, Ordering::SeqCst);
@@ -440,7 +493,7 @@ mod tests {
 
         // Reactive mode → no background task
         let id = AgentId::new();
-        executor.start_agent(id, "reactive", &ScheduleMode::Reactive, |_id, _msg| {
+        executor.start_agent(id, "reactive", &ScheduleMode::Reactive, false, |_id, _msg| {
             tokio::spawn(async {})
         });
         assert_eq!(executor.active_count(), 0);
@@ -453,8 +506,39 @@ mod tests {
             &ScheduleMode::Proactive {
                 conditions: vec!["event:agent_spawned".to_string()],
             },
+            false,
             |_id, _msg| tokio::spawn(async {}),
         );
         assert_eq!(executor.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_immediate_first_tick() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let executor = BackgroundExecutor::new(shutdown_rx);
+        let agent_id = AgentId::new();
+
+        let tick_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tick_clone = tick_count.clone();
+
+        let schedule = ScheduleMode::Continuous {
+            check_interval_secs: 3600, // 1 hour — must NOT wait this long
+        };
+
+        executor.start_agent(agent_id, "hand-agent", &schedule, true, move |_id, _msg| {
+            let tc = tick_clone.clone();
+            tokio::spawn(async move {
+                tc.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        // Wait only 500ms — immediate tick should have fired by now
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            tick_count.load(Ordering::SeqCst) >= 1,
+            "Expected immediate first tick within 500ms"
+        );
+
+        executor.stop_agent(agent_id);
     }
 }

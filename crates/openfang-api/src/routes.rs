@@ -4528,9 +4528,11 @@ pub async fn activate_hand(
     Path(hand_id): Path<String>,
     body: Option<Json<openfang_hands::ActivateHandRequest>>,
 ) -> impl IntoResponse {
-    let config = body.map(|b| b.0.config).unwrap_or_default();
+    let (config, provider_override, model_override) = body
+        .map(|b| (b.0.config, b.0.provider, b.0.model))
+        .unwrap_or_default();
 
-    match state.kernel.activate_hand(&hand_id, config) {
+    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override) {
         Ok(instance) => {
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
@@ -4550,6 +4552,7 @@ pub async fn activate_hand(
                             agent_id,
                             &entry.name,
                             &entry.manifest.schedule,
+                            true,
                         );
                     }
                 }
@@ -7162,6 +7165,122 @@ pub async fn set_agent_tools(
     match state
         .kernel
         .set_agent_tool_filters(agent_id, allowlist, blocklist)
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+// ── Per-Agent Taint / PII Policy ──────────────────────────────────────
+
+/// GET /api/agents/{id}/taint-policy — Get an agent's taint/PII policy.
+pub async fn get_agent_taint_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        }
+    };
+    let tp = &entry.manifest.taint_policy;
+    let allow_labels: Vec<serde_json::Value> = tp
+        .allow_labels
+        .iter()
+        .map(|l| serde_json::to_value(l).unwrap_or_default())
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mode": tp.mode,
+            "pii_action": tp.pii_action,
+            "ner_enabled": tp.ner_enabled,
+            "ner_confidence": tp.ner_confidence,
+            "allow_labels": allow_labels,
+        })),
+    )
+}
+
+/// PUT /api/agents/{id}/taint-policy — Update an agent's taint/PII policy.
+pub async fn set_agent_taint_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    // Parse the policy fields from the request body
+    let mode: openfang_types::taint::TaintMode = body
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+        .unwrap_or_default();
+
+    let pii_action: openfang_types::taint::PiiAction = body
+        .get("pii_action")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+        .unwrap_or_default();
+
+    let ner_enabled = body
+        .get("ner_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let ner_confidence = body
+        .get("ner_confidence")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32)
+        .unwrap_or(0.85);
+
+    let allow_labels: std::collections::HashSet<openfang_types::taint::TaintLabel> = body
+        .get("allow_labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| {
+                    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let policy = openfang_types::taint::TaintPolicy {
+        mode,
+        allow_labels,
+        pii_action,
+        ner_enabled,
+        ner_confidence,
+    };
+
+    match state
+        .kernel
+        .set_agent_taint_policy(agent_id, policy)
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (

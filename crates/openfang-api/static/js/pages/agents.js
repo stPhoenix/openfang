@@ -76,12 +76,21 @@ function agentsPage() {
     toolFiltersLoading: false,
     newAllowTool: '',
     newBlockTool: '',
+    availableTools: [],
+    availableToolDescs: {},
+    // -- Taint / PII policy --
+    taintPolicy: { mode: 'block', pii_action: 'block', ner_enabled: false, ner_confidence: 0.85, allow_labels: [] },
+    taintSaving: false,
     // -- Model switch --
     editingModel: false,
     newModelValue: '',
     editingProvider: false,
     newProviderValue: '',
     modelSaving: false,
+    agentProviders: [],
+    agentModels: [],
+    agentProvidersLoading: false,
+    agentModelsLoading: false,
     // -- Fallback chain --
     editingFallback: false,
     newFallbackValue: '',
@@ -612,17 +621,47 @@ function agentsPage() {
       });
     },
 
+    // ── Model/Provider dropdown helpers ──
+    get agentFilteredModels() {
+      if (!this.newProviderValue) return this.agentModels;
+      var prov = this.newProviderValue;
+      return this.agentModels.filter(function(m) { return m.provider === prov; });
+    },
+
+    async loadAgentModelOptions() {
+      this.agentProvidersLoading = true;
+      this.agentModelsLoading = true;
+      try {
+        var results = await Promise.all([
+          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
+          OpenFangAPI.get('/api/models?available=true').catch(function() { return { models: [] }; })
+        ]);
+        this.agentProviders = results[0].providers || [];
+        this.agentModels = results[1].models || [];
+      } catch(e) { /* ignore */ }
+      this.agentProvidersLoading = false;
+      this.agentModelsLoading = false;
+    },
+
+    onAgentProviderChange() {
+      var filtered = this.agentFilteredModels;
+      if (filtered.length === 0) { this.newModelValue = ''; return; }
+      var currentValid = filtered.some(function(m) { return m.id === this.newModelValue; }.bind(this));
+      if (!currentValid) {
+        this.newModelValue = filtered[0].id;
+      }
+    },
+
     // ── Model switch ──
     async changeModel() {
-      if (!this.detailAgent || !this.newModelValue.trim()) return;
+      if (!this.detailAgent || !this.newModelValue) return;
       this.modelSaving = true;
       try {
-        var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: this.newModelValue.trim() });
+        var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: this.newModelValue });
         var providerInfo = (resp && resp.provider) ? ' (provider: ' + resp.provider + ')' : '';
         OpenFangToast.success('Model changed' + providerInfo + ' (memory reset)');
         this.editingModel = false;
         await Alpine.store('app').refreshAgents();
-        // Refresh detailAgent
         var agents = Alpine.store('app').agents;
         for (var i = 0; i < agents.length; i++) {
           if (agents[i].id === this.detailAgent.id) { this.detailAgent = agents[i]; break; }
@@ -635,12 +674,13 @@ function agentsPage() {
 
     // ── Provider switch ──
     async changeProvider() {
-      if (!this.detailAgent || !this.newProviderValue.trim()) return;
+      if (!this.detailAgent || !this.newProviderValue) return;
       this.modelSaving = true;
       try {
-        var combined = this.newProviderValue.trim() + '/' + this.detailAgent.model_name;
+        var model = this.newModelValue || this.detailAgent.model_name;
+        var combined = this.newProviderValue + '/' + model;
         var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: combined });
-        OpenFangToast.success('Provider changed to ' + (resp && resp.provider ? resp.provider : this.newProviderValue.trim()));
+        OpenFangToast.success('Provider changed to ' + (resp && resp.provider ? resp.provider : this.newProviderValue));
         this.editingProvider = false;
         await Alpine.store('app').refreshAgents();
         var agents = Alpine.store('app').agents;
@@ -693,15 +733,35 @@ function agentsPage() {
       if (!this.detailAgent) return;
       this.toolFiltersLoading = true;
       try {
-        this.toolFilters = await OpenFangAPI.get('/api/agents/' + this.detailAgent.id + '/tools');
+        var results = await Promise.all([
+          OpenFangAPI.get('/api/agents/' + this.detailAgent.id + '/tools'),
+          this.availableTools.length ? Promise.resolve(null) : OpenFangAPI.get('/api/tools'),
+          OpenFangAPI.get('/api/agents/' + this.detailAgent.id + '/taint-policy')
+        ]);
+        this.toolFilters = results[0];
+        if (results[1]) {
+          var tools = results[1].tools || [];
+          this.availableTools = tools.map(function(t) { return t.name; });
+          var descs = {};
+          tools.forEach(function(t) { descs[t.name] = t.description || ''; });
+          this.availableToolDescs = descs;
+        }
+        var tp = results[2];
+        this.taintPolicy = {
+          mode: tp.mode || 'block',
+          pii_action: tp.pii_action || 'block',
+          ner_enabled: !!tp.ner_enabled,
+          ner_confidence: tp.ner_confidence != null ? tp.ner_confidence : 0.85,
+          allow_labels: tp.allow_labels || []
+        };
       } catch(e) {
         this.toolFilters = { tool_allowlist: [], tool_blocklist: [] };
       }
       this.toolFiltersLoading = false;
     },
 
-    addAllowTool() {
-      var t = this.newAllowTool.trim();
+    addAllowTool(name) {
+      var t = (name || this.newAllowTool || '').trim();
       if (t && this.toolFilters.tool_allowlist.indexOf(t) === -1) {
         this.toolFilters.tool_allowlist.push(t);
         this.newAllowTool = '';
@@ -714,8 +774,8 @@ function agentsPage() {
       this.saveToolFilters();
     },
 
-    addBlockTool() {
-      var t = this.newBlockTool.trim();
+    addBlockTool(name) {
+      var t = (name || this.newBlockTool || '').trim();
       if (t && this.toolFilters.tool_blocklist.indexOf(t) === -1) {
         this.toolFilters.tool_blocklist.push(t);
         this.newBlockTool = '';
@@ -735,6 +795,18 @@ function agentsPage() {
       } catch(e) {
         OpenFangToast.error('Failed to update tool filters: ' + e.message);
       }
+    },
+
+    async saveTaintPolicy() {
+      if (!this.detailAgent) return;
+      this.taintSaving = true;
+      try {
+        await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/taint-policy', this.taintPolicy);
+        OpenFangToast.success('PII policy updated');
+      } catch(e) {
+        OpenFangToast.error('Failed to update PII policy: ' + e.message);
+      }
+      this.taintSaving = false;
     },
 
     async spawnBuiltin(t) {

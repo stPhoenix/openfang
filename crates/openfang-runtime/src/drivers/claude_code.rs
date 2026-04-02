@@ -148,15 +148,13 @@ impl ClaudeCodeDriver {
         parts.join("\n\n")
     }
 
-    /// Map a model ID like "claude-code/opus" to CLI --model flag value.
+    /// Map a model ID to CLI --model flag value.
+    ///
+    /// Strips the `claude-code/` provider prefix if present and passes the
+    /// canonical model name through (e.g. `"claude-sonnet-4-6"`).
     fn model_flag(model: &str) -> Option<String> {
         let stripped = model.strip_prefix("claude-code/").unwrap_or(model);
-        match stripped {
-            "opus" => Some("opus".to_string()),
-            "sonnet" => Some("sonnet".to_string()),
-            "haiku" => Some("haiku".to_string()),
-            _ => Some(stripped.to_string()),
-        }
+        Some(stripped.to_string())
     }
 
     /// Apply security env filtering to a command.
@@ -684,6 +682,44 @@ fn claude_credentials_exist() -> bool {
     }
 }
 
+/// Read the OAuth access token from Claude Code's stored credentials.
+///
+/// Returns `Some(token)` if a valid, non-expired token is found.
+/// The token (`sk-ant-oat*`) is passed to [`AnthropicDriver`] which detects
+/// the prefix and sends it as `Authorization: Bearer` with the required
+/// `anthropic-beta: oauth-2025-04-20` header to enable OAuth on the Messages API.
+pub fn read_claude_oauth_token() -> Option<String> {
+    let home = home_dir()?;
+    let claude_dir = home.join(".claude");
+
+    let cred_path = if claude_dir.join(".credentials.json").exists() {
+        claude_dir.join(".credentials.json")
+    } else if claude_dir.join("credentials.json").exists() {
+        claude_dir.join("credentials.json")
+    } else {
+        return None;
+    };
+
+    let content = std::fs::read_to_string(&cred_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let oauth = json.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?;
+
+    if let Some(expires_at) = oauth.get("expiresAt").and_then(|v| v.as_i64()) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms > expires_at {
+            tracing::warn!("Claude Code OAuth token is expired — run `claude auth` to refresh");
+            return None;
+        }
+    }
+
+    Some(token.to_string())
+}
+
 /// Cross-platform home directory.
 fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
@@ -728,17 +764,23 @@ mod tests {
 
     #[test]
     fn test_model_flag_mapping() {
+        // Canonical model IDs: provider prefix stripped, full name passed through
         assert_eq!(
-            ClaudeCodeDriver::model_flag("claude-code/opus"),
-            Some("opus".to_string())
+            ClaudeCodeDriver::model_flag("claude-code/claude-opus-4-6"),
+            Some("claude-opus-4-6".to_string())
         );
         assert_eq!(
-            ClaudeCodeDriver::model_flag("claude-code/sonnet"),
-            Some("sonnet".to_string())
+            ClaudeCodeDriver::model_flag("claude-code/claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
-            ClaudeCodeDriver::model_flag("claude-code/haiku"),
-            Some("haiku".to_string())
+            ClaudeCodeDriver::model_flag("claude-code/claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4-5-20251001".to_string())
+        );
+        // Already-stripped canonical names pass through unchanged
+        assert_eq!(
+            ClaudeCodeDriver::model_flag("claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             ClaudeCodeDriver::model_flag("custom-model"),
