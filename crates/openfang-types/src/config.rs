@@ -179,7 +179,9 @@ pub enum SearchProvider {
     Perplexity,
     /// DuckDuckGo HTML (no API key needed).
     DuckDuckGo,
-    /// Auto-select based on available API keys (Tavily → Brave → Perplexity → DuckDuckGo).
+    /// SearXNG self-hosted search (no API key needed).
+    Searxng,
+    /// Auto-select based on available API keys (Tavily → Brave → Perplexity → Searxng → DuckDuckGo).
     #[default]
     Auto,
 }
@@ -198,6 +200,8 @@ pub struct WebConfig {
     pub tavily: TavilySearchConfig,
     /// Perplexity Search configuration.
     pub perplexity: PerplexitySearchConfig,
+    /// SearXNG Search configuration.
+    pub searxng: SearxngSearchConfig,
     /// Web fetch configuration.
     pub fetch: WebFetchConfig,
 }
@@ -210,6 +214,7 @@ impl Default for WebConfig {
             brave: BraveSearchConfig::default(),
             tavily: TavilySearchConfig::default(),
             perplexity: PerplexitySearchConfig::default(),
+            searxng: SearxngSearchConfig::default(),
             fetch: WebFetchConfig::default(),
         }
     }
@@ -287,6 +292,14 @@ impl Default for PerplexitySearchConfig {
     }
 }
 
+/// SearXNG self-hosted search configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearxngSearchConfig {
+    /// Base URL of the SearXNG instance (e.g., "https://search.example.com").
+    pub url: String,
+}
+
 /// Web fetch configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -299,6 +312,15 @@ pub struct WebFetchConfig {
     pub timeout_secs: u64,
     /// Enable HTML→Markdown readability extraction.
     pub readability: bool,
+    /// SSRF allowlist for self-hosted environments.
+    ///
+    /// Entries can be exact hostnames (`"n8n.local"`), wildcard domains
+    /// (`"*.olares.com"`), or CIDR ranges (`"10.0.0.0/8"`).
+    ///
+    /// Allowlisted hosts bypass the private-IP check but **never** bypass
+    /// cloud metadata endpoint blocking (169.254.169.254, metadata.google.internal, etc.).
+    #[serde(default)]
+    pub ssrf_allowed_hosts: Vec<String>,
 }
 
 impl Default for WebFetchConfig {
@@ -308,6 +330,7 @@ impl Default for WebFetchConfig {
             max_response_bytes: 10 * 1024 * 1024, // 10 MB
             timeout_secs: 30,
             readability: true,
+            ssrf_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -3723,6 +3746,13 @@ impl KernelConfig {
                         "Perplexity search selected but {} is not set",
                         self.web.perplexity.api_key_env
                     ));
+                }
+            }
+            SearchProvider::Searxng => {
+                if self.web.searxng.url.is_empty() {
+                    warnings.push(
+                        "Searxng search selected but searxng.url is not configured".to_string(),
+                    );
                 }
             }
             SearchProvider::DuckDuckGo | SearchProvider::Auto => {}

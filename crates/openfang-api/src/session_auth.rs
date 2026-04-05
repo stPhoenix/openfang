@@ -161,6 +161,15 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_produces_unique_salts() {
+        let h1 = hash_password("same");
+        let h2 = hash_password("same");
+        assert_ne!(h1, h2, "each hash should use a unique salt");
+        assert!(verify_password("same", &h1).valid);
+        assert!(verify_password("same", &h2).valid);
+    }
+
+    #[test]
     fn test_create_and_verify_token() {
         let token = create_session_token("admin", "my-secret", 1);
         let user = verify_session_token(&token, "my-secret");
@@ -183,6 +192,13 @@ mod tests {
     #[test]
     fn test_password_hash_length_mismatch() {
         let result = verify_password("x", "short");
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_verify_malformed_argon2_hash() {
+        // Starts with $argon2 but is not a valid PHC string.
+        let result = verify_password("x", "$argon2id$garbage");
         assert!(!result.valid);
     }
 }
