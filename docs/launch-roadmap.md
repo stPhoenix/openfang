@@ -413,7 +413,7 @@ These are features where OpenFang can leapfrog OpenClaw.
 | Plugin SDK | TypeScript published | JS + Python SDK | **Tie** |
 | Native Mobile | iOS + Android + macOS | Web responsive only | OpenClaw |
 | Voice/Talk Mode | Wake word + TTS + overlay | Mic + TTS playback | OpenClaw (slight) |
-| Browser Automation | Playwright with inline screenshots | Playwright + inline screenshots | **Tie** |
+| Browser Automation | Playwright with inline screenshots | **Native CDP** + inline screenshots | **OpenFang** |
 | Visual Workflow Builder | None | **Drag-and-drop builder** | **OpenFang** |
 
 **OpenFang wins 15/18 categories.** The remaining gaps are: mobile apps (OpenClaw), voice wake word (OpenClaw slight edge).

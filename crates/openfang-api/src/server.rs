@@ -104,10 +104,20 @@ pub async fn build_router(
             .allow_headers(tower_http::cors::Any)
     };
 
+    // Warn if dashboard auth is enabled but the password hash is not Argon2id.
+    let ph = &state.kernel.config.auth.password_hash;
+    if state.kernel.config.auth.enabled && !ph.is_empty() && !ph.starts_with("$argon2") {
+        tracing::warn!(
+            "Dashboard auth password_hash is not in Argon2id format. \
+             Login will fail. Regenerate with: openfang auth hash-password"
+        );
+    }
+
     // Trim whitespace so `api_key = ""` or `api_key = "  "` both disable auth.
     let api_key = state.kernel.config.api_key.trim().to_string();
     let auth_state = crate::middleware::AuthState {
         api_key: api_key.clone(),
+        api_key_hash: state.kernel.config.api_key_hash.clone(),
         auth_enabled: state.kernel.config.auth.enabled,
         session_secret: if !api_key.is_empty() {
             api_key.clone()
@@ -203,6 +213,11 @@ pub async fn build_router(
         .route(
             "/api/agents/{id}/tools",
             axum::routing::get(routes::get_agent_tools).put(routes::set_agent_tools),
+        )
+        .route(
+            "/api/agents/{id}/taint-policy",
+            axum::routing::get(routes::get_agent_taint_policy)
+                .put(routes::set_agent_taint_policy),
         )
         .route(
             "/api/agents/{id}/skills",

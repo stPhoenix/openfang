@@ -1,16 +1,16 @@
 ---
 name: browser-automation
 version: "1.0.0"
-description: Playwright-based browser automation patterns for autonomous web interaction
+description: CDP-based browser automation patterns for autonomous web interaction
 author: OpenFang
-tags: [browser, automation, playwright, web, scraping]
+tags: [browser, automation, cdp, web, scraping]
 tools: [browser_navigate, browser_click, browser_type, browser_screenshot, browser_read_page, browser_close]
 runtime: prompt_only
 ---
 
 # Browser Automation Skill
 
-## Playwright CSS Selector Reference
+## CSS Selector Reference
 
 ### Basic Selectors
 | Selector | Description | Example |

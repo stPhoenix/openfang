@@ -82,8 +82,6 @@ pub struct OpenFangKernel {
     pub audit_log: Arc<AuditLog>,
     /// Cost metering engine.
     pub metering: Arc<MeteringEngine>,
-    /// Default LLM driver (from kernel config).
-    default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -104,7 +102,7 @@ pub struct OpenFangKernel {
     pub a2a_external_agents: std::sync::Mutex<Vec<(String, openfang_runtime::a2a::AgentCard)>>,
     /// Web tools context (multi-provider search + SSRF-protected fetch + caching).
     pub web_ctx: openfang_runtime::web_search::WebToolsContext,
-    /// Browser automation manager (Playwright bridge sessions).
+    /// Browser automation manager (native CDP over WebSocket).
     pub browser_ctx: openfang_runtime::browser::BrowserManager,
     /// Media understanding engine (image description, audio transcription).
     pub media_engine: openfang_runtime::media_understanding::MediaEngine,
@@ -551,6 +549,32 @@ impl OpenFangKernel {
             warn!("Config: {}", w);
         }
 
+        // Initialize NER engine for ML-based PII detection (if enabled).
+        #[cfg(feature = "ner")]
+        if config.pii.ner_enabled {
+            let model_dir = if config.pii.model_dir.starts_with("~") {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(config.pii.model_dir.strip_prefix("~/").unwrap_or(config.pii.model_dir.as_ref()))
+            } else {
+                config.pii.model_dir.clone()
+            };
+            if model_dir.join("model.onnx").exists() {
+                match openfang_runtime::ner_engine::init_global_ner_engine(
+                    &model_dir,
+                    config.pii.confidence_threshold,
+                ) {
+                    Ok(()) => info!("NER PII detection engine loaded"),
+                    Err(e) => warn!("NER engine init failed, falling back to regex-only PII: {e}"),
+                }
+            } else {
+                info!(
+                    path = %model_dir.display(),
+                    "NER model not found — using regex-only PII detection"
+                );
+            }
+        }
+
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
@@ -623,37 +647,8 @@ impl OpenFangKernel {
                 warn!(
                     provider = %config.default_model.provider,
                     error = %e,
-                    "Primary LLM driver init failed — trying auto-detect"
+                    "Primary LLM driver init failed — agents will return errors until provider is configured"
                 );
-                // Auto-detect: scan env for any configured provider key
-                if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
-                    let auto_config = DriverConfig {
-                        provider: provider.to_string(),
-                        api_key: credential_resolver
-                            .resolve(env_var)
-                            .map(|z: zeroize::Zeroizing<String>| z.to_string()),
-                        base_url: config.provider_urls.get(provider).cloned(),
-                        skip_permissions: true,
-                    };
-                    match drivers::create_driver(&auto_config) {
-                        Ok(d) => {
-                            info!(
-                                provider = %provider,
-                                model = %model,
-                                "Auto-detected provider from {} — using as default",
-                                env_var
-                            );
-                            driver_chain.push(d);
-                            // Update the running config so agents get the right model
-                            config.default_model.provider = provider.to_string();
-                            config.default_model.model = model.to_string();
-                            config.default_model.api_key_env = env_var.to_string();
-                        }
-                        Err(e2) => {
-                            warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
-                        }
-                    }
-                }
             }
         }
 
@@ -704,7 +699,7 @@ impl OpenFangKernel {
         }
 
         // Use the chain, or create a stub driver if everything failed
-        let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
+        let _driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
             Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::with_models(model_chain))
         } else if let Some(single) = driver_chain.into_iter().next() {
             single
@@ -731,6 +726,12 @@ impl OpenFangKernel {
         let auth = AuthManager::new(&config.users);
         if auth.is_enabled() {
             info!("RBAC enabled with {} users", auth.user_count());
+        } else if config.channels.any_configured() {
+            warn!(
+                "One or more channels are configured but RBAC is disabled (no [[users]] in config). \
+                 Anyone who can reach the bot can interact with it. \
+                 Add [[users]] entries to config.toml for access control."
+            );
         }
 
         // Initialize model catalog, detect provider auth, and apply URL overrides
@@ -877,40 +878,77 @@ impl OpenFangKernel {
                         None
                     }
                 }
-            } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                let model = if configured_model == "all-MiniLM-L6-v2" {
-                    default_embedding_model_for_provider("openai")
-                } else {
-                    configured_model.as_str()
-                };
-                let openai_url = config.provider_urls.get("openai").map(|s| s.as_str());
-                match create_embedding_driver("openai", model, "OPENAI_API_KEY", openai_url) {
-                    Ok(d) => {
-                        info!(model = %model, "Embedding driver auto-detected: OpenAI");
-                        Some(Arc::from(d))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "OpenAI embedding auto-detect failed");
-                        None
-                    }
-                }
             } else {
-                // Try Ollama (local, no key needed)
-                let model = if configured_model == "all-MiniLM-L6-v2" {
-                    default_embedding_model_for_provider("ollama")
+                // Auto-detect embedding provider by checking API key env vars in
+                // priority order.  First match wins.
+                const API_KEY_PROVIDERS: &[(&str, &str)] = &[
+                    ("OPENAI_API_KEY",    "openai"),
+                    ("GROQ_API_KEY",      "groq"),
+                    ("MISTRAL_API_KEY",   "mistral"),
+                    ("TOGETHER_API_KEY",  "together"),
+                    ("FIREWORKS_API_KEY", "fireworks"),
+                    ("COHERE_API_KEY",    "cohere"),
+                ];
+
+                let detected_from_key = API_KEY_PROVIDERS
+                    .iter()
+                    .find(|(env_var, _)| std::env::var(env_var).is_ok())
+                    .and_then(|(env_var, provider)| {
+                        let model = if configured_model == "all-MiniLM-L6-v2" {
+                            default_embedding_model_for_provider(provider)
+                        } else {
+                            configured_model.as_str()
+                        };
+                        let custom_url = config.provider_urls.get(*provider).map(|s| s.as_str());
+                        match create_embedding_driver(provider, model, env_var, custom_url) {
+                            Ok(d) => {
+                                info!(provider = %provider, model = %model, "Embedding driver auto-detected via {}", env_var);
+                                Some(Arc::from(d))
+                            }
+                            Err(e) => {
+                                warn!(provider = %provider, error = %e, "Embedding auto-detect failed for {}", provider);
+                                None
+                            }
+                        }
+                    });
+
+                if detected_from_key.is_some() {
+                    detected_from_key
                 } else {
-                    configured_model.as_str()
-                };
-                let ollama_url = config.provider_urls.get("ollama").map(|s| s.as_str());
-                match create_embedding_driver("ollama", model, "", ollama_url) {
-                    Ok(d) => {
-                        info!(model = %model, "Embedding driver auto-detected: Ollama (local)");
-                        Some(Arc::from(d))
+                    // No API key found — try local providers in order:
+                    // Ollama, vLLM, LM Studio (no key needed).
+                    const LOCAL_PROVIDERS: &[&str] = &["ollama", "vllm", "lmstudio"];
+
+                    let mut local_result = None;
+                    for provider in LOCAL_PROVIDERS {
+                        let model = if configured_model == "all-MiniLM-L6-v2" {
+                            default_embedding_model_for_provider(provider)
+                        } else {
+                            configured_model.as_str()
+                        };
+                        let custom_url = config.provider_urls.get(*provider).map(|s| s.as_str());
+                        match create_embedding_driver(provider, model, "", custom_url) {
+                            Ok(d) => {
+                                info!(provider = %provider, model = %model, "Embedding driver auto-detected: {} (local)", provider);
+                                local_result = Some(Arc::from(d));
+                                break;
+                            }
+                            Err(e) => {
+                                debug!(provider = %provider, error = %e, "Local embedding provider {} not available", provider);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        debug!("No embedding driver available (Ollama probe failed: {e}) — using text search fallback");
-                        None
+
+                    if local_result.is_none() {
+                        warn!(
+                            "No embedding provider available. Memory recall will use text search only. \
+                             Configure [memory] embedding_provider in config.toml or set an API key \
+                             (OPENAI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY, TOGETHER_API_KEY, \
+                             FIREWORKS_API_KEY, COHERE_API_KEY)."
+                        );
                     }
+
+                    local_result
                 }
             }
         };
@@ -1012,7 +1050,6 @@ impl OpenFangKernel {
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
-            default_driver: driver,
             wasm_sandbox,
             auth,
             model_catalog: std::sync::RwLock::new(model_catalog),
@@ -1089,7 +1126,11 @@ impl OpenFangKernel {
                                             || disk_manifest.tool_allowlist
                                                 != entry.manifest.tool_allowlist
                                             || disk_manifest.tool_blocklist
-                                                != entry.manifest.tool_blocklist;
+                                                != entry.manifest.tool_blocklist
+                                            || disk_manifest.skills
+                                                != entry.manifest.skills
+                                            || disk_manifest.mcp_servers
+                                                != entry.manifest.mcp_servers;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1323,12 +1364,30 @@ impl OpenFangKernel {
                     manifest.model.provider.is_empty() || manifest.model.provider == "default";
                 if provider_is_default || manifest.model.provider == entry.provider {
                     manifest.model.provider = entry.provider.clone();
-                    manifest.model.model = strip_provider_prefix(&entry.id, &entry.provider);
+                    let stripped = strip_provider_prefix(&entry.id, &entry.provider);
+                    // Resolve short aliases to canonical IDs so the manifest
+                    // always stores the full model name (e.g. "sonnet" from
+                    // e.g. "claude-code-direct/claude-sonnet-4-6" → "claude-sonnet-4-6").
+                    manifest.model.model = catalog
+                        .resolve_alias(&stripped)
+                        .map(|s| s.to_string())
+                        .unwrap_or(stripped);
                     if manifest.model.api_key_env.is_none() {
                         manifest.model.api_key_env =
                             Some(self.config.resolve_api_key_env(&entry.provider));
                     }
                 }
+            }
+
+            // Normalize: strip provider prefix from model name if present
+            let normalized =
+                strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+            if normalized != manifest.model.model {
+                // Resolve alias after stripping to ensure canonical ID
+                manifest.model.model = catalog
+                    .resolve_alias(&normalized)
+                    .map(|s| s.to_string())
+                    .unwrap_or(normalized);
             }
         }
         if manifest.model.api_key_env.is_none()
@@ -1337,12 +1396,6 @@ impl OpenFangKernel {
         {
             manifest.model.api_key_env =
                 Some(self.config.resolve_api_key_env(&manifest.model.provider));
-        }
-
-        // Normalize: strip provider prefix from model name if present
-        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
-        if normalized != manifest.model.model {
-            manifest.model.model = normalized;
         }
 
         // Apply global budget defaults to agent resource quotas
@@ -2985,19 +3038,26 @@ impl OpenFangKernel {
             }
         };
 
-        // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
-        let normalized_model =
-            if let (Some(entry), Some(prov)) = (catalog_entry.as_ref(), provider.as_ref()) {
-                if entry.provider == *prov {
-                    strip_provider_prefix(&entry.id, prov)
-                } else {
-                    strip_provider_prefix(model, prov)
-                }
+        // Strip the provider prefix from the model name and resolve any remaining
+        // short aliases to canonical API model IDs (e.g. "sonnet" → "claude-sonnet-4-6").
+        let normalized_model = {
+            let stripped = if let (Some(entry), Some(prov)) =
+                (catalog_entry.as_ref(), provider.as_ref())
+            {
+                strip_provider_prefix(&entry.id, prov)
             } else if let Some(ref prov) = provider {
                 strip_provider_prefix(model, prov)
             } else {
                 model.to_string()
             };
+            // Defense-in-depth: resolve alias after stripping so short names
+            // like "sonnet" never survive into the manifest.
+            self.model_catalog
+                .read()
+                .ok()
+                .and_then(|cat| cat.resolve_alias(&stripped).map(|s| s.to_string()))
+                .unwrap_or(stripped)
+        };
 
         if let Some(provider) = provider {
             let api_key_env = Some(self.config.resolve_api_key_env(&provider));
@@ -3120,6 +3180,24 @@ impl OpenFangKernel {
             blocklist = ?blocklist,
             "Agent tool filters updated"
         );
+        Ok(())
+    }
+
+    /// Update taint/PII policy for an agent.
+    pub fn set_agent_taint_policy(
+        &self,
+        agent_id: AgentId,
+        policy: openfang_types::taint::TaintPolicy,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_taint_policy(agent_id, policy)
+            .map_err(KernelError::OpenFang)?;
+
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent(&entry);
+        }
+
+        info!(agent_id = %agent_id, "Agent taint policy updated");
         Ok(())
     }
 
@@ -3339,7 +3417,11 @@ impl OpenFangKernel {
         &self,
         hand_id: &str,
         config: std::collections::HashMap<String, serde_json::Value>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
     ) -> KernelResult<openfang_hands::HandInstance> {
+        let provider_override = provider_override.filter(|s| !s.is_empty());
+        let model_override = model_override.filter(|s| !s.is_empty());
         use openfang_hands::HandError;
 
         let def = self
@@ -3365,12 +3447,16 @@ impl OpenFangKernel {
 
         // Build an agent manifest from the hand definition.
         // If the hand declares provider/model as "default", inherit the kernel's configured LLM.
-        let hand_provider = if def.agent.provider == "default" {
+        let hand_provider = if let Some(ref p) = provider_override {
+            p.clone()
+        } else if def.agent.provider == "default" {
             self.config.default_model.provider.clone()
         } else {
             def.agent.provider.clone()
         };
-        let hand_model = if def.agent.model == "default" {
+        let hand_model = if let Some(ref m) = model_override {
+            m.clone()
+        } else if def.agent.model == "default" {
             self.config.default_model.model.clone()
         } else {
             def.agent.model.clone()
@@ -3906,7 +3992,7 @@ impl OpenFangKernel {
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
             for (hand_id, config, old_agent_id) in saved_hands {
-                match self.activate_hand(&hand_id, config) {
+                match self.activate_hand(&hand_id, config, None, None) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart
@@ -3976,7 +4062,7 @@ impl OpenFangKernel {
             // Each agent gets a 500ms delay before the next one starts.
             tokio::spawn(async move {
                 for (i, (id, name, schedule)) in bg_agents.into_iter().enumerate() {
-                    kernel.start_background_for_agent(id, &name, &schedule);
+                    kernel.start_background_for_agent(id, &name, &schedule, false);
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
@@ -4471,6 +4557,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         name: &str,
         schedule: &ScheduleMode,
+        immediate_first_tick: bool,
     ) {
         // For proactive agents, auto-register triggers from conditions
         if let ScheduleMode::Proactive { conditions } = schedule {
@@ -4489,7 +4576,7 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, immediate_first_tick, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
                     match k.send_message(aid, &msg).await {
@@ -4680,22 +4767,10 @@ impl OpenFangKernel {
             match drivers::create_driver(&driver_config) {
                 Ok(d) => d,
                 Err(e) => {
-                    // If fresh driver creation fails (e.g. key not yet set for this
-                    // provider), fall back to the boot-time default driver. This
-                    // keeps existing agents working while the user is still
-                    // configuring providers via the dashboard.
-                    if agent_provider == default_provider && !has_custom_key && !has_custom_url {
-                        debug!(
-                            provider = %agent_provider,
-                            error = %e,
-                            "Fresh driver creation failed, falling back to boot-time default"
-                        );
-                        Arc::clone(&self.default_driver)
-                    } else {
-                        return Err(KernelError::BootFailed(format!(
-                            "Agent LLM driver init failed: {e}"
-                        )));
-                    }
+                    return Err(KernelError::BootFailed(format!(
+                        "Agent LLM driver init failed for provider '{}': {e}",
+                        agent_provider
+                    )));
                 }
             }
         };
@@ -4743,7 +4818,19 @@ impl OpenFangKernel {
                     skip_permissions: true,
                 };
                 match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, strip_provider_prefix(&fb_model_name, &fb_provider))),
+                    Ok(d) => {
+                        let stripped =
+                            strip_provider_prefix(&fb_model_name, &fb_provider);
+                        let resolved = self
+                            .model_catalog
+                            .read()
+                            .ok()
+                            .and_then(|cat| {
+                                cat.resolve_alias(&stripped).map(|s| s.to_string())
+                            })
+                            .unwrap_or(stripped);
+                        chain.push((d, resolved));
+                    }
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb_provider);
                     }
@@ -5722,7 +5809,10 @@ fn apply_budget_defaults(
 fn default_embedding_model_for_provider(provider: &str) -> &'static str {
     match provider {
         "openai" => "text-embedding-3-small",
+        "groq" => "nomic-embed-text",
         "mistral" => "mistral-embed",
+        "together" => "togethercomputer/m2-bert-80M-8k-retrieval",
+        "fireworks" => "nomic-ai/nomic-embed-text-v1.5",
         "cohere" => "embed-english-v3.0",
         // Local providers use nomic-embed-text as a good default
         "ollama" | "vllm" | "lmstudio" => "nomic-embed-text",
@@ -6392,7 +6482,7 @@ impl KernelHandle for OpenFangKernel {
         config: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         let instance = self
-            .activate_hand(hand_id, config)
+            .activate_hand(hand_id, config, None, None)
             .map_err(|e| format!("{e}"))?;
 
         Ok(serde_json::json!({
@@ -7168,7 +7258,7 @@ mod tests {
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
         let instance = kernel
-            .activate_hand("browser", HashMap::new())
+            .activate_hand("browser", HashMap::new(), None, None)
             .expect("browser hand should activate");
         let agent_id = instance.agent_id.expect("browser hand agent id");
         let entry = kernel

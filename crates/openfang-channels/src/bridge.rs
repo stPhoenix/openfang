@@ -768,6 +768,7 @@ async fn dispatch_message(
                 thread_id,
                 output_format,
                 lifecycle_reactions,
+                &overrides,
             )
             .await;
             return;
@@ -775,7 +776,7 @@ async fn dispatch_message(
         // Image download failed — fall through to text description below
     }
 
-    let text = match &message.content {
+    let mut text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { .. } => unreachable!(), // handled above
         ChannelContent::Image {
@@ -827,24 +828,63 @@ async fn dispatch_message(
     }
 
     // --- Prompt injection guard ---
-    // Scan incoming channel messages for injection patterns before routing.
-    // Default mode is Warn (log and allow through). Agents can override via manifest.
+    // Apply the channel's prompt guard policy to incoming text.
     {
-        use openfang_types::prompt_guard;
-        let verdict = prompt_guard::scan_all(&text);
-        if verdict.has_critical() {
-            let patterns: Vec<&str> = verdict
-                .findings()
-                .iter()
-                .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
-                .map(|f| f.pattern.as_str())
-                .collect();
-            tracing::warn!(
-                channel = ct_str,
-                sender = %message.sender.display_name,
-                patterns = ?patterns,
-                "Prompt injection detected in incoming channel message"
-            );
+        use openfang_types::prompt_guard::{self, PromptGuardMode};
+        let policy = overrides
+            .as_ref()
+            .map(|ov| ov.prompt_guard.clone())
+            .unwrap_or_default();
+
+        match policy.mode {
+            PromptGuardMode::Off => {}
+            PromptGuardMode::Warn => {
+                let verdict = prompt_guard::scan_all(&text);
+                if verdict.has_critical() {
+                    let patterns: Vec<&str> = verdict
+                        .findings()
+                        .iter()
+                        .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                        .map(|f| f.pattern.as_str())
+                        .collect();
+                    tracing::warn!(
+                        channel = ct_str,
+                        sender = %message.sender.display_name,
+                        patterns = ?patterns,
+                        "Prompt injection detected in incoming channel message"
+                    );
+                }
+            }
+            PromptGuardMode::Sanitize => {
+                let original = text.clone();
+                text = prompt_guard::sanitize(&text);
+                if text != original {
+                    tracing::warn!(
+                        channel = ct_str,
+                        sender = %message.sender.display_name,
+                        "Prompt injection patterns sanitized from incoming message"
+                    );
+                }
+            }
+            PromptGuardMode::Block => {
+                if let Err(reason) = prompt_guard::apply_policy(&text, &policy) {
+                    tracing::warn!(
+                        channel = ct_str,
+                        sender = %message.sender.display_name,
+                        reason = %reason,
+                        "Blocked incoming message due to prompt injection"
+                    );
+                    send_response(
+                        adapter,
+                        &message.sender,
+                        "Your message was blocked by the prompt injection guard.".to_string(),
+                        thread_id,
+                        output_format,
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
     }
 
@@ -1361,6 +1401,7 @@ async fn dispatch_with_blocks(
     thread_id: Option<&str>,
     output_format: OutputFormat,
     lifecycle_reactions: bool,
+    overrides: &Option<openfang_types::config::ChannelOverrides>,
 ) {
     // Route to agent (same logic as text path)
     let agent_id = router.resolve(
@@ -1417,6 +1458,54 @@ async fn dispatch_with_blocks(
         )
         .await;
         return;
+    }
+
+    // --- Prompt injection guard on text blocks ---
+    {
+        use openfang_types::prompt_guard::{self, PromptGuardMode};
+        let policy = overrides
+            .as_ref()
+            .map(|ov| ov.prompt_guard.clone())
+            .unwrap_or_default();
+        if policy.mode != PromptGuardMode::Off {
+            for block in &blocks {
+                if let ContentBlock::Text { text, .. } = block {
+                    let verdict = prompt_guard::scan_all(text);
+                    if verdict.has_critical() {
+                        let patterns: Vec<&str> = verdict
+                            .findings()
+                            .iter()
+                            .filter(|f| f.severity == prompt_guard::FindingSeverity::Critical)
+                            .map(|f| f.pattern.as_str())
+                            .collect();
+                        if policy.mode == PromptGuardMode::Block {
+                            tracing::warn!(
+                                channel = ct_str,
+                                sender = %message.sender.display_name,
+                                patterns = ?patterns,
+                                "Blocked multimodal message due to prompt injection"
+                            );
+                            send_response(
+                                adapter,
+                                &message.sender,
+                                "Your message was blocked by the prompt injection guard."
+                                    .to_string(),
+                                thread_id,
+                                output_format,
+                            )
+                            .await;
+                            return;
+                        }
+                        tracing::warn!(
+                            channel = ct_str,
+                            sender = %message.sender.display_name,
+                            patterns = ?patterns,
+                            "Prompt injection detected in multimodal channel message"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Resolve verified sender identity for per-role tool restrictions
@@ -1976,7 +2065,7 @@ mod tests {
     #[test]
     fn test_dm_policy_filtering() {
         // Test that DmPolicy::Ignore would be checked
-        assert_eq!(DmPolicy::default(), DmPolicy::Respond);
+        assert_eq!(DmPolicy::default(), DmPolicy::AllowedOnly);
         assert_eq!(GroupPolicy::default(), GroupPolicy::MentionOnly);
     }
 

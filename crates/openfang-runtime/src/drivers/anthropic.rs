@@ -33,6 +33,20 @@ impl AnthropicDriver {
                 .unwrap_or_default(),
         }
     }
+
+    /// Apply the correct auth header based on the key type.
+    ///
+    /// OAuth tokens (prefix `sk-ant-oat`) use `Authorization: Bearer` plus the
+    /// `anthropic-beta: oauth-2025-04-20` header to enable OAuth on the Messages API.
+    /// Regular API keys use `x-api-key`.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.starts_with("sk-ant-oat") {
+            req.header("Authorization", format!("Bearer {}", self.api_key.as_str()))
+                .header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            req.header("x-api-key", self.api_key.as_str())
+        }
+    }
 }
 
 /// Anthropic Messages API request body.
@@ -205,9 +219,7 @@ impl LlmDriver for AnthropicDriver {
             debug!(url = %url, attempt, "Sending Anthropic API request");
 
             let resp = self
-                .client
-                .post(&url)
-                .header("x-api-key", self.api_key.as_str())
+                .apply_auth(self.client.post(&url))
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .json(&api_request)
@@ -312,9 +324,7 @@ impl LlmDriver for AnthropicDriver {
             debug!(url = %url, attempt, "Sending Anthropic streaming request");
 
             let resp = self
-                .client
-                .post(&url)
-                .header("x-api-key", self.api_key.as_str())
+                .apply_auth(self.client.post(&url))
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .json(&api_request)

@@ -307,10 +307,12 @@ impl McpConnection {
             }
         }
 
-        let config = StreamableHttpClientTransportConfig {
-            uri: Arc::from(url),
-            custom_headers,
-            ..Default::default()
+        #[allow(clippy::field_reassign_with_default)]
+        let config = {
+            let mut c = StreamableHttpClientTransportConfig::default();
+            c.uri = Arc::from(url);
+            c.custom_headers = custom_headers;
+            c
         };
 
         let transport = StreamableHttpClientTransport::from_config(config);

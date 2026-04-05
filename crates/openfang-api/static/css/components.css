@@ -701,8 +701,7 @@ mark.search-highlight {
 .tool-card[data-tool^="knowledge_"] { border-left-color: #F472B6; }
 .tool-card[data-tool^="cron_"],
 .tool-card[data-tool^="schedule_"] { border-left-color: #FB923C; }
-.tool-card[data-tool^="browser_"],
-.tool-card[data-tool^="playwright_"] { border-left-color: #2DD4BF; }
+.tool-card[data-tool^="browser_"] { border-left-color: #2DD4BF; }
 .tool-card[data-tool^="container_"],
 .tool-card[data-tool^="docker_"] { border-left-color: #38BDF8; }
 .tool-card[data-tool^="image_"],

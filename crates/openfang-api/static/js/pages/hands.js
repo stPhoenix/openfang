@@ -37,6 +37,13 @@ function handsPage() {
     detectedPlatform: 'linux',
     installPlatforms: {},
     apiKeyInputs: {},
+    // ── Provider/Model Selection ───────────────────────────────────────
+    handProviders: [],
+    handProvidersLoading: false,
+    handProvider: '',
+    handModel: '',
+    handModels: [],
+    handModelsLoading: false,
 
     async loadData() {
       this.loading = true;
@@ -123,6 +130,30 @@ function handsPage() {
           }
         }
         this.setupWizard = data;
+        // Pre-populate provider/model from hand definition
+        this.handProvider = (data.agent && data.agent.provider) || '';
+        this.handModel = (data.agent && data.agent.model) || '';
+        // Fetch available providers, models, and status concurrently
+        this.handProvidersLoading = true;
+        this.handModelsLoading = true;
+        var self = this;
+        Promise.all([
+          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
+          OpenFangAPI.get('/api/status').catch(function() { return {}; }),
+          OpenFangAPI.get('/api/models?available=true').catch(function() { return { models: [] }; })
+        ]).then(function(results) {
+          self.handProviders = results[0].providers || [];
+          self.handModels = results[2].models || [];
+          // If hand uses 'default', resolve to kernel default
+          if (!self.handProvider || self.handProvider === 'default') {
+            self.handProvider = results[1].default_provider || '';
+          }
+          if (!self.handModel || self.handModel === 'default') {
+            self.handModel = results[1].default_model || '';
+          }
+          self.handProvidersLoading = false;
+          self.handModelsLoading = false;
+        });
         // Skip deps step if no requirements
         var hasReqs = data.requirements && data.requirements.length > 0;
         this.setupStep = hasReqs ? 1 : 2;
@@ -314,6 +345,22 @@ function handsPage() {
       return true;
     },
 
+    get handFilteredModels() {
+      if (!this.handProvider) return this.handModels;
+      var prov = this.handProvider;
+      return this.handModels.filter(function(m) { return m.provider === prov; });
+    },
+
+    onHandProviderChange() {
+      // When provider changes, auto-select first model if current model doesn't match
+      var filtered = this.handFilteredModels;
+      if (filtered.length === 0) { this.handModel = ''; return; }
+      var currentValid = filtered.some(function(m) { return m.id === this.handModel; }.bind(this));
+      if (!currentValid) {
+        this.handModel = filtered[0].id;
+      }
+    },
+
     getSettingKeyForReq(req) {
       // Find the matching setting key for an API key requirement.
       // Convention: setting key is the lowercase version of the requirement key.
@@ -348,9 +395,11 @@ function handsPage() {
       if (this.setupStep === 1 && this.setupHasSettings) {
         this.setupStep = 2;
       } else if (this.setupStep === 1) {
-        this.setupStep = 3;
+        this.setupStep = 3; // skip settings, go to model
       } else if (this.setupStep === 2) {
-        this.setupStep = 3;
+        this.setupStep = 3; // settings -> model
+      } else if (this.setupStep === 3) {
+        this.setupStep = 4; // model -> launch
       }
     },
 
@@ -368,10 +417,12 @@ function handsPage() {
     },
 
     setupPrevStep() {
-      if (this.setupStep === 3 && this.setupHasSettings) {
-        this.setupStep = 2;
+      if (this.setupStep === 4) {
+        this.setupStep = 3; // launch -> model
+      } else if (this.setupStep === 3 && this.setupHasSettings) {
+        this.setupStep = 2; // model -> settings
       } else if (this.setupStep === 3) {
-        this.setupStep = this.setupHasReqs ? 1 : 2;
+        this.setupStep = this.setupHasReqs ? 1 : 2; // model -> deps or settings
       } else if (this.setupStep === 2 && this.setupHasReqs) {
         this.setupStep = 1;
       }
@@ -385,6 +436,10 @@ function handsPage() {
       this.clipboardMsg = null;
       this.installPlatforms = {};
       this.apiKeyInputs = {};
+      this.handProviders = [];
+      this.handModels = [];
+      this.handProvider = '';
+      this.handModel = '';
     },
 
     async launchHand() {
@@ -408,7 +463,10 @@ function handsPage() {
       }
       this.activatingId = handId;
       try {
-        var data = await OpenFangAPI.post('/api/hands/' + handId + '/activate', { config: config });
+        var body = { config: config };
+        if (this.handProvider) body.provider = this.handProvider;
+        if (this.handModel) body.model = this.handModel;
+        var data = await OpenFangAPI.post('/api/hands/' + handId + '/activate', body);
         this.showToast('Hand "' + handId + '" activated as ' + (data.agent_name || data.instance_id));
         this.closeSetupWizard();
         await this.loadActive();

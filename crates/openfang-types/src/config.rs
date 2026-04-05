@@ -1,5 +1,6 @@
 //! Configuration types for the OpenFang kernel.
 
+use crate::prompt_guard::PromptGuardPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,9 +30,9 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
     /// Respond to all DMs.
-    #[default]
     Respond,
-    /// Only respond to DMs from allowed users.
+    /// Only respond to DMs from allowed users (RBAC check enforced).
+    #[default]
     AllowedOnly,
     /// Ignore all DMs.
     Ignore,
@@ -93,6 +94,10 @@ pub struct ChannelOverrides {
     /// Defaults to true. Set to false to suppress automatic reactions (e.g. on Telegram).
     #[serde(default = "default_true")]
     pub lifecycle_reactions: bool,
+    /// Prompt injection guard policy for incoming messages.
+    /// Default: Warn (scan and log, but allow through).
+    #[serde(default)]
+    pub prompt_guard: PromptGuardPolicy,
 }
 
 impl Default for ChannelOverrides {
@@ -108,6 +113,7 @@ impl Default for ChannelOverrides {
             usage_footer: None,
             typing_mode: None,
             lifecycle_reactions: true,
+            prompt_guard: PromptGuardPolicy::default(),
         }
     }
 }
@@ -173,7 +179,9 @@ pub enum SearchProvider {
     Perplexity,
     /// DuckDuckGo HTML (no API key needed).
     DuckDuckGo,
-    /// Auto-select based on available API keys (Tavily → Brave → Perplexity → DuckDuckGo).
+    /// SearXNG self-hosted search (no API key needed).
+    Searxng,
+    /// Auto-select based on available API keys (Tavily → Brave → Perplexity → Searxng → DuckDuckGo).
     #[default]
     Auto,
 }
@@ -192,6 +200,8 @@ pub struct WebConfig {
     pub tavily: TavilySearchConfig,
     /// Perplexity Search configuration.
     pub perplexity: PerplexitySearchConfig,
+    /// SearXNG Search configuration.
+    pub searxng: SearxngSearchConfig,
     /// Web fetch configuration.
     pub fetch: WebFetchConfig,
 }
@@ -204,6 +214,7 @@ impl Default for WebConfig {
             brave: BraveSearchConfig::default(),
             tavily: TavilySearchConfig::default(),
             perplexity: PerplexitySearchConfig::default(),
+            searxng: SearxngSearchConfig::default(),
             fetch: WebFetchConfig::default(),
         }
     }
@@ -281,6 +292,14 @@ impl Default for PerplexitySearchConfig {
     }
 }
 
+/// SearXNG self-hosted search configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearxngSearchConfig {
+    /// Base URL of the SearXNG instance (e.g., "https://search.example.com").
+    pub url: String,
+}
+
 /// Web fetch configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -293,6 +312,15 @@ pub struct WebFetchConfig {
     pub timeout_secs: u64,
     /// Enable HTML→Markdown readability extraction.
     pub readability: bool,
+    /// SSRF allowlist for self-hosted environments.
+    ///
+    /// Entries can be exact hostnames (`"n8n.local"`), wildcard domains
+    /// (`"*.olares.com"`), or CIDR ranges (`"10.0.0.0/8"`).
+    ///
+    /// Allowlisted hosts bypass the private-IP check but **never** bypass
+    /// cloud metadata endpoint blocking (169.254.169.254, metadata.google.internal, etc.).
+    #[serde(default)]
+    pub ssrf_allowed_hosts: Vec<String>,
 }
 
 impl Default for WebFetchConfig {
@@ -302,6 +330,7 @@ impl Default for WebFetchConfig {
             max_response_bytes: 10 * 1024 * 1024, // 10 MB
             timeout_secs: 30,
             readability: true,
+            ssrf_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -1024,6 +1053,11 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// SHA-256 hash of the API key (hex-encoded). When set, takes precedence
+    /// over `api_key` for authentication — the plaintext key is not needed in config.
+    /// Generate with: `echo -n "your-api-key" | sha256sum | cut -d' ' -f1`
+    #[serde(default)]
+    pub api_key_hash: Option<String>,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1140,6 +1174,35 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// PII detection configuration (regex + optional NER).
+    #[serde(default)]
+    pub pii: PiiConfig,
+}
+
+/// PII detection configuration.
+///
+/// Controls whether ML-based NER is used alongside regex for PII detection.
+/// Configure in `[pii]` section of config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PiiConfig {
+    /// Enable ML-based NER detection globally. Individual agents can override
+    /// via `taint_policy.ner_enabled`.
+    pub ner_enabled: bool,
+    /// Directory containing the ONNX NER model files (model.onnx, tokenizer.json).
+    pub model_dir: PathBuf,
+    /// Minimum confidence threshold for NER detections (0.0–1.0).
+    pub confidence_threshold: f32,
+}
+
+impl Default for PiiConfig {
+    fn default() -> Self {
+        Self {
+            ner_enabled: false,
+            model_dir: PathBuf::from("~/.openfang/models/ner"),
+            confidence_threshold: 0.85,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1171,8 +1234,9 @@ pub struct AuthConfig {
     pub enabled: bool,
     /// Admin username.
     pub username: String,
-    /// SHA256 hash of the password (hex-encoded).
-    /// Generate with: openfang auth hash-password
+    /// Password hash in Argon2 PHC format (`$argon2id$v=19$...`).
+    /// Legacy SHA-256 hex hashes are accepted and auto-migrated on next login.
+    /// Generate with: `openfang auth hash-password`
     pub password_hash: String,
     /// Session token lifetime in hours (default: 168 = 7 days).
     pub session_ttl_hours: u64,
@@ -1345,6 +1409,7 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            api_key_hash: None,
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -1381,6 +1446,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            pii: PiiConfig::default(),
         }
     }
 }
@@ -1434,6 +1500,14 @@ impl std::fmt::Debug for KernelConfig {
                     "<empty>"
                 } else {
                     "<redacted>"
+                },
+            )
+            .field(
+                "api_key_hash",
+                &if self.api_key_hash.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
                 },
             )
             .field("mode", &self.mode)
@@ -1739,6 +1813,55 @@ pub struct ChannelsConfig {
     pub wecom: Option<WeComConfig>,
     /// MQTT pub/sub configuration (None = disabled).
     pub mqtt: Option<MqttConfig>,
+}
+
+impl ChannelsConfig {
+    /// Returns `true` if at least one channel adapter is configured.
+    pub fn any_configured(&self) -> bool {
+        self.telegram.is_some()
+            || self.discord.is_some()
+            || self.slack.is_some()
+            || self.whatsapp.is_some()
+            || self.signal.is_some()
+            || self.matrix.is_some()
+            || self.email.is_some()
+            || self.teams.is_some()
+            || self.mattermost.is_some()
+            || self.irc.is_some()
+            || self.google_chat.is_some()
+            || self.twitch.is_some()
+            || self.rocketchat.is_some()
+            || self.zulip.is_some()
+            || self.xmpp.is_some()
+            || self.line.is_some()
+            || self.viber.is_some()
+            || self.messenger.is_some()
+            || self.reddit.is_some()
+            || self.mastodon.is_some()
+            || self.bluesky.is_some()
+            || self.feishu.is_some()
+            || self.revolt.is_some()
+            || self.nextcloud.is_some()
+            || self.guilded.is_some()
+            || self.keybase.is_some()
+            || self.threema.is_some()
+            || self.nostr.is_some()
+            || self.webex.is_some()
+            || self.pumble.is_some()
+            || self.flock.is_some()
+            || self.twist.is_some()
+            || self.mumble.is_some()
+            || self.dingtalk.is_some()
+            || self.dingtalk_stream.is_some()
+            || self.discourse.is_some()
+            || self.gitter.is_some()
+            || self.ntfy.is_some()
+            || self.gotify.is_some()
+            || self.webhook.is_some()
+            || self.linkedin.is_some()
+            || self.wecom.is_some()
+            || self.mqtt.is_some()
+    }
 }
 
 /// Telegram channel adapter configuration.
@@ -3625,6 +3748,13 @@ impl KernelConfig {
                     ));
                 }
             }
+            SearchProvider::Searxng => {
+                if self.web.searxng.url.is_empty() {
+                    warnings.push(
+                        "Searxng search selected but searxng.url is not configured".to_string(),
+                    );
+                }
+            }
             SearchProvider::DuckDuckGo | SearchProvider::Auto => {}
         }
 
@@ -3948,7 +4078,7 @@ mod tests {
     #[test]
     fn test_channel_overrides_defaults() {
         let ov = ChannelOverrides::default();
-        assert_eq!(ov.dm_policy, DmPolicy::Respond);
+        assert_eq!(ov.dm_policy, DmPolicy::AllowedOnly);
         assert_eq!(ov.group_policy, GroupPolicy::MentionOnly);
         assert_eq!(ov.rate_limit_per_user, 0);
         assert!(!ov.threading);
@@ -4024,7 +4154,7 @@ mod tests {
         let ov: ChannelOverrides = serde_json::from_str(json).unwrap();
         assert!(!ov.lifecycle_reactions);
         // Other fields should have their defaults
-        assert_eq!(ov.dm_policy, DmPolicy::Respond);
+        assert_eq!(ov.dm_policy, DmPolicy::AllowedOnly);
         assert!(ov.model.is_none());
     }
 

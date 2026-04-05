@@ -152,6 +152,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "",
             key_required: false,
         }),
+        "claude-code-direct" => Some(ProviderDefaults {
+            base_url: ANTHROPIC_BASE_URL,
+            api_key_env: "ANTHROPIC_API_KEY",
+            key_required: false,
+        }),
         "moonshot" | "kimi" | "kimi2" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
@@ -323,6 +328,30 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             cli_path,
             config.skip_permissions,
         )));
+    }
+
+    // Claude Code Direct — Anthropic API with OAuth token from Claude CLI.
+    // Supports native tool calling, unlike the subprocess-based claude-code driver.
+    //
+    // OAuth tokens (`sk-ant-oat*`) are sent as `Authorization: Bearer` with the
+    // `anthropic-beta: oauth-2025-04-20` header (handled by AnthropicDriver::apply_auth).
+    if provider == "claude-code-direct" {
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .or_else(claude_code::read_claude_oauth_token)
+            .ok_or_else(|| {
+                LlmError::MissingApiKey(
+                    "No Anthropic API key found. Run `claude auth` or set ANTHROPIC_API_KEY"
+                        .into(),
+                )
+            })?;
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| ANTHROPIC_BASE_URL.to_string());
+        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
     // Qwen Code CLI — subprocess-based, uses Qwen OAuth (free tier)
@@ -499,6 +528,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
 ///
 /// Returns `(provider, model, api_key_env)` for the first provider that has a
 /// configured API key, checked in a user-friendly priority order.
+#[deprecated(note = "Auto-detection removed; providers must be explicitly configured")]
 pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'static str)> {
     // Priority: popular cloud providers first, then niche, then local
     const PROBE_ORDER: &[(&str, &str, &str)] = &[
@@ -589,6 +619,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "nvidia",
         "codex",
         "claude-code",
+        "claude-code-direct",
         "qwen-code",
         "azure",
     ]
@@ -695,7 +726,7 @@ mod tests {
         assert!(providers.contains(&"claude-code"));
         assert!(providers.contains(&"qwen-code"));
         assert!(providers.contains(&"azure"));
-        assert_eq!(providers.len(), 37);
+        assert_eq!(providers.len(), 38);
     }
 
     #[test]

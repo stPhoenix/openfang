@@ -1191,15 +1191,15 @@ pub async fn start_channel_bridge_with_config(
         started_at: Instant::now(),
     };
 
-    // Security advisory: warn when RBAC is enabled but channels have open DM policy
+    // Security advisory: warn when RBAC is enabled but channels explicitly override to open DM policy
     if kernel.auth.is_enabled() {
         use openfang_types::config::DmPolicy;
         let check_channel = |name: &str, overrides: &openfang_types::config::ChannelOverrides, allowed_users_empty: bool| {
             if overrides.dm_policy == DmPolicy::Respond && allowed_users_empty {
                 warn!(
                     channel = name,
-                    "Channel has dm_policy=respond with RBAC enabled but no allowed_users. \
-                     Consider setting dm_policy='allowed_only' for defense in depth."
+                    "Channel has dm_policy=respond (explicitly overridden from default 'allowed_only') \
+                     with RBAC enabled but no allowed_users. Any user can DM the bot."
                 );
             }
         };

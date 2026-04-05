@@ -219,6 +219,23 @@ pub enum TaintMode {
     Allow,
 }
 
+/// Action to take when PII is detected in outgoing data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiiAction {
+    /// Hard block — reject the operation entirely.
+    #[default]
+    Block,
+    /// Redact — replace detected PII with placeholders and proceed.
+    Redact,
+    /// Approval gate — ask the user for one-time permission.
+    Approve,
+}
+
+fn default_ner_confidence() -> f32 {
+    0.85
+}
+
 /// Per-agent taint enforcement policy.
 ///
 /// Controls whether PII/secret detection blocks tool execution, asks the
@@ -226,12 +243,21 @@ pub enum TaintMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaintPolicy {
-    /// Enforcement mode.
+    /// Enforcement mode (for secrets and non-PII taint labels).
     pub mode: TaintMode,
     /// Labels to exempt from checks. For example, `["Pii"]` allows PII
     /// forwarding while still blocking secrets.
     #[serde(default)]
     pub allow_labels: HashSet<TaintLabel>,
+    /// Action to take when PII is specifically detected (block, redact, or approve).
+    #[serde(default)]
+    pub pii_action: PiiAction,
+    /// Enable ML-based NER detection for this agent (requires `ner` feature and model files).
+    #[serde(default)]
+    pub ner_enabled: bool,
+    /// Minimum confidence threshold for NER detections (0.0–1.0).
+    #[serde(default = "default_ner_confidence")]
+    pub ner_confidence: f32,
 }
 
 impl Default for TaintPolicy {
@@ -239,6 +265,9 @@ impl Default for TaintPolicy {
         Self {
             mode: TaintMode::Block,
             allow_labels: HashSet::new(),
+            pii_action: PiiAction::Block,
+            ner_enabled: false,
+            ner_confidence: 0.85,
         }
     }
 }
@@ -339,6 +368,9 @@ mod tests {
         let policy = TaintPolicy::default();
         assert_eq!(policy.mode, TaintMode::Block);
         assert!(policy.allow_labels.is_empty());
+        assert_eq!(policy.pii_action, PiiAction::Block);
+        assert!(!policy.ner_enabled);
+        assert!((policy.ner_confidence - 0.85).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -347,6 +379,31 @@ mod tests {
         let policy: TaintPolicy = serde_json::from_value(json).unwrap();
         assert_eq!(policy.mode, TaintMode::Approve);
         assert!(policy.allow_labels.contains(&TaintLabel::Pii));
+    }
+
+    #[test]
+    fn test_pii_action_serde() {
+        let json = serde_json::json!({
+            "mode": "block",
+            "pii_action": "redact",
+            "ner_enabled": true,
+            "ner_confidence": 0.7
+        });
+        let policy: TaintPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(policy.pii_action, PiiAction::Redact);
+        assert!(policy.ner_enabled);
+        assert!((policy.ner_confidence - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_pii_action_backward_compat() {
+        // Old config without pii_action fields should deserialize with defaults.
+        let json = serde_json::json!({"mode": "allow"});
+        let policy: TaintPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(policy.mode, TaintMode::Allow);
+        assert_eq!(policy.pii_action, PiiAction::Block);
+        assert!(!policy.ner_enabled);
+        assert!((policy.ner_confidence - 0.85).abs() < f32::EPSILON);
     }
 
     #[test]

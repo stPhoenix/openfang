@@ -437,6 +437,12 @@ pub struct ActivateHandRequest {
     /// Optional configuration overrides.
     #[serde(default)]
     pub config: HashMap<String, serde_json::Value>,
+    /// Override the hand's declared provider (e.g. "groq", "openai").
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Override the hand's declared model (e.g. "llama-3.3-70b-versatile").
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[cfg(test)]

@@ -268,6 +268,21 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update the taint/PII policy for an agent.
+    pub fn update_taint_policy(
+        &self,
+        id: AgentId,
+        policy: openfang_types::taint::TaintPolicy,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.taint_policy = policy;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Touch an agent — refresh last_active without changing any other state.
     /// Used by the agent loop to prevent heartbeat false-positives during long LLM calls.
     pub fn touch(&self, id: AgentId) {

@@ -260,6 +260,7 @@ enum Step {
     ApiKey,
     Model,
     Routing,
+    Security,
     Complete,
 }
 
@@ -278,6 +279,24 @@ enum RoutingPhase {
     Choice,
     /// Picking model for a tier (0=fast, 1=balanced, 2=frontier)
     PickTier(usize),
+}
+
+/// Sub-state within the Security step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecurityPhase {
+    Choice,
+    AdminUser,
+    AdminPass,
+    AdminPassConfirm,
+    Confirm,
+}
+
+/// Security mode chosen during onboarding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecurityMode {
+    Open,
+    ApiKeyOnly,
+    FullLockdown,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,6 +361,16 @@ struct State {
     routing_models: [String; 3],
     routing_tier_list: ListState, // for PickTier model selection
 
+    // Security
+    security_phase: SecurityPhase,
+    security_mode: SecurityMode,
+    security_choice_list: ListState,
+    generated_api_key: String,
+    admin_username: String,
+    admin_password: String,
+    admin_password_confirm: String,
+    password_mismatch: bool,
+
     // Complete
     complete_list: ListState,
     daemon_started: bool,
@@ -380,6 +409,14 @@ impl State {
             routing_enabled: false,
             routing_models: [String::new(), String::new(), String::new()],
             routing_tier_list: ListState::default(),
+            security_phase: SecurityPhase::Choice,
+            security_mode: SecurityMode::Open,
+            security_choice_list: ListState::default(),
+            generated_api_key: String::new(),
+            admin_username: String::new(),
+            admin_password: String::new(),
+            admin_password_confirm: String::new(),
+            password_mismatch: false,
             complete_list: ListState::default(),
             daemon_started: false,
             daemon_url: String::new(),
@@ -391,6 +428,7 @@ impl State {
         s.provider_list.select(Some(0));
         s.migration_choice_list.select(Some(0));
         s.routing_choice_list.select(Some(0));
+        s.security_choice_list.select(Some(0));
         s.complete_list.select(Some(0));
         s
     }
@@ -428,14 +466,25 @@ impl State {
 
     fn step_label(&self) -> &'static str {
         match self.step {
-            Step::Welcome => "1 of 7",
-            Step::Migration => "2 of 7",
-            Step::Provider => "3 of 7",
-            Step::ApiKey => "4 of 7",
-            Step::Model => "5 of 7",
-            Step::Routing => "6 of 7",
-            Step::Complete => "7 of 7",
+            Step::Welcome => "1 of 8",
+            Step::Migration => "2 of 8",
+            Step::Provider => "3 of 8",
+            Step::ApiKey => "4 of 8",
+            Step::Model => "5 of 8",
+            Step::Routing => "6 of 8",
+            Step::Security => "7 of 8",
+            Step::Complete => "8 of 8",
         }
+    }
+
+    /// Advance to the Security step, resetting its phase.
+    fn advance_to_security(&mut self) {
+        self.security_phase = SecurityPhase::Choice;
+        self.security_choice_list.select(Some(0));
+        self.password_mismatch = false;
+        self.admin_password.clear();
+        self.admin_password_confirm.clear();
+        self.step = Step::Security;
     }
 
     /// Advance to the Provider step, optionally pre-selecting a migrated provider.
@@ -853,8 +902,7 @@ pub fn run() -> InitResult {
                             if state.model_entries.len() < 2 {
                                 // Skip routing — not enough models
                                 state.routing_enabled = false;
-                                save_config(&mut state);
-                                state.step = Step::Complete;
+                                state.advance_to_security();
                             } else {
                                 state.step = Step::Routing;
                             }
@@ -863,6 +911,8 @@ pub fn run() -> InitResult {
                     },
 
                     Step::Routing => handle_routing_key(&mut state, key.code),
+
+                    Step::Security => handle_security_key(&mut state, key.code),
 
                     Step::Complete => match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -1018,8 +1068,7 @@ fn handle_routing_key(state: &mut State, code: KeyCode) {
                     state.select_routing_tier_model(0);
                 } else {
                     state.routing_enabled = false;
-                    save_config(state);
-                    state.step = Step::Complete;
+                    state.advance_to_security();
                 }
             }
             _ => {}
@@ -1059,10 +1108,141 @@ fn handle_routing_key(state: &mut State, code: KeyCode) {
                     state.routing_phase = RoutingPhase::PickTier(next_tier);
                     state.select_routing_tier_model(next_tier);
                 } else {
-                    // All 3 tiers picked — save and advance
+                    // All 3 tiers picked — advance to security
+                    state.advance_to_security();
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+// ── Security step ─────────────────────────────────────────────────────────
+
+/// Generate a random API key with `of_` prefix.
+fn generate_api_key() -> String {
+    format!("of_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn handle_security_key(state: &mut State, code: KeyCode) {
+    match state.security_phase {
+        SecurityPhase::Choice => match code {
+            KeyCode::Esc => {
+                // Go back to Routing (or Model if routing was skipped)
+                if state.model_entries.len() < 2 {
+                    state.step = Step::Model;
+                } else {
+                    state.step = Step::Routing;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let i = state.security_choice_list.selected().unwrap_or(0);
+                let next = if i == 0 { 2 } else { i - 1 };
+                state.security_choice_list.select(Some(next));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let i = state.security_choice_list.selected().unwrap_or(0);
+                let next = (i + 1) % 3;
+                state.security_choice_list.select(Some(next));
+            }
+            KeyCode::Enter => match state.security_choice_list.selected() {
+                Some(0) => {
+                    state.security_mode = SecurityMode::Open;
                     save_config(state);
                     state.step = Step::Complete;
                 }
+                Some(1) => {
+                    state.security_mode = SecurityMode::ApiKeyOnly;
+                    state.generated_api_key = generate_api_key();
+                    state.security_phase = SecurityPhase::Confirm;
+                }
+                Some(2) => {
+                    state.security_mode = SecurityMode::FullLockdown;
+                    state.generated_api_key = generate_api_key();
+                    state.admin_username = "admin".to_string();
+                    state.security_phase = SecurityPhase::AdminUser;
+                }
+                _ => {}
+            },
+            _ => {}
+        },
+        SecurityPhase::AdminUser => match code {
+            KeyCode::Esc => {
+                state.security_phase = SecurityPhase::Choice;
+            }
+            KeyCode::Enter => {
+                if !state.admin_username.is_empty() {
+                    state.admin_password.clear();
+                    state.security_phase = SecurityPhase::AdminPass;
+                }
+            }
+            KeyCode::Char(c) => {
+                state.admin_username.push(c);
+            }
+            KeyCode::Backspace => {
+                state.admin_username.pop();
+            }
+            _ => {}
+        },
+        SecurityPhase::AdminPass => match code {
+            KeyCode::Esc => {
+                state.security_phase = SecurityPhase::AdminUser;
+            }
+            KeyCode::Enter => {
+                if !state.admin_password.is_empty() {
+                    state.admin_password_confirm.clear();
+                    state.password_mismatch = false;
+                    state.security_phase = SecurityPhase::AdminPassConfirm;
+                }
+            }
+            KeyCode::Char(c) => {
+                state.admin_password.push(c);
+            }
+            KeyCode::Backspace => {
+                state.admin_password.pop();
+            }
+            _ => {}
+        },
+        SecurityPhase::AdminPassConfirm => match code {
+            KeyCode::Esc => {
+                state.admin_password.clear();
+                state.security_phase = SecurityPhase::AdminPass;
+            }
+            KeyCode::Enter => {
+                if state.admin_password == state.admin_password_confirm {
+                    state.password_mismatch = false;
+                    state.security_phase = SecurityPhase::Confirm;
+                } else {
+                    state.password_mismatch = true;
+                    state.admin_password_confirm.clear();
+                }
+            }
+            KeyCode::Char(c) => {
+                state.password_mismatch = false;
+                state.admin_password_confirm.push(c);
+            }
+            KeyCode::Backspace => {
+                state.password_mismatch = false;
+                state.admin_password_confirm.pop();
+            }
+            _ => {}
+        },
+        SecurityPhase::Confirm => match code {
+            KeyCode::Esc => match state.security_mode {
+                SecurityMode::FullLockdown => {
+                    state.security_phase = SecurityPhase::AdminPassConfirm;
+                }
+                _ => {
+                    state.security_phase = SecurityPhase::Choice;
+                }
+            },
+            KeyCode::Enter => {
+                save_config(state);
+                // Zeroize passwords after saving
+                use zeroize::Zeroize;
+                state.admin_password.zeroize();
+                state.admin_password_confirm.zeroize();
+                state.step = Step::Complete;
             }
             _ => {}
         },
@@ -1126,12 +1306,42 @@ complex_threshold = 500
         format!("api_key_env = \"{}\"", p.env_var)
     };
 
+    let security_section = match state.security_mode {
+        SecurityMode::Open => String::new(),
+        SecurityMode::ApiKeyOnly => {
+            format!(
+                r#"api_key = "{api_key}"
+
+[auth]
+require_auth_for_reads = true
+"#,
+                api_key = state.generated_api_key,
+            )
+        }
+        SecurityMode::FullLockdown => {
+            let password_hash =
+                openfang_api::session_auth::hash_password(&state.admin_password);
+            format!(
+                r#"api_key = "{api_key}"
+
+[auth]
+enabled = true
+username = "{username}"
+password_hash = "{password_hash}"
+require_auth_for_reads = true
+"#,
+                api_key = state.generated_api_key,
+                username = state.admin_username,
+            )
+        }
+    };
+
     let config = format!(
         r#"# OpenFang Agent OS configuration
 # See https://github.com/RightNow-AI/openfang for documentation
 
 api_listen = "127.0.0.1:4200"
-
+{security_section}
 [default_model]
 provider = "{provider}"
 model = "{model}"
@@ -1245,6 +1455,7 @@ fn draw(f: &mut Frame, area: Rect, state: &mut State) {
         Step::ApiKey => draw_api_key(f, chunks[3], state),
         Step::Model => draw_model(f, chunks[3], state),
         Step::Routing => draw_routing(f, chunks[3], state),
+        Step::Security => draw_security(f, chunks[3], state),
         Step::Complete => draw_complete(f, chunks[3], state),
     }
 }
@@ -2131,6 +2342,337 @@ fn build_model_list_items<'a>(
         .collect()
 }
 
+// ── Security step drawing ─────────────────────────────────────────────────
+
+fn draw_security(f: &mut Frame, area: Rect, state: &mut State) {
+    match state.security_phase {
+        SecurityPhase::Choice => draw_security_choice(f, area, state),
+        SecurityPhase::AdminUser => draw_security_admin_user(f, area, state),
+        SecurityPhase::AdminPass => draw_security_admin_pass(f, area, state, false),
+        SecurityPhase::AdminPassConfirm => draw_security_admin_pass(f, area, state, true),
+        SecurityPhase::Confirm => draw_security_confirm(f, area, state),
+    }
+}
+
+fn draw_security_choice(f: &mut Frame, area: Rect, state: &mut State) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // 0: title
+        Constraint::Length(1), // 1: desc
+        Constraint::Length(1), // 2: desc2
+        Constraint::Length(1), // 3: spacer
+        Constraint::Length(1), // 4: option 1
+        Constraint::Length(2), // 5: option 1 desc
+        Constraint::Length(1), // 6: option 2
+        Constraint::Length(2), // 7: option 2 desc
+        Constraint::Length(1), // 8: option 3
+        Constraint::Length(2), // 9: option 3 desc
+        Constraint::Min(0),    // 10: flex
+        Constraint::Length(1), // 11: hints
+    ])
+    .split(area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  API Security",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        chunks[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  How should the dashboard and API be protected?",
+            theme::dim_style(),
+        )])),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  You can change this later in ~/.openfang/config.toml.",
+            theme::dim_style(),
+        )])),
+        chunks[2],
+    );
+
+    let options: [(&str, &str); 3] = [
+        ("Open (localhost only)", "No auth. Only accessible from this machine."),
+        ("API key", "Auto-generated Bearer token protects all endpoints."),
+        ("Full lockdown", "API key + admin login (username & password)."),
+    ];
+
+    let option_chunks = [
+        (chunks[4], chunks[5]),
+        (chunks[6], chunks[7]),
+        (chunks[8], chunks[9]),
+    ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let selected = state.security_choice_list.selected() == Some(i);
+        let arrow = if selected {
+            Span::styled("  \u{25b8} ", Style::default().fg(theme::ACCENT))
+        } else {
+            Span::raw("    ")
+        };
+        let label_style = if selected {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_PRIMARY)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![arrow, Span::styled(*label, label_style)])),
+            option_chunks[i].0,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("      {desc}"),
+                theme::dim_style(),
+            )])),
+            option_chunks[i].1,
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [\u{2191}\u{2193}] Navigate  [Enter] Select  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[11],
+    );
+}
+
+fn draw_security_admin_user(f: &mut Frame, area: Rect, state: &mut State) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // title
+        Constraint::Length(1), // prompt
+        Constraint::Length(1), // input
+        Constraint::Length(1), // spacer
+        Constraint::Length(1), // hint
+        Constraint::Min(0),
+        Constraint::Length(1), // nav
+    ])
+    .split(area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  Admin Username",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        chunks[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw(
+            "  Enter admin username for dashboard login:",
+        )])),
+        chunks[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  \u{25b8} "),
+            Span::styled(&state.admin_username, theme::input_style()),
+            Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ])),
+        chunks[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "    Default: admin",
+            theme::dim_style(),
+        )])),
+        chunks[4],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [Enter] Continue  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[6],
+    );
+}
+
+fn draw_security_admin_pass(f: &mut Frame, area: Rect, state: &mut State, is_confirm: bool) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // title
+        Constraint::Length(1), // prompt
+        Constraint::Length(1), // input
+        Constraint::Length(1), // mismatch warning
+        Constraint::Min(0),
+        Constraint::Length(1), // nav
+    ])
+    .split(area);
+
+    let title = if is_confirm {
+        "  Confirm Password"
+    } else {
+        "  Admin Password"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        chunks[0],
+    );
+
+    let prompt = if is_confirm {
+        "  Re-enter the admin password:"
+    } else {
+        "  Enter admin password for dashboard login:"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw(prompt)])),
+        chunks[1],
+    );
+
+    let input = if is_confirm {
+        &state.admin_password_confirm
+    } else {
+        &state.admin_password
+    };
+    let masked: String = "\u{2022}".repeat(input.len());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  \u{25b8} "),
+            Span::styled(&masked, theme::input_style()),
+            Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ])),
+        chunks[2],
+    );
+
+    if is_confirm && state.password_mismatch {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  \u{2718} ", Style::default().fg(theme::RED)),
+                Span::styled(
+                    "Passwords do not match, try again",
+                    Style::default().fg(theme::RED),
+                ),
+            ])),
+            chunks[3],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [Enter] Continue  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[5],
+    );
+}
+
+fn draw_security_confirm(f: &mut Frame, area: Rect, state: &mut State) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // 0: title
+        Constraint::Length(1), // 1: spacer
+        Constraint::Length(1), // 2: mode
+        Constraint::Length(1), // 3: api key
+        Constraint::Length(1), // 4: auth/username (lockdown only)
+        Constraint::Length(1), // 5: username (lockdown only)
+        Constraint::Length(1), // 6: spacer
+        Constraint::Length(1), // 7: note
+        Constraint::Length(1), // 8: note2
+        Constraint::Min(0),    // 9: flex
+        Constraint::Length(1), // 10: hints
+    ])
+    .split(area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  Security Summary",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        chunks[0],
+    );
+
+    let kv_style = theme::dim_style();
+    let val_style = Style::default().fg(theme::TEXT_PRIMARY);
+
+    let mode_label = match state.security_mode {
+        SecurityMode::ApiKeyOnly => "API key only",
+        SecurityMode::FullLockdown => "Full lockdown",
+        SecurityMode::Open => "Open",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Mode:      ", kv_style),
+            Span::styled(mode_label, val_style),
+        ])),
+        chunks[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  API key:   ", kv_style),
+            Span::styled(&state.generated_api_key, Style::default().fg(theme::GREEN)),
+        ])),
+        chunks[3],
+    );
+
+    if state.security_mode == SecurityMode::FullLockdown {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  Auth:      ", kv_style),
+                Span::styled("dashboard login required", val_style),
+            ])),
+            chunks[4],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  Username:  ", kv_style),
+                Span::styled(&state.admin_username, val_style),
+            ])),
+            chunks[5],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  The API key is saved in ~/.openfang/config.toml.",
+            theme::dim_style(),
+        )])),
+        chunks[7],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  Use it as: Authorization: Bearer <key>",
+            theme::dim_style(),
+        )])),
+        chunks[8],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [Enter] Save & finish  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[10],
+    );
+}
+
 fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
     let p = match state.provider() {
         Some(p) => p,
@@ -2151,17 +2693,18 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
         Constraint::Length(1), // 2: spacer
         Constraint::Length(1), // 3: provider
         Constraint::Length(1), // 4: model
-        Constraint::Length(1), // 5: daemon
-        Constraint::Length(1), // 6: spacer
-        Constraint::Length(1), // 7: separator
-        Constraint::Length(1), // 8: spacer
-        Constraint::Length(1), // 9: question
-        Constraint::Length(1), // 10: spacer
-        Constraint::Length(1), // 11: option 1 — Desktop
-        Constraint::Length(1), // 12: option 2 — Dashboard
-        Constraint::Length(1), // 13: option 3 — Chat
-        Constraint::Min(0),    // 14: flex
-        Constraint::Length(1), // 15: hints
+        Constraint::Length(1), // 5: security
+        Constraint::Length(1), // 6: daemon
+        Constraint::Length(1), // 7: spacer
+        Constraint::Length(1), // 8: separator
+        Constraint::Length(1), // 9: spacer
+        Constraint::Length(1), // 10: question
+        Constraint::Length(1), // 11: spacer
+        Constraint::Length(1), // 12: option 1 — Desktop
+        Constraint::Length(1), // 13: option 2 — Dashboard
+        Constraint::Length(1), // 14: option 3 — Chat
+        Constraint::Min(0),    // 15: flex
+        Constraint::Length(1), // 16: hints
     ])
     .split(area);
 
@@ -2236,6 +2779,24 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
         chunks[4],
     );
 
+    // Security summary
+    let security_text = match state.security_mode {
+        SecurityMode::Open => "open (no auth)".to_string(),
+        SecurityMode::ApiKeyOnly => "API key protected".to_string(),
+        SecurityMode::FullLockdown => format!("full lockdown (user: {})", state.admin_username),
+    };
+    let security_color = match state.security_mode {
+        SecurityMode::Open => theme::YELLOW,
+        _ => theme::GREEN,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Security:    ", kv_style),
+            Span::styled(security_text, Style::default().fg(security_color)),
+        ])),
+        chunks[5],
+    );
+
     let daemon_text = if state.daemon_started {
         format!("running at {}", state.daemon_url)
     } else if !state.daemon_error.is_empty() {
@@ -2253,7 +2814,7 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
             Span::styled("  Daemon:      ", kv_style),
             Span::styled(daemon_text, Style::default().fg(daemon_color)),
         ])),
-        chunks[5],
+        chunks[6],
     );
 
     // ── Separator ──
@@ -2262,7 +2823,7 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
             "  ".to_string() + &"\u{2500}".repeat(area.width.saturating_sub(6) as usize),
             Style::default().fg(theme::BORDER),
         )])),
-        chunks[7],
+        chunks[8],
     );
 
     // ── Question ──
@@ -2273,7 +2834,7 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )])),
-        chunks[9],
+        chunks[10],
     );
 
     // ── Options ──
@@ -2339,7 +2900,7 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
                 badge_span,
                 desc_span,
             ])),
-            chunks[11 + i],
+            chunks[12 + i],
         );
     }
 
@@ -2349,6 +2910,6 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
             "  [\u{2191}\u{2193}/jk] Navigate  [Enter] Launch  [1/2/3] Quick select",
             theme::hint_style(),
         )])),
-        chunks[15],
+        chunks[16],
     );
 }

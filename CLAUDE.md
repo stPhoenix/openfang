@@ -1,4 +1,5 @@
 # OpenFang — Agent Instructions
+# Important: use mcp for code exploration
 
 ## Project Overview
 OpenFang is an open-source Agent Operating System written in Rust (14 crates).
