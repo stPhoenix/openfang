@@ -161,8 +161,8 @@ tokio-test = "0.4"
 tempfile = "3"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 2
 strip = true
 opt-level = 3
 

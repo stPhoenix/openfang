@@ -528,6 +528,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
 ///
 /// Returns `(provider, model, api_key_env)` for the first provider that has a
 /// configured API key, checked in a user-friendly priority order.
+#[deprecated(note = "Auto-detection removed; providers must be explicitly configured")]
 pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'static str)> {
     // Priority: popular cloud providers first, then niche, then local
     const PROBE_ORDER: &[(&str, &str, &str)] = &[

@@ -38,6 +38,7 @@
 - **Cron scheduling** — Replaced `schedule_*` tools with `cron_create`, `cron_list`, `cron_cancel` for consistent scheduling with natural language support.
 - **Self-inspection & self-modification** — Agents can now inspect and modify their own manifests at runtime via `agent_self_inspect` and `agent_self_modify`.
 - **Auth-gated reads** — `require_auth_for_reads` flag enforces authentication on most GET endpoints.
+- **Strict provider affinity** — Removed implicit provider auto-detection and silent fallback. When a configured provider is unreachable, the system now returns an error instead of silently switching to a different provider. Explicitly configured `[[fallback_providers]]` and per-agent `[[fallback_models]]` still work as intended.
 - **Bug fixes** — Resolved 10+ issues (#771, #811, #752, #772, #661, #875, #872, #867, #824, #833, #766).
 
 ---
@@ -372,7 +373,7 @@ For production workloads, use the [WhatsApp Cloud API](https://developers.facebo
 
 Anthropic, Gemini, OpenAI, Groq, DeepSeek, OpenRouter, Together, Mistral, Fireworks, Cohere, Perplexity, xAI, AI21, Cerebras, SambaNova, HuggingFace, Replicate, Ollama, vLLM, LM Studio, Qwen, MiniMax, Zhipu, Moonshot, Qianfan, Bedrock, and more.
 
-Intelligent routing with task complexity scoring, automatic fallback, cost tracking, and per-model pricing.
+Intelligent routing with task complexity scoring, explicit fallback chains, cost tracking, and per-model pricing.
 
 ---
 

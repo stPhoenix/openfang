@@ -82,8 +82,6 @@ pub struct OpenFangKernel {
     pub audit_log: Arc<AuditLog>,
     /// Cost metering engine.
     pub metering: Arc<MeteringEngine>,
-    /// Default LLM driver (from kernel config).
-    default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -649,37 +647,8 @@ impl OpenFangKernel {
                 warn!(
                     provider = %config.default_model.provider,
                     error = %e,
-                    "Primary LLM driver init failed — trying auto-detect"
+                    "Primary LLM driver init failed — agents will return errors until provider is configured"
                 );
-                // Auto-detect: scan env for any configured provider key
-                if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
-                    let auto_config = DriverConfig {
-                        provider: provider.to_string(),
-                        api_key: credential_resolver
-                            .resolve(env_var)
-                            .map(|z: zeroize::Zeroizing<String>| z.to_string()),
-                        base_url: config.provider_urls.get(provider).cloned(),
-                        skip_permissions: true,
-                    };
-                    match drivers::create_driver(&auto_config) {
-                        Ok(d) => {
-                            info!(
-                                provider = %provider,
-                                model = %model,
-                                "Auto-detected provider from {} — using as default",
-                                env_var
-                            );
-                            driver_chain.push(d);
-                            // Update the running config so agents get the right model
-                            config.default_model.provider = provider.to_string();
-                            config.default_model.model = model.to_string();
-                            config.default_model.api_key_env = env_var.to_string();
-                        }
-                        Err(e2) => {
-                            warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
-                        }
-                    }
-                }
             }
         }
 
@@ -730,7 +699,7 @@ impl OpenFangKernel {
         }
 
         // Use the chain, or create a stub driver if everything failed
-        let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
+        let _driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
             Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::with_models(model_chain))
         } else if let Some(single) = driver_chain.into_iter().next() {
             single
@@ -1044,7 +1013,6 @@ impl OpenFangKernel {
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
-            default_driver: driver,
             wasm_sandbox,
             auth,
             model_catalog: std::sync::RwLock::new(model_catalog),
@@ -4758,22 +4726,10 @@ impl OpenFangKernel {
             match drivers::create_driver(&driver_config) {
                 Ok(d) => d,
                 Err(e) => {
-                    // If fresh driver creation fails (e.g. key not yet set for this
-                    // provider), fall back to the boot-time default driver. This
-                    // keeps existing agents working while the user is still
-                    // configuring providers via the dashboard.
-                    if agent_provider == default_provider && !has_custom_key && !has_custom_url {
-                        debug!(
-                            provider = %agent_provider,
-                            error = %e,
-                            "Fresh driver creation failed, falling back to boot-time default"
-                        );
-                        Arc::clone(&self.default_driver)
-                    } else {
-                        return Err(KernelError::BootFailed(format!(
-                            "Agent LLM driver init failed: {e}"
-                        )));
-                    }
+                    return Err(KernelError::BootFailed(format!(
+                        "Agent LLM driver init failed for provider '{}': {e}",
+                        agent_provider
+                    )));
                 }
             }
         };
