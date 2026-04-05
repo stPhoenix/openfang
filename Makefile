@@ -1,10 +1,12 @@
 .PHONY: help build build-release test test-quick clippy check install reinstall \
-       start start-detach stop restart clean kill-port \
-       docker-dev docker-dev-build docker-dev-stop docker-dev-rebuild docker-dev-watch docker-dev-shell docker-dev-clean
+       start start-detach stop restart clean kill-port mem-check \
+       docker-dev docker-dev-up docker-dev-stop docker-dev-restart docker-dev-logs docker-dev-clean
 
-# Build flags to avoid OOM on Linux (systemd-oomd)
-JOBS ?= 4
-TEST_THREADS ?= 4
+# Memory-aware parallelism to avoid OOM on Linux (systemd-oomd)
+# Each rustc peaks at ~2-4GB; each test binary ~200MB (with line-tables-only debug)
+AVAILABLE_GB := $(shell awk '/MemAvailable/ {printf "%d", $$2/1048576}' /proc/meminfo)
+JOBS ?= $(shell echo $$(( $(AVAILABLE_GB) > 48 ? 8 : $(AVAILABLE_GB) > 24 ? 4 : 2 )))
+TEST_THREADS ?= $(shell echo $$(( $(AVAILABLE_GB) > 32 ? 4 : $(AVAILABLE_GB) > 16 ? 2 : 1 )))
 
 # Default target: show help
 .DEFAULT_GOAL := help
@@ -19,7 +21,11 @@ build: ## Compile all workspace crates (lib only)
 	cargo build --workspace --lib
 
 build-release: ## Build optimized release binary
-	RUST_MIN_STACK=16777216 cargo build --release -p openfang-cli
+	RUST_MIN_STACK=16777216 cargo build --release -p openfang-cli -j $(JOBS)
+
+mem-check: ## Show current memory and recommended parallelism
+	@echo "Available: $(AVAILABLE_GB) GB | JOBS=$(JOBS) | TEST_THREADS=$(TEST_THREADS)"
+	@echo "Swap: $$(swapon --show=SIZE --noheadings 2>/dev/null || echo 'none')"
 
 test: ## Run full test suite (one crate at a time to avoid OOM)
 	@for crate in $$(cargo metadata --no-deps --format-version=1 | python3 -c "import sys,json; [print(p['name']) for p in json.load(sys.stdin)['packages']]"); do \
@@ -66,30 +72,26 @@ reinstall: build-release kill-port stop ## Stop, rebuild, install, and restart
 	$(MAKE) start-detach
 	@echo "Reinstalled and restarted openfang"
 
-## Docker dev environment
+## Docker dev environment (runs host-built binary)
 
 COMPOSE_DEV = docker compose -f docker-compose.dev.yml
 
-docker-dev: ## Start dev container (incremental build + run)
+docker-dev: build-release ## Build on host and run in Docker
 	$(COMPOSE_DEV) up
 
-docker-dev-build: ## Rebuild dev container image from scratch
-	$(COMPOSE_DEV) up --build
+docker-dev-up: ## Start dev container (assumes binary already built)
+	$(COMPOSE_DEV) up
 
 docker-dev-stop: ## Stop dev container
 	$(COMPOSE_DEV) down
 
-docker-dev-rebuild: ## Rebuild openfang inside running dev container
-	$(COMPOSE_DEV) exec openfang cargo build --bin openfang
+docker-dev-restart: build-release docker-dev-stop ## Rebuild on host and restart container
+	$(COMPOSE_DEV) up -d
 
-docker-dev-watch: ## Start dev container with cargo-watch (auto-rebuild on changes)
-	$(COMPOSE_DEV) run --rm -p 4200:4200 openfang \
-		cargo watch -x 'build --bin openfang' -s './target/debug/openfang start'
+docker-dev-logs: ## Show dev container logs
+	$(COMPOSE_DEV) logs -f
 
-docker-dev-shell: ## Open a shell in the dev container
-	$(COMPOSE_DEV) exec openfang bash
-
-docker-dev-clean: ## Remove dev volumes (target cache, cargo registry)
+docker-dev-clean: ## Remove dev volumes
 	$(COMPOSE_DEV) down -v
 
 ## Cleanup

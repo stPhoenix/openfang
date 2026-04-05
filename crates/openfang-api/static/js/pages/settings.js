@@ -403,7 +403,7 @@ function settingsPage() {
       try {
         var resp = await OpenFangAPI.post('/api/providers/' + encodeURIComponent(provider.id) + '/key', { key: key.trim() });
         if (resp && resp.switched_default) {
-          OpenFangToast.warning(resp.message || 'Default provider was switched to ' + provider.display_name);
+          OpenFangToast.warn(resp.message || 'Default provider was switched to ' + provider.display_name);
         } else {
           OpenFangToast.success('API key saved for ' + provider.display_name);
         }
@@ -505,7 +505,7 @@ function settingsPage() {
         if (result.reachable) {
           OpenFangToast.success(provider.display_name + ' URL saved &mdash; reachable (' + (result.latency_ms || '?') + 'ms)');
         } else {
-          OpenFangToast.warning(provider.display_name + ' URL saved but not reachable');
+          OpenFangToast.warn(provider.display_name + ' URL saved but not reachable');
         }
         await this.loadProviders();
       } catch(e) {

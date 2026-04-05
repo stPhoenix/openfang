@@ -11,12 +11,18 @@ OpenFang is an open-source Agent Operating System written in Rust (14 crates).
 After every feature implementation, run ALL THREE checks:
 ```bash
 cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
-cargo test --workspace -j 4 -- --test-threads=4  # All tests must pass (currently 1744+)
-# NOTE: -j 4 and --test-threads=4 are required on Linux to prevent
-# systemd-oomd from killing the user session due to memory pressure
-# (27 debug test binaries, ~500-660MB each, overwhelm the cgroup limit)
+make test                              # All tests must pass (currently 1744+)
+# Uses memory-aware parallelism (auto-scales JOBS and TEST_THREADS based on available RAM)
+# Run `make mem-check` to see current values
 cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 ```
+
+### OOM Prevention
+- `Cargo.toml` `[profile.dev]` uses `debug = "line-tables-only"` to keep test binaries ~200MB (not ~600MB)
+- `.cargo/config.toml` uses mold linker and limits to 8 build jobs
+- Makefile auto-scales parallelism based on `/proc/meminfo`
+- Docker containers are capped at 4GB to avoid competing with host builds
+- Prereqs: `sudo apt install mold clang`; optionally enable zram for fast compressed swap
 
 ## MANDATORY: Live Integration Testing
 **After implementing any new endpoint, feature, or wiring change, you MUST run live integration tests.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:

@@ -1,16 +1,13 @@
 services:
   openfang:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
+    image: debian:trixie-slim
     ports:
       - "4200:4200"
     volumes:
-      - .:/app                                    # source code (live edits from host)
-      - cargo-registry:/usr/local/cargo/registry  # cache downloaded crates
-      - cargo-git:/usr/local/cargo/git            # cache git deps
-      - dev-target:/app/target                    # persist compilation artifacts
-      - openfang-data:/data                       # runtime data
+      - ./target/release/openfang:/usr/local/bin/openfang:ro
+      - ./agents:/opt/openfang/agents:ro
+      - openfang-data:/data
+      - ${HOME}/.claude:/root/.claude:ro
     environment:
       - OPENFANG_LISTEN=0.0.0.0:4200
       - OPENFANG_HOME=/data
@@ -21,10 +18,14 @@ services:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+    entrypoint: ["/usr/local/bin/openfang"]
+    command: ["start"]
+    mem_limit: 4g
+    memswap_limit: 6g
+    cpus: 4
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
-  cargo-registry:
-  cargo-git:
-  dev-target:
   openfang-data:
