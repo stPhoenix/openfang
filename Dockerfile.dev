@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+FROM rust:1-slim-bookworm
+WORKDIR /app
+
+# System dependencies (same as production + mold linker)
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev perl make mold \
+    python3 python3-pip python3-venv \
+    nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cargo tools for dev workflow
+RUN cargo install cargo-watch
+
+# Use mold linker for faster linking (matches host .cargo/config.toml)
+RUN mkdir -p /app/.cargo && \
+    printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' \
+    > /app/.cargo/config.toml
+
+EXPOSE 4200
+ENV OPENFANG_HOME=/data
+
+# Build and run: compile in debug mode, then start the daemon
+CMD cargo build --bin openfang && ./target/debug/openfang start

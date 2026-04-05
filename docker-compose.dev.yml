@@ -1,0 +1,30 @@
+services:
+  openfang:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "4200:4200"
+    volumes:
+      - .:/app                                    # source code (live edits from host)
+      - cargo-registry:/usr/local/cargo/registry  # cache downloaded crates
+      - cargo-git:/usr/local/cargo/git            # cache git deps
+      - dev-target:/app/target                    # persist compilation artifacts
+      - openfang-data:/data                       # runtime data
+    environment:
+      - OPENFANG_LISTEN=0.0.0.0:4200
+      - OPENFANG_HOME=/data
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  dev-target:
+  openfang-data:
