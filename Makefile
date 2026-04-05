@@ -1,5 +1,6 @@
 .PHONY: help build build-release test test-quick clippy check install reinstall \
-       start start-detach stop restart clean kill-port
+       start start-detach stop restart clean kill-port \
+       docker-dev docker-dev-build docker-dev-stop docker-dev-rebuild docker-dev-watch docker-dev-shell docker-dev-clean
 
 # Build flags to avoid OOM on Linux (systemd-oomd)
 JOBS ?= 4
@@ -64,6 +65,32 @@ reinstall: build-release kill-port stop ## Stop, rebuild, install, and restart
 	cp target/release/openfang ~/.cargo/bin/openfang
 	$(MAKE) start-detach
 	@echo "Reinstalled and restarted openfang"
+
+## Docker dev environment
+
+COMPOSE_DEV = docker compose -f docker-compose.dev.yml
+
+docker-dev: ## Start dev container (incremental build + run)
+	$(COMPOSE_DEV) up
+
+docker-dev-build: ## Rebuild dev container image from scratch
+	$(COMPOSE_DEV) up --build
+
+docker-dev-stop: ## Stop dev container
+	$(COMPOSE_DEV) down
+
+docker-dev-rebuild: ## Rebuild openfang inside running dev container
+	$(COMPOSE_DEV) exec openfang cargo build --bin openfang
+
+docker-dev-watch: ## Start dev container with cargo-watch (auto-rebuild on changes)
+	$(COMPOSE_DEV) run --rm -p 4200:4200 openfang \
+		cargo watch -x 'build --bin openfang' -s './target/debug/openfang start'
+
+docker-dev-shell: ## Open a shell in the dev container
+	$(COMPOSE_DEV) exec openfang bash
+
+docker-dev-clean: ## Remove dev volumes (target cache, cargo registry)
+	$(COMPOSE_DEV) down -v
 
 ## Cleanup
 
