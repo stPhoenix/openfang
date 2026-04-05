@@ -273,6 +273,8 @@ pub async fn run_agent_loop(
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
+    max_output_tokens_for_model: Option<usize>,
+    compaction_settings: Option<&openfang_types::config::CompactionSettings>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
@@ -457,11 +459,71 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let default_compaction = openfang_types::config::CompactionSettings::default();
+    let comp_settings = compaction_settings.unwrap_or(&default_compaction);
+    let model_max_output = max_output_tokens_for_model.unwrap_or(32_000);
+    let mut auto_compact_state = crate::compactor::AutoCompactState::default();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
-        // Context overflow recovery pipeline (replaces emergency_trim_messages)
+        // Layer 1: Microcompaction — clear old tool results if time gap exceeded
+        if comp_settings.microcompact.enabled {
+            crate::microcompact::microcompact_messages(
+                &mut messages,
+                &comp_settings.microcompact,
+            );
+        }
+
+        // Layer 2: Autocompaction — if token threshold exceeded, summarize
+        let est_tokens =
+            crate::compactor::estimate_token_count(&messages, Some(&system_prompt), Some(available_tools));
+        if crate::compactor::should_auto_compact(
+            est_tokens,
+            ctx_window,
+            model_max_output,
+            comp_settings,
+            &auto_compact_state,
+        ) {
+            info!(
+                est_tokens,
+                threshold = comp_settings.auto_compact_threshold(ctx_window, model_max_output),
+                "Autocompact triggered"
+            );
+            match crate::compactor::compact_conversation(
+                driver.clone(),
+                &manifest.model.model,
+                &messages,
+                comp_settings,
+                openfang_types::message::CompactTrigger::Auto,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => {
+                    messages = crate::compactor::build_post_compact_messages(&result);
+                    auto_compact_state.compacted = true;
+                    auto_compact_state.consecutive_failures = 0;
+                    auto_compact_state.turn_counter = 0;
+                    info!(
+                        pre = result.pre_compact_token_count,
+                        post = result.true_post_compact_token_count,
+                        "Autocompact succeeded"
+                    );
+                }
+                Err(e) => {
+                    auto_compact_state.consecutive_failures += 1;
+                    warn!(
+                        error = %e,
+                        failures = auto_compact_state.consecutive_failures,
+                        "Autocompact failed"
+                    );
+                }
+            }
+        }
+
+        // Context overflow recovery pipeline (last-resort safety net)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
         if recovery == RecoveryStage::FinalError {
@@ -755,14 +817,10 @@ pub async fn run_agent_loop(
                 let assistant_blocks = response.content.clone();
 
                 // Add assistant message with tool use blocks
-                session.messages.push(Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Blocks(assistant_blocks.clone()),
-                });
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Blocks(assistant_blocks),
-                });
+                session
+                    .messages
+                    .push(Message::assistant_with_blocks(assistant_blocks.clone()));
+                messages.push(Message::assistant_with_blocks(assistant_blocks));
 
                 // Build allowed tool names list for capability enforcement
                 let mut allowed_tool_names: Vec<String> =
@@ -1005,10 +1063,8 @@ pub async fn run_agent_loop(
                 }
 
                 // Add tool results as a user message (Anthropic API requirement)
-                let tool_results_msg = Message {
-                    role: Role::User,
-                    content: MessageContent::Blocks(tool_result_blocks.clone()),
-                };
+                let tool_results_msg =
+                    Message::user_with_blocks(tool_result_blocks.clone());
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
@@ -1482,6 +1538,8 @@ pub async fn run_agent_loop_streaming(
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
+    max_output_tokens_for_model: Option<usize>,
+    compaction_settings: Option<&openfang_types::config::CompactionSettings>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
@@ -1660,11 +1718,75 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let default_compaction = openfang_types::config::CompactionSettings::default();
+    let comp_settings = compaction_settings.unwrap_or(&default_compaction);
+    let model_max_output = max_output_tokens_for_model.unwrap_or(32_000);
+    let mut auto_compact_state = crate::compactor::AutoCompactState::default();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
-        // Context overflow recovery pipeline (replaces emergency_trim_messages)
+        // Layer 1: Microcompaction — clear old tool results if time gap exceeded
+        if comp_settings.microcompact.enabled {
+            crate::microcompact::microcompact_messages(
+                &mut messages,
+                &comp_settings.microcompact,
+            );
+        }
+
+        // Layer 2: Autocompaction — if token threshold exceeded, summarize
+        let est_tokens =
+            crate::compactor::estimate_token_count(&messages, Some(&system_prompt), Some(available_tools));
+        if crate::compactor::should_auto_compact(
+            est_tokens,
+            ctx_window,
+            model_max_output,
+            comp_settings,
+            &auto_compact_state,
+        ) {
+            info!(
+                est_tokens,
+                threshold = comp_settings.auto_compact_threshold(ctx_window, model_max_output),
+                "Autocompact triggered (streaming)"
+            );
+            match crate::compactor::compact_conversation(
+                driver.clone(),
+                &manifest.model.model,
+                &messages,
+                comp_settings,
+                openfang_types::message::CompactTrigger::Auto,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => {
+                    messages = crate::compactor::build_post_compact_messages(&result);
+                    auto_compact_state.compacted = true;
+                    auto_compact_state.consecutive_failures = 0;
+                    auto_compact_state.turn_counter = 0;
+                    let _ = stream_tx.send(StreamEvent::PhaseChange {
+                        phase: "autocompact".to_string(),
+                        detail: Some("Context compacted to stay within limits.".to_string()),
+                    }).await;
+                    info!(
+                        pre = result.pre_compact_token_count,
+                        post = result.true_post_compact_token_count,
+                        "Autocompact succeeded (streaming)"
+                    );
+                }
+                Err(e) => {
+                    auto_compact_state.consecutive_failures += 1;
+                    warn!(
+                        error = %e,
+                        failures = auto_compact_state.consecutive_failures,
+                        "Autocompact failed (streaming)"
+                    );
+                }
+            }
+        }
+
+        // Context overflow recovery pipeline (last-resort safety net)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
         match &recovery {
@@ -1950,14 +2072,10 @@ pub async fn run_agent_loop_streaming(
 
                 let assistant_blocks = response.content.clone();
 
-                session.messages.push(Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Blocks(assistant_blocks.clone()),
-                });
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Blocks(assistant_blocks),
-                });
+                session
+                    .messages
+                    .push(Message::assistant_with_blocks(assistant_blocks.clone()));
+                messages.push(Message::assistant_with_blocks(assistant_blocks));
 
                 let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
@@ -2211,10 +2329,8 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
-                let tool_results_msg = Message {
-                    role: Role::User,
-                    content: MessageContent::Blocks(tool_result_blocks.clone()),
-                };
+                let tool_results_msg =
+                    Message::user_with_blocks(tool_result_blocks.clone());
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
@@ -3382,6 +3498,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3436,6 +3554,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3492,6 +3612,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3546,6 +3668,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3593,6 +3717,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3718,6 +3844,8 @@ mod tests {
             None,
             None,
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3766,6 +3894,8 @@ mod tests {
             None,
             None,
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -3822,6 +3952,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -4799,6 +4931,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
@@ -4857,6 +4991,8 @@ mod tests {
             &memory,
             driver,
             &tools,
+            None,
+            None,
             None,
             None,
             None,
@@ -4942,8 +5078,10 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
+            None, // process_manager
             None, // user_content_blocks
             None, // sender_role
         )
@@ -5007,6 +5145,8 @@ mod tests {
             None, // docker_config
             None, // hooks
             None, // context_window_tokens
+            None, // max_output_tokens_for_model
+            None, // compaction_settings
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role

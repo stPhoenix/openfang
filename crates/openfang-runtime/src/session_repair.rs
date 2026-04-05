@@ -107,10 +107,7 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
                 MessageContent::Blocks(filtered)
             }
         };
-        cleaned.push(Message {
-            role: msg.role,
-            content: new_content,
-        });
+        cleaned.push(Message::new(msg.role, new_content));
     }
 
     // Phase 2b: Reorder misplaced ToolResults
@@ -307,10 +304,7 @@ fn reorder_tool_results(messages: &mut Vec<Message>) -> usize {
             } else {
                 messages.insert(
                     insert_pos,
-                    Message {
-                        role: Role::User,
-                        content: MessageContent::Blocks(blocks),
-                    },
+                    Message::user_with_blocks(blocks),
                 );
             }
         }
@@ -398,10 +392,7 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
         } else {
             messages.insert(
                 insert_pos.min(messages.len()),
-                Message {
-                    role: Role::User,
-                    content: MessageContent::Blocks(blocks),
-                },
+                Message::user_with_blocks(blocks),
             );
         }
     }
@@ -702,15 +693,12 @@ mod tests {
     fn drops_orphaned_tool_result() {
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "orphan-id".to_string(),
-                    tool_name: String::new(),
-                    content: "some result".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "orphan-id".to_string(),
+                tool_name: String::new(),
+                content: "some result".to_string(),
+                is_error: false,
+            }]),
             Message::assistant("Done"),
         ];
         let repaired = validate_and_repair(&messages);
@@ -741,10 +729,7 @@ mod tests {
     fn drops_empty_messages() {
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(String::new()),
-            },
+            Message::new(Role::User, MessageContent::Text(String::new())),
             Message::assistant("Hi"),
         ];
         let repaired = validate_and_repair(&messages);
@@ -755,24 +740,18 @@ mod tests {
     fn preserves_tool_use_result_pairs() {
         let messages = vec![
             Message::user("Search for rust"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "tu-1".to_string(),
-                    name: "web_search".to_string(),
-                    input: serde_json::json!({"query": "rust"}),
-                    provider_metadata: None,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-1".to_string(),
-                    tool_name: String::new(),
-                    content: "Results found".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "rust"}),
+                provider_metadata: None,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                tool_name: String::new(),
+                content: "Results found".to_string(),
+                is_error: false,
+            }]),
             Message::assistant("Here are the results"),
         ];
         let repaired = validate_and_repair(&messages);
@@ -787,25 +766,19 @@ mod tests {
         // with an unrelated user message in between.
         let messages = vec![
             Message::user("Search for rust"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "tu-reorder".to_string(),
-                    name: "web_search".to_string(),
-                    input: serde_json::json!({"query": "rust"}),
-                    provider_metadata: None,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "tu-reorder".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "rust"}),
+                provider_metadata: None,
+            }]),
             Message::user("While you search, I have another question"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-reorder".to_string(),
-                    tool_name: String::new(),
-                    content: "Search results".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-reorder".to_string(),
+                tool_name: String::new(),
+                content: "Search results".to_string(),
+                is_error: false,
+            }]),
             Message::assistant("Here are results"),
         ];
 
@@ -841,15 +814,12 @@ mod tests {
         // Assistant has a ToolUse but there's no ToolResult anywhere
         let messages = vec![
             Message::user("Do something"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "tu-orphan".to_string(),
-                    name: "file_read".to_string(),
-                    input: serde_json::json!({"path": "/etc/hosts"}),
-                    provider_metadata: None,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "tu-orphan".to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({"path": "/etc/hosts"}),
+                provider_metadata: None,
+            }]),
             Message::assistant("I tried to read the file"),
         ];
 
@@ -879,33 +849,24 @@ mod tests {
     fn test_deduplicate_tool_results() {
         let messages = vec![
             Message::user("Search"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "tu-dup".to_string(),
-                    name: "search".to_string(),
-                    input: serde_json::json!({}),
-                    provider_metadata: None,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-dup".to_string(),
-                    tool_name: String::new(),
-                    content: "First result".to_string(),
-                    is_error: false,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-dup".to_string(),
-                    tool_name: String::new(),
-                    content: "Duplicate result".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "tu-dup".to_string(),
+                name: "search".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-dup".to_string(),
+                tool_name: String::new(),
+                content: "First result".to_string(),
+                is_error: false,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-dup".to_string(),
+                tool_name: String::new(),
+                content: "Duplicate result".to_string(),
+                is_error: false,
+            }]),
             Message::assistant("Done"),
         ];
 
@@ -987,20 +948,14 @@ mod tests {
     fn test_repair_stats() {
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "orphan".to_string(),
-                    tool_name: String::new(),
-                    content: "lost".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "orphan".to_string(),
+                tool_name: String::new(),
+                content: "lost".to_string(),
+                is_error: false,
+            }]),
             Message::user("World"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(String::new()),
-            },
+            Message::new(Role::User, MessageContent::Text(String::new())),
             Message::assistant("Hi"),
         ];
 
@@ -1016,13 +971,10 @@ mod tests {
         // Empty assistant message followed by tool results from user
         let messages = vec![
             Message::user("Do something"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::Text {
-                    text: String::new(),
-                    provider_metadata: None,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::Text {
+                text: String::new(),
+                provider_metadata: None,
+            }]),
             Message::user("Never mind"),
             Message::assistant("OK"),
         ];
@@ -1052,48 +1004,36 @@ mod tests {
         let messages = vec![
             Message::user("Start"),
             // Assistant uses two tools
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![
-                    ContentBlock::ToolUse {
-                        id: "tu-a".to_string(),
-                        name: "search".to_string(),
-                        input: serde_json::json!({}),
-                        provider_metadata: None,
-                    },
-                    ContentBlock::ToolUse {
-                        id: "tu-b".to_string(),
-                        name: "fetch".to_string(),
-                        input: serde_json::json!({}),
-                        provider_metadata: None,
-                    },
-                ]),
-            },
+            Message::assistant_with_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "tu-a".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tu-b".to_string(),
+                    name: "fetch".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                },
+            ]),
             // Only tu-a has a result, tu-b is missing
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-a".to_string(),
-                    tool_name: String::new(),
-                    content: "search result".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-a".to_string(),
+                tool_name: String::new(),
+                content: "search result".to_string(),
+                is_error: false,
+            }]),
             // Orphaned result from a non-existent tool use
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-ghost".to_string(),
-                    tool_name: String::new(),
-                    content: "ghost result".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-ghost".to_string(),
+                tool_name: String::new(),
+                content: "ghost result".to_string(),
+                is_error: false,
+            }]),
             // Empty message
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(String::new()),
-            },
+            Message::new(Role::User, MessageContent::Text(String::new())),
             Message::assistant("Done"),
         ];
 
@@ -1128,23 +1068,20 @@ mod tests {
         // A user message where ALL blocks are orphaned ToolResults — should be removed entirely
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![
-                    ContentBlock::ToolResult {
-                        tool_use_id: "orphan-1".to_string(),
-                        tool_name: String::new(),
-                        content: "lost 1".to_string(),
-                        is_error: false,
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id: "orphan-2".to_string(),
-                        tool_name: String::new(),
-                        content: "lost 2".to_string(),
-                        is_error: false,
-                    },
-                ]),
-            },
+            Message::user_with_blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "orphan-1".to_string(),
+                    tool_name: String::new(),
+                    content: "lost 1".to_string(),
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "orphan-2".to_string(),
+                    tool_name: String::new(),
+                    content: "lost 2".to_string(),
+                    is_error: false,
+                },
+            ]),
             Message::assistant("Hi"),
         ];
 

@@ -182,6 +182,9 @@ impl StandaloneChat {
                 self.chat.status_msg = Some(format!("Error: {e}"));
             }
         }
+        // Refresh context usage display
+        self.refresh_context_usage();
+
         // Auto-send the next staged message if any
         if let Some(msg) = self.chat.take_staged() {
             self.send_message(msg);
@@ -273,6 +276,8 @@ impl StandaloneChat {
                         "/help         \u{2014} show this help",
                         "/model        \u{2014} open model picker (Ctrl+M)",
                         "/model <name> \u{2014} switch to model directly",
+                        "/compact      \u{2014} summarize older messages to free context",
+                        "/context      \u{2014} show context window usage",
                         "/status       \u{2014} connection & agent info",
                         "/clear        \u{2014} clear chat history",
                         "/kill         \u{2014} kill the current agent & quit",
@@ -365,12 +370,180 @@ impl StandaloneChat {
                     }
                 }
             }
+            "/compact" => {
+                match &self.backend {
+                    Backend::Daemon { base_url } => {
+                        if let Some(ref id) = self.agent_id_daemon {
+                            let client = crate::daemon_client();
+                            let url = format!("{base_url}/api/agents/{id}/session/compact");
+                            self.chat.push_message(
+                                Role::System,
+                                "Compacting session...".to_string(),
+                            );
+                            match client.post(&url).send() {
+                                Ok(r) if r.status().is_success() => {
+                                    let body: serde_json::Value =
+                                        r.json().unwrap_or_default();
+                                    let msg = body["message"]
+                                        .as_str()
+                                        .unwrap_or("Compaction complete.");
+                                    self.chat
+                                        .push_message(Role::System, msg.to_string());
+                                }
+                                Ok(r) => {
+                                    let body: serde_json::Value =
+                                        r.json().unwrap_or_default();
+                                    let err = body["error"]
+                                        .as_str()
+                                        .unwrap_or("Compaction failed.");
+                                    self.chat
+                                        .push_message(Role::System, err.to_string());
+                                }
+                                Err(e) => {
+                                    self.chat.push_message(
+                                        Role::System,
+                                        format!("Compaction error: {e}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Backend::InProcess { kernel } => {
+                        if let Some(id) = self.agent_id_inprocess {
+                            self.chat.push_message(
+                                Role::System,
+                                "Compacting session...".to_string(),
+                            );
+                            let kernel = kernel.clone();
+                            let rt = tokio::runtime::Handle::current();
+                            match rt.block_on(kernel.compact_agent_session(id)) {
+                                Ok(msg) => {
+                                    self.chat.push_message(Role::System, msg);
+                                }
+                                Err(e) => {
+                                    self.chat.push_message(
+                                        Role::System,
+                                        format!("Compaction failed: {e}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Backend::None => {
+                        self.chat
+                            .push_message(Role::System, "No backend connected.".to_string());
+                    }
+                }
+            }
+            "/context" => {
+                match &self.backend {
+                    Backend::Daemon { base_url } => {
+                        if let Some(ref id) = self.agent_id_daemon {
+                            let client = crate::daemon_client();
+                            let url = format!("{base_url}/api/agents/{id}/context");
+                            match client.get(&url).send() {
+                                Ok(r) if r.status().is_success() => {
+                                    let body: serde_json::Value =
+                                        r.json().unwrap_or_default();
+                                    let pct = body["usage_percent"]
+                                        .as_f64()
+                                        .unwrap_or(0.0);
+                                    let est = body["estimated_tokens"]
+                                        .as_u64()
+                                        .unwrap_or(0);
+                                    let window = body["context_window"]
+                                        .as_u64()
+                                        .unwrap_or(0);
+                                    let pressure = body["pressure"]
+                                        .as_str()
+                                        .unwrap_or("unknown");
+                                    self.chat.push_message(
+                                        Role::System,
+                                        format!(
+                                            "Context: {:.1}% ({} / {} tokens) — {pressure}",
+                                            pct, est, window
+                                        ),
+                                    );
+                                }
+                                _ => {
+                                    self.chat.push_message(
+                                        Role::System,
+                                        "Failed to fetch context info.".to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Backend::InProcess { kernel } => {
+                        if let Some(id) = self.agent_id_inprocess {
+                            match kernel.detailed_context_report(id, None) {
+                                Ok(data) => {
+                                    let styled =
+                                        crate::tui::context_widget::render_context_lines(&data);
+                                    let text =
+                                        openfang_runtime::context_analysis::render_context_terminal(
+                                            &data,
+                                        );
+                                    self.chat
+                                        .push_styled_message(Role::System, text, styled);
+                                }
+                                Err(e) => {
+                                    self.chat.push_message(
+                                        Role::System,
+                                        format!("Context report error: {e}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Backend::None => {
+                        self.chat
+                            .push_message(Role::System, "No backend connected.".to_string());
+                    }
+                }
+            }
             _ => {
                 self.chat.push_message(
                     Role::System,
                     format!("Unknown command: {}. Type /help", parts[0]),
                 );
             }
+        }
+    }
+
+    // ── Context usage refresh ─────────────────────────────────────────────────
+
+    fn refresh_context_usage(&mut self) {
+        match &self.backend {
+            Backend::Daemon { base_url } => {
+                if let Some(ref id) = self.agent_id_daemon {
+                    let client = crate::daemon_client();
+                    let url = format!("{base_url}/api/agents/{id}/context");
+                    if let Ok(r) = client.get(&url).send() {
+                        if r.status().is_success() {
+                            if let Ok(body) = r.json::<serde_json::Value>() {
+                                let est = body["estimated_tokens"].as_u64().unwrap_or(0) as usize;
+                                let window =
+                                    body["context_window"].as_u64().unwrap_or(0) as usize;
+                                let pct = body["usage_percent"].as_f64().unwrap_or(0.0);
+                                self.chat.context_usage = Some((est, window, pct));
+                            }
+                        }
+                    }
+                }
+            }
+            Backend::InProcess { kernel } => {
+                if let Some(id) = self.agent_id_inprocess {
+                    if let Ok(report) = kernel.context_report(id) {
+                        self.chat.context_usage = Some((
+                            report.estimated_tokens,
+                            report.context_window,
+                            report.usage_percent,
+                        ));
+                    }
+                }
+            }
+            Backend::None => {}
         }
     }
 
@@ -542,6 +715,7 @@ impl StandaloneChat {
             Role::System,
             "/help for commands \u{2022} /exit to quit".to_string(),
         );
+        self.refresh_context_usage();
     }
 
     fn enter_chat_inprocess(&mut self, id: AgentId, name: String) {
@@ -563,6 +737,7 @@ impl StandaloneChat {
             Role::System,
             "/help for commands \u{2022} /exit to quit".to_string(),
         );
+        self.refresh_context_usage();
     }
 
     /// Resolve agent on daemon: find by name/id, or auto-spawn from template.

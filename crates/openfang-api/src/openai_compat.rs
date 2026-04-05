@@ -235,7 +235,7 @@ fn convert_messages(oai_messages: &[OaiMessage]) -> Vec<Message> {
                 OaiContent::Null => return None,
             };
 
-            Some(Message { role, content })
+            Some(Message::new(role, content))
         })
         .collect()
 }

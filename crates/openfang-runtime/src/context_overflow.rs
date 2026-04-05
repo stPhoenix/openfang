@@ -230,14 +230,10 @@ mod tests {
         (0..count)
             .map(|i| {
                 let text = format!("msg{}: {}", i, "x".repeat(size_each));
-                Message {
-                    role: if i % 2 == 0 {
-                        Role::User
-                    } else {
-                        Role::Assistant
-                    },
-                    content: MessageContent::Text(text),
-                }
+                Message::new(
+                    if i % 2 == 0 { Role::User } else { Role::Assistant },
+                    MessageContent::Text(text),
+                )
             })
             .collect()
     }
@@ -287,24 +283,18 @@ mod tests {
         let big_result = "x".repeat(5000);
         let mut msgs = vec![
             Message::user("hi"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    tool_name: String::new(),
-                    content: big_result.clone(),
-                    is_error: false,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t2".to_string(),
-                    tool_name: String::new(),
-                    content: big_result,
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: String::new(),
+                content: big_result.clone(),
+                is_error: false,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t2".to_string(),
+                tool_name: String::new(),
+                content: big_result,
+                is_error: false,
+            }]),
         ];
         // Tiny context window to force all stages
         let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
@@ -334,15 +324,12 @@ mod tests {
         let chinese_result: String = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(1250); // 5000 chars, 15000 bytes
         let mut msgs = vec![
             Message::user("hi"),
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    tool_name: String::new(),
-                    content: chinese_result,
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: String::new(),
+                content: chinese_result,
+                is_error: false,
+            }]),
         ];
         // Tiny context window to force stage 3 tool truncation
         let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
@@ -357,24 +344,18 @@ mod tests {
         // user(ToolResult).  safe_drain_boundary should pull back to 1.
         let msgs = vec![
             Message::user("hello"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "t1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({}),
-                    provider_metadata: None,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    tool_name: "read".to_string(),
-                    content: "file contents".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: "read".to_string(),
+                content: "file contents".to_string(),
+                is_error: false,
+            }]),
             Message::user("thanks"),
         ];
         // Boundary 2 would cut between the assistant(ToolUse) at [1] and user(ToolResult) at [2].

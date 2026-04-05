@@ -1,0 +1,7 @@
+# Lightweight dev runner: host-built binary + Claude Code CLI
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl nodejs npm \
+    && npm install -g @anthropic-ai/claude-code \
+    && rm -rf /var/lib/apt/lists/*

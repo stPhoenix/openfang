@@ -1,13 +1,16 @@
 services:
   openfang:
-    image: debian:trixie-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.dev-runner
     ports:
       - "4200:4200"
     volumes:
       - ./target/release/openfang:/usr/local/bin/openfang:ro
-      - ./agents:/opt/openfang/agents:ro
+      - ./agents:/data/agents:ro
       - openfang-data:/data
-      - ${HOME}/.claude:/root/.claude:ro
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.config/claude-code:/root/.config/claude-code
     environment:
       - OPENFANG_LISTEN=0.0.0.0:4200
       - OPENFANG_HOME=/data

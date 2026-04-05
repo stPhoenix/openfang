@@ -455,6 +455,48 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
 
 /// Read a workspace identity file with a size cap to prevent prompt stuffing.
 /// Returns None if the file doesn't exist or is empty.
+/// Resolve context window size with priority: env override > session > model catalog > 200K default.
+fn resolve_context_window(
+    model_id: &str,
+    session_tokens: u64,
+    model_catalog: &std::sync::RwLock<openfang_runtime::model_catalog::ModelCatalog>,
+) -> usize {
+    // 1. Environment variable override (highest priority)
+    if let Ok(val) = std::env::var("OPENFANG_MAX_CONTEXT_TOKENS") {
+        if let Ok(n) = val.parse::<usize>() {
+            return n;
+        }
+    }
+
+    // 2. Session-level override
+    if session_tokens > 0 {
+        return session_tokens as usize;
+    }
+
+    // 3. Model catalog lookup
+    if let Ok(catalog) = model_catalog.read() {
+        if let Some(entry) = catalog.find_model(model_id) {
+            return entry.context_window as usize;
+        }
+    }
+
+    // 4. Default fallback
+    200_000
+}
+
+/// Resolve max output tokens from model catalog.
+fn resolve_max_output_tokens(
+    model_id: &str,
+    model_catalog: &std::sync::RwLock<openfang_runtime::model_catalog::ModelCatalog>,
+) -> usize {
+    if let Ok(catalog) = model_catalog.read() {
+        if let Some(entry) = catalog.find_model(model_id) {
+            return entry.max_output_tokens as usize;
+        }
+    }
+    32_000
+}
+
 fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
     const MAX_IDENTITY_FILE_BYTES: usize = 32_768; // 32KB cap
     let path = workspace.join(filename);
@@ -1111,16 +1153,27 @@ impl OpenFangKernel {
                                     &toml_str,
                                 ) {
                                     Ok(disk_manifest) => {
+                                        // Placeholder values ("default"/empty) in the TOML
+                                        // should never overwrite user-changed values from DB.
+                                        let disk_provider_is_placeholder =
+                                            disk_manifest.model.provider.is_empty()
+                                                || disk_manifest.model.provider == "default";
+                                        let disk_model_is_placeholder =
+                                            disk_manifest.model.model.is_empty()
+                                                || disk_manifest.model.model == "default";
+
                                         // Compare key fields to detect changes
                                         let changed = disk_manifest.name != entry.manifest.name
                                             || disk_manifest.description
                                                 != entry.manifest.description
                                             || disk_manifest.model.system_prompt
                                                 != entry.manifest.model.system_prompt
-                                            || disk_manifest.model.provider
-                                                != entry.manifest.model.provider
-                                            || disk_manifest.model.model
-                                                != entry.manifest.model.model
+                                            || (!disk_provider_is_placeholder
+                                                && disk_manifest.model.provider
+                                                    != entry.manifest.model.provider)
+                                            || (!disk_model_is_placeholder
+                                                && disk_manifest.model.model
+                                                    != entry.manifest.model.model)
                                             || disk_manifest.capabilities.tools
                                                 != entry.manifest.capabilities.tools
                                             || disk_manifest.tool_allowlist
@@ -1136,7 +1189,25 @@ impl OpenFangKernel {
                                                 agent = %name,
                                                 "Agent TOML on disk differs from DB, updating"
                                             );
+                                            // Preserve DB model config when TOML has placeholders
+                                            let db_model_config = entry.manifest.model.clone();
                                             entry.manifest = disk_manifest;
+                                            if disk_provider_is_placeholder {
+                                                entry.manifest.model.provider =
+                                                    db_model_config.provider;
+                                            }
+                                            if disk_model_is_placeholder {
+                                                entry.manifest.model.model =
+                                                    db_model_config.model;
+                                            }
+                                            if disk_provider_is_placeholder
+                                                || disk_model_is_placeholder
+                                            {
+                                                entry.manifest.model.api_key_env =
+                                                    db_model_config.api_key_env;
+                                                entry.manifest.model.base_url =
+                                                    db_model_config.base_url;
+                                            }
                                             // Persist the update back to DB
                                             if let Err(e) = kernel.memory.save_agent(&entry) {
                                                 warn!(
@@ -1193,21 +1264,17 @@ impl OpenFangKernel {
                         &mut restored_entry.manifest.resources,
                     );
 
-                    // Apply default_model to restored agents.
-                    //
-                    // Two cases:
-                    // 1. Agent has empty/default provider → always apply default_model
-                    // 2. Agent named "assistant" (auto-spawned) → update to match
-                    //    default_model so config.toml changes take effect on restart
+                    // Apply default_model to restored agents that still have
+                    // empty/placeholder provider+model (i.e. never explicitly changed).
+                    // We no longer force-override the auto-spawned "assistant" agent,
+                    // because that stomps user-initiated model changes made via the UI.
                     {
                         let dm = &kernel.config.default_model;
                         let is_default_provider = restored_entry.manifest.model.provider.is_empty()
                             || restored_entry.manifest.model.provider == "default";
                         let is_default_model = restored_entry.manifest.model.model.is_empty()
                             || restored_entry.manifest.model.model == "default";
-                        let is_auto_spawned = restored_entry.name == "assistant"
-                            && restored_entry.manifest.description == "General-purpose assistant";
-                        if is_default_provider && is_default_model || is_auto_spawned {
+                        if is_default_provider && is_default_model {
                             if !dm.provider.is_empty() {
                                 restored_entry.manifest.model.provider = dm.provider.clone();
                             }
@@ -1868,11 +1935,20 @@ impl OpenFangKernel {
 
         let driver = self.resolve_driver(&entry.manifest)?;
 
-        // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
+        // Look up model's actual context window and max output tokens from the catalog
+        let (ctx_window, max_output) = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|cat| {
+                cat.find_model(&entry.manifest.model.model).map(|m| {
+                    (
+                        Some(m.context_window as usize),
+                        Some(m.max_output_tokens as usize),
+                    )
+                })
+            })
+            .unwrap_or((None, None));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
@@ -2113,6 +2189,8 @@ impl OpenFangKernel {
                 },
                 Some(&kernel_clone.hooks),
                 ctx_window,
+                max_output,
+                Some(&kernel_clone.config.compaction),
                 Some(&kernel_clone.process_manager),
                 content_blocks,
                 sender_role,
@@ -2641,11 +2719,20 @@ impl OpenFangKernel {
 
         let driver = self.resolve_driver(&manifest)?;
 
-        // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
+        // Look up model's actual context window and max output tokens from the catalog
+        let (ctx_window, max_output) = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|cat| {
+                cat.find_model(&manifest.model.model).map(|m| {
+                    (
+                        Some(m.context_window as usize),
+                        Some(m.max_output_tokens as usize),
+                    )
+                })
+            })
+            .unwrap_or((None, None));
 
         // skill_snapshot was already built above (before tool list and prompt)
         // with bundled + global + workspace skills. Reuse it for the agent loop.
@@ -2687,6 +2774,8 @@ impl OpenFangKernel {
             },
             Some(&self.hooks),
             ctx_window,
+            max_output,
+            Some(&self.config.compaction),
             Some(&self.process_manager),
             content_blocks,
             sender_role,
@@ -3257,7 +3346,9 @@ impl OpenFangKernel {
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
-        use openfang_runtime::compactor::{compact_session, needs_compaction, CompactionConfig};
+        use openfang_runtime::compactor::{
+            build_post_compact_messages, compact_conversation, estimate_message_tokens,
+        };
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -3275,44 +3366,63 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = CompactionConfig::default();
-
-        if !needs_compaction(&session, &config) {
-            return Ok(format!(
-                "No compaction needed ({} messages, threshold {})",
-                session.messages.len(),
-                config.threshold
-            ));
+        if session.messages.is_empty() {
+            return Ok("No messages to compact.".to_string());
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
         let model = entry.manifest.model.model.clone();
+        let settings = &self.config.compaction;
+        let session_id_str = session.id.to_string();
 
-        let result = compact_session(driver, &model, &session, &config)
-            .await
-            .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
+        let result = compact_conversation(
+            driver,
+            &model,
+            &session.messages,
+            settings,
+            openfang_types::message::CompactTrigger::Manual,
+            None,
+            Some(&session_id_str),
+        )
+        .await
+        .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
+
+        let pre_tokens = result.pre_compact_token_count.unwrap_or(0);
+
+        // Build the new message list from compaction result
+        let new_messages = build_post_compact_messages(&result);
+
+        // Extract summary text for the legacy store_llm_summary path
+        let summary_text: String = result
+            .summary_messages
+            .iter()
+            .map(|m| m.content.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Store the LLM summary in the canonical session
         self.memory
-            .store_llm_summary(agent_id, &result.summary, result.kept_messages.clone())
+            .store_llm_summary(agent_id, &summary_text, new_messages.clone())
             .map_err(KernelError::OpenFang)?;
 
-        // Post-compaction audit: validate and repair the kept messages
+        // Post-compaction audit: validate and repair
         let (repaired_messages, repair_stats) =
-            openfang_runtime::session_repair::validate_and_repair_with_stats(&result.kept_messages);
+            openfang_runtime::session_repair::validate_and_repair_with_stats(&new_messages);
 
-        // Also update the regular session with the repaired messages
+        // Update the session with the repaired messages
         let mut updated_session = session;
         updated_session.messages = repaired_messages;
         self.memory
             .save_session(&updated_session)
             .map_err(KernelError::OpenFang)?;
 
-        // Build result message with audit summary
+        let post_tokens = estimate_message_tokens(&updated_session.messages);
+
+        // Build result message
         let mut msg = format!(
-            "Compacted {} messages into summary ({} chars), kept {} recent messages.",
-            result.compacted_count,
-            result.summary.len(),
+            "Compacted: {} tokens → {} tokens ({} messages remaining).",
+            pre_tokens,
+            post_tokens,
             updated_session.messages.len()
         );
 
@@ -3321,14 +3431,10 @@ impl OpenFangKernel {
             + repair_stats.duplicates_removed
             + repair_stats.messages_merged;
         if repairs > 0 {
-            msg.push_str(&format!(" Post-audit: repaired ({} orphaned removed, {} synthetic inserted, {} merged, {} deduped).",
-                repair_stats.orphaned_results_removed,
-                repair_stats.synthetic_results_inserted,
-                repair_stats.messages_merged,
-                repair_stats.duplicates_removed,
+            msg.push_str(&format!(
+                " Post-audit: repaired ({} fixes).",
+                repairs
             ));
-        } else {
-            msg.push_str(" Post-audit: clean.");
         }
 
         Ok(msg)
@@ -3360,19 +3466,137 @@ impl OpenFangKernel {
         let system_prompt = &entry.manifest.model.system_prompt;
         // Use the agent's actual filtered tools instead of all builtins
         let tools = self.available_tools(agent_id);
-        // Use 200K default or the model's known context window
-        let context_window = if session.context_window_tokens > 0 {
-            session.context_window_tokens
-        } else {
-            200_000
-        };
+
+        // Resolve context window from model catalog, env override, or session
+        let context_window = resolve_context_window(
+            &entry.manifest.model.model,
+            session.context_window_tokens,
+            &self.model_catalog,
+        );
 
         Ok(generate_context_report(
             &session.messages,
             Some(system_prompt),
             Some(&tools),
-            context_window as usize,
+            context_window,
         ))
+    }
+
+    /// Generate a detailed context analysis report with grid visualization and suggestions.
+    pub fn detailed_context_report(
+        &self,
+        agent_id: AgentId,
+        terminal_width: Option<u16>,
+    ) -> KernelResult<openfang_runtime::context_analysis::ContextData> {
+        use openfang_runtime::context_analysis::{AnalysisInput, analyze_context_usage};
+
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        let session = self
+            .memory
+            .get_session(entry.session_id)
+            .map_err(KernelError::OpenFang)?
+            .unwrap_or_else(|| openfang_memory::session::Session {
+                id: entry.session_id,
+                agent_id,
+                messages: Vec::new(),
+                context_window_tokens: 0,
+                label: None,
+            });
+
+        let model_id = &entry.manifest.model.model;
+        let context_window = resolve_context_window(
+            model_id,
+            session.context_window_tokens,
+            &self.model_catalog,
+        );
+        let max_output_tokens = resolve_max_output_tokens(model_id, &self.model_catalog);
+
+        let system_prompt = entry.manifest.model.system_prompt.clone();
+        let tools = self.available_tools(agent_id);
+
+        // Collect MCP tools
+        let mcp_tools = self
+            .mcp_tools
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
+
+        // Collect memory/identity files
+        let mut memory_files = Vec::new();
+        if let Some(ref ws) = entry.manifest.workspace {
+            for (file_type, filename) in [
+                ("identity", "SOUL.md"),
+                ("user", "USER.md"),
+                ("memory", "MEMORY.md"),
+                ("agents", "AGENTS.md"),
+            ] {
+                if let Some(content) = read_identity_file(ws, filename) {
+                    memory_files.push((
+                        file_type.to_string(),
+                        filename.to_string(),
+                        content,
+                    ));
+                }
+            }
+        }
+
+        // Collect skills
+        let skill_entries: Vec<(String, String, usize)> = self
+            .skill_registry
+            .read()
+            .map(|reg| {
+                reg.list()
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| {
+                        let name = s.manifest.skill.name.clone();
+                        let source = s.path.display().to_string();
+                        let desc = &s.manifest.skill.description;
+                        let tokens =
+                            openfang_runtime::compactor::rough_token_count_estimation(
+                                &format!("{name}{desc}"),
+                                4,
+                            );
+                        (name, source, tokens)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Collect peer agents (excluding current agent)
+        let custom_agents: Vec<(String, String)> = self
+            .registry
+            .list()
+            .iter()
+            .filter(|a| a.id != agent_id)
+            .map(|a| (a.name.clone(), a.manifest.model.model.clone()))
+            .collect();
+
+        // Compaction settings
+        let auto_compact_enabled = self.config.compaction.auto_compact_enabled;
+        let autocompact_buffer_tokens = self.config.compaction.autocompact_buffer_tokens;
+
+        let input = AnalysisInput {
+            messages: session.messages,
+            model_id: model_id.clone(),
+            context_window,
+            max_output_tokens,
+            system_prompt,
+            tools,
+            mcp_tools,
+            memory_files,
+            skill_entries,
+            custom_agents,
+            auto_compact_enabled,
+            autocompact_buffer_tokens,
+            terminal_width,
+            last_api_usage: None,
+        };
+
+        Ok(analyze_context_usage(&input))
     }
 
     /// Kill an agent.
@@ -4807,14 +5031,24 @@ impl OpenFangKernel {
                     let env_var = self.config.resolve_api_key_env(&fb_provider);
                     std::env::var(&env_var).ok()
                 };
+                // Only inherit the default_model's base_url when the fallback
+                // provider matches the default provider — otherwise a provider-
+                // specific URL (e.g. lm-studio) leaks into unrelated providers.
+                let fb_base_url = fb
+                    .base_url
+                    .clone()
+                    .or_else(|| {
+                        if fb_provider == dm.provider {
+                            dm.base_url.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| self.lookup_provider_url(&fb_provider));
                 let config = DriverConfig {
                     provider: fb_provider.clone(),
                     api_key: fb_api_key,
-                    base_url: fb
-                        .base_url
-                        .clone()
-                        .or_else(|| dm.base_url.clone())
-                        .or_else(|| self.lookup_provider_url(&fb_provider)),
+                    base_url: fb_base_url,
                     skip_permissions: true,
                 };
                 match drivers::create_driver(&config) {

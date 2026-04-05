@@ -84,40 +84,184 @@ pub fn needs_compaction(session: &Session, config: &CompactionConfig) -> bool {
     session.messages.len() > config.threshold
 }
 
+/// Estimated tokens for a single image or document block.
+const IMAGE_MAX_TOKEN_SIZE: usize = 2_000;
+
+/// Rough token estimation: `content.len() / bytes_per_token`.
+pub fn rough_token_count_estimation(content: &str, bytes_per_token: usize) -> usize {
+    content.len() / bytes_per_token.max(1)
+}
+
+/// Estimate token count for a single content block (spec Section 4).
+fn estimate_block_tokens(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text { text, .. } => rough_token_count_estimation(text, 4),
+        ContentBlock::Image { .. } => IMAGE_MAX_TOKEN_SIZE,
+        ContentBlock::ToolResult { content, .. } => rough_token_count_estimation(content, 4),
+        ContentBlock::Thinking { thinking } => rough_token_count_estimation(thinking, 4),
+        ContentBlock::ToolUse { name, input, .. } => {
+            let input_str = serde_json::to_string(input).unwrap_or_default();
+            rough_token_count_estimation(&format!("{name}{input_str}"), 4)
+        }
+        ContentBlock::Unknown => 0,
+    }
+}
+
+/// Estimate token count for a set of messages with per-block awareness.
+///
+/// Handles all content block types accurately:
+/// - Text: chars/4
+/// - Images: 2000 tokens each
+/// - ToolResult: chars/4
+/// - Thinking: chars/4 (text only)
+/// - ToolUse: chars/4 of name + JSON(input)
+///
+/// Applies a 4/3 conservative padding multiplier to the final result
+/// to account for tokenization overhead.
+pub fn estimate_message_tokens(messages: &[Message]) -> usize {
+    let mut raw_tokens: usize = 0;
+
+    for msg in messages {
+        // Per-message overhead (role label, framing tokens)
+        raw_tokens += 4;
+
+        match &msg.content {
+            MessageContent::Text(s) => {
+                raw_tokens += rough_token_count_estimation(s, 4);
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    raw_tokens += estimate_block_tokens(block);
+                }
+            }
+        }
+    }
+
+    // Conservative 4/3 padding multiplier
+    (raw_tokens * 4).div_ceil(3)
+}
+
 /// Estimate token count for a set of messages, optional system prompt, and tool definitions.
 ///
-/// Uses the chars/4 heuristic — not exact, but good enough for budget gating.
+/// Uses per-block estimation with 4/3 padding multiplier.
+/// This is the main entry point for callers that need a full context estimate.
 pub fn estimate_token_count(
     messages: &[Message],
     system_prompt: Option<&str>,
     tools: Option<&[openfang_types::tool::ToolDefinition]>,
 ) -> usize {
-    let mut chars: usize = 0;
+    let mut tokens = estimate_message_tokens(messages);
 
     // System prompt
     if let Some(sp) = system_prompt {
-        chars += sp.len();
-    }
-
-    // Messages
-    for msg in messages {
-        chars += msg.content.text_length();
-        // Per-message overhead (role label, framing tokens)
-        chars += 16;
+        tokens += rough_token_count_estimation(sp, 4);
     }
 
     // Tool definitions (JSON schema is the biggest contributor)
     if let Some(tool_defs) = tools {
         for tool in tool_defs {
-            chars += tool.name.len() + tool.description.len();
-            if let Ok(schema_str) = serde_json::to_string(&tool.input_schema) {
-                chars += schema_str.len();
-            }
+            let schema_str = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            tokens += rough_token_count_estimation(
+                &format!("{}{}{}", tool.name, tool.description, schema_str),
+                4,
+            );
         }
     }
 
-    // chars / 4 heuristic
-    chars / 4
+    tokens
+}
+
+// ---------------------------------------------------------------------------
+// Autocompaction State and Threshold Logic (Layer 2)
+// ---------------------------------------------------------------------------
+
+/// Mutable state tracking autocompaction across turns.
+#[derive(Debug, Clone)]
+pub struct AutoCompactState {
+    /// Whether the previous compaction attempt succeeded.
+    pub compacted: bool,
+    /// Turns since last successful compaction.
+    pub turn_counter: u32,
+    /// Unique ID for this compaction turn (for telemetry).
+    pub turn_id: String,
+    /// Consecutive autocompaction failures (circuit breaker counter).
+    pub consecutive_failures: u32,
+}
+
+impl Default for AutoCompactState {
+    fn default() -> Self {
+        Self {
+            compacted: false,
+            turn_counter: 0,
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            consecutive_failures: 0,
+        }
+    }
+}
+
+/// Token warning state for UI feedback.
+#[derive(Debug, Clone)]
+pub struct TokenWarningState {
+    /// Percentage of context remaining (0–100).
+    pub percent_left: f64,
+    /// Token usage has crossed the warning threshold.
+    pub is_above_warning_threshold: bool,
+    /// Token usage has crossed the error threshold.
+    pub is_above_error_threshold: bool,
+    /// Token usage has crossed the autocompact trigger threshold.
+    pub is_above_auto_compact_threshold: bool,
+    /// Context is effectively full (blocking limit reached).
+    pub is_at_blocking_limit: bool,
+}
+
+/// Determine if autocompaction should trigger.
+///
+/// Uses the model-aware thresholds from `CompactionSettings`. Returns false
+/// if compaction is disabled, circuit breaker has tripped, or token usage
+/// is below the threshold.
+pub fn should_auto_compact(
+    estimated_tokens: usize,
+    context_window: usize,
+    max_output_tokens: usize,
+    settings: &openfang_types::config::CompactionSettings,
+    state: &AutoCompactState,
+) -> bool {
+    if !settings.enabled || !settings.auto_compact_enabled {
+        return false;
+    }
+    if state.consecutive_failures >= settings.max_consecutive_failures {
+        return false;
+    }
+    let threshold = settings.auto_compact_threshold(context_window, max_output_tokens);
+    estimated_tokens >= threshold
+}
+
+/// Calculate the token warning state for UI feedback.
+pub fn calculate_token_warning_state(
+    estimated_tokens: usize,
+    context_window: usize,
+    max_output_tokens: usize,
+    settings: &openfang_types::config::CompactionSettings,
+) -> TokenWarningState {
+    let effective = settings.effective_context_window(context_window, max_output_tokens);
+    let used_pct = if effective > 0 {
+        estimated_tokens as f64 / effective as f64 * 100.0
+    } else {
+        100.0
+    };
+    let percent_left = (100.0 - used_pct).max(0.0);
+
+    let auto_threshold = settings.auto_compact_threshold(context_window, max_output_tokens);
+    let warning_threshold = settings.warning_threshold(context_window, max_output_tokens);
+    let blocking = settings.blocking_limit(context_window, max_output_tokens);
+
+    TokenWarningState {
+        percent_left,
+        is_above_warning_threshold: estimated_tokens >= warning_threshold,
+        is_above_error_threshold: estimated_tokens >= warning_threshold, // same per spec
+        is_above_auto_compact_threshold: estimated_tokens >= auto_threshold,
+        is_at_blocking_limit: estimated_tokens >= blocking,
+    }
 }
 
 /// Check whether estimated tokens exceed the compaction threshold.
@@ -126,6 +270,464 @@ pub fn estimate_token_count(
 pub fn needs_compaction_by_tokens(estimated_tokens: usize, config: &CompactionConfig) -> bool {
     let threshold = (config.context_window_tokens as f64 * config.token_threshold_ratio) as usize;
     estimated_tokens > threshold
+}
+
+// ---------------------------------------------------------------------------
+// Summarization Prompts (Spec Section 10)
+// ---------------------------------------------------------------------------
+
+const NO_TOOLS_PREAMBLE: &str = "\
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn - you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.";
+
+const NO_TOOLS_TRAILER: &str = "\
+REMINDER: Do NOT call any tools. Respond with plain text only - an <analysis> block \
+followed by a <summary> block. Tool calls will be rejected and you will fail the task.";
+
+const DETAILED_ANALYSIS_INSTRUCTION: &str = "\
+Before providing your final summary, wrap your analysis in <analysis> tags to organize \
+your thoughts and ensure you've covered all necessary points. In your analysis process:
+
+1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like:
+     - file names
+     - full code snippets
+     - function signatures
+     - file edits
+   - Errors that you ran into and how you fixed them
+   - Pay special attention to specific user feedback that you received, especially if the \
+     user told you to do something differently.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.";
+
+const BASE_COMPACT_PROMPT: &str = "\
+Your task is to create a detailed summary of the conversation so far, paying close \
+attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and \
+architectural decisions that would be essential for continuing development work without \
+losing context.
+
+{analysis_instruction}
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. \
+   Pay special attention to the most recent messages and include full code snippets where applicable \
+   and include a summary of why this file read or edit is important.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention \
+   to specific user feedback that you received, especially if the user told you to do something differently.
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for \
+   understanding the users' feedback and changing intent.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary \
+   request, paying special attention to the most recent messages from both user and assistant. \
+   Include file names and code snippets where applicable.
+9. Optional Next Step: List the next step that you will take that is related to the most recent work \
+   you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent \
+   explicit requests, and the task you were working on immediately before this summary request. \
+   If your last task was concluded, then only list next steps if they are explicitly in line with the \
+   users request. Do not start on tangential requests or really old requests that were already completed \
+   without confirming with the user first. \
+   If there is a next step, include direct quotes from the most recent conversation showing exactly what \
+   task you were working on and where you left off. This should be verbatim to ensure there's no drift \
+   in task interpretation.";
+
+/// Build the full compaction prompt with optional custom instructions.
+pub fn get_compact_prompt(custom_instructions: Option<&str>) -> String {
+    let body = BASE_COMPACT_PROMPT.replace("{analysis_instruction}", DETAILED_ANALYSIS_INSTRUCTION);
+    let mut prompt = format!("{NO_TOOLS_PREAMBLE}\n\n{body}");
+
+    if let Some(instructions) = custom_instructions {
+        if !instructions.is_empty() {
+            prompt.push_str(&format!("\n\nAdditional Instructions:\n{instructions}"));
+        }
+    }
+
+    prompt.push_str(&format!("\n\n{NO_TOOLS_TRAILER}"));
+    prompt
+}
+
+// ---------------------------------------------------------------------------
+// Summary Post-Processing
+// ---------------------------------------------------------------------------
+
+/// Post-process a raw LLM summary response.
+///
+/// 1. Strip `<analysis>...</analysis>` block (drafting scratchpad)
+/// 2. Extract `<summary>...</summary>` content
+/// 3. Collapse multiple blank lines
+/// 4. Trim
+pub fn format_compact_summary(raw: &str) -> String {
+    let mut result = raw.to_string();
+
+    // Strip <analysis>...</analysis> block (greedy)
+    if let Some(start) = result.find("<analysis>") {
+        if let Some(end) = result.find("</analysis>") {
+            let end = end + "</analysis>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        }
+    }
+
+    // Extract <summary>...</summary> content
+    if let Some(start) = result.find("<summary>") {
+        let content_start = start + "<summary>".len();
+        if let Some(end) = result.find("</summary>") {
+            result = format!("Summary:\n{}", &result[content_start..end]);
+        }
+    }
+
+    // Collapse multiple blank lines to double newline
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Message Grouping (Spec Section 14)
+// ---------------------------------------------------------------------------
+
+/// Group messages by API round boundaries.
+///
+/// A new group starts when a NEW assistant response begins (different
+/// `api_message_id` from the prior assistant message). Streaming chunks
+/// from the same API response share an ID, so boundaries only fire at
+/// genuinely new rounds.
+pub fn group_messages_by_api_round(messages: &[Message]) -> Vec<Vec<Message>> {
+    let mut groups: Vec<Vec<Message>> = Vec::new();
+    let mut current: Vec<Message> = Vec::new();
+    let mut last_assistant_id: Option<String> = None;
+
+    for msg in messages {
+        let is_new_round = msg.role == Role::Assistant
+            && !current.is_empty()
+            && {
+                let this_id = msg.metadata.api_message_id.as_deref();
+                match (&last_assistant_id, this_id) {
+                    (Some(prev), Some(curr)) => prev != curr,
+                    (None, Some(_)) => true,
+                    _ => false,
+                }
+            };
+
+        if is_new_round {
+            groups.push(std::mem::take(&mut current));
+        }
+        current.push(msg.clone());
+
+        if msg.role == Role::Assistant {
+            if let Some(id) = &msg.metadata.api_message_id {
+                last_assistant_id = Some(id.clone());
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    groups
+}
+
+// ---------------------------------------------------------------------------
+// PTL (Prompt-Too-Long) Retry (Spec Section 13)
+// ---------------------------------------------------------------------------
+
+/// Truncate the oldest message groups for a prompt-too-long retry.
+///
+/// Returns `None` if truncation is impossible (fewer than 2 groups).
+pub fn truncate_head_for_ptl_retry(
+    messages: &[Message],
+    token_gap: Option<usize>,
+) -> Option<Vec<Message>> {
+    let groups = group_messages_by_api_round(messages);
+    if groups.len() < 2 {
+        return None;
+    }
+
+    let drop_count = if let Some(gap) = token_gap {
+        // Drop groups until accumulated tokens >= gap
+        let mut accumulated = 0usize;
+        let mut count = 0usize;
+        for group in &groups {
+            if accumulated >= gap {
+                break;
+            }
+            accumulated += estimate_message_tokens(group);
+            count += 1;
+            if count >= groups.len() - 1 {
+                break; // never drop all groups
+            }
+        }
+        count.max(1)
+    } else {
+        // Drop 20% of groups (minimum 1)
+        let pct = (groups.len() as f64 * 0.2).ceil() as usize;
+        pct.max(1).min(groups.len() - 1)
+    };
+
+    let kept: Vec<Message> = groups[drop_count..].iter().flatten().cloned().collect();
+
+    // If result starts with an assistant message, prepend a synthetic user marker
+    if kept.first().map(|m| m.role) == Some(Role::Assistant) {
+        let mut marker =
+            Message::user("[earlier conversation truncated for compaction retry]");
+        marker.metadata.is_meta = true;
+        let mut result = vec![marker];
+        result.extend(kept);
+        Some(result)
+    } else {
+        Some(kept)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image/Document Stripping (Spec Section 15)
+// ---------------------------------------------------------------------------
+
+/// Replace image and document blocks with text markers for summarization.
+pub fn strip_images_from_messages(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            for block in blocks.iter_mut() {
+                if matches!(block, ContentBlock::Image { .. }) {
+                    *block = ContentBlock::Text {
+                        text: "[image]".to_string(),
+                        provider_metadata: None,
+                    };
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New CompactionResult (Spec-aligned)
+// ---------------------------------------------------------------------------
+
+/// Result of a full conversation compaction (spec-aligned).
+///
+/// Contains all messages needed to rebuild the post-compact context.
+#[derive(Debug)]
+pub struct FullCompactionResult {
+    /// Boundary marker message (SystemCompactBoundaryMessage).
+    pub boundary_marker: Message,
+    /// Summary of the compacted conversation.
+    pub summary_messages: Vec<Message>,
+    /// File restorations, tool re-announcements.
+    pub attachments: Vec<Message>,
+    /// Preserved messages (kept verbatim across compaction).
+    pub messages_to_keep: Option<Vec<Message>>,
+    /// Text shown to the user.
+    pub user_display_message: Option<String>,
+    /// Token count before compaction.
+    pub pre_compact_token_count: Option<usize>,
+    /// Token count of the compaction API call's usage.
+    pub post_compact_token_count: Option<usize>,
+    /// Estimated resulting context size after assembly.
+    pub true_post_compact_token_count: Option<usize>,
+}
+
+/// Build the post-compact message array from a compaction result.
+///
+/// The ordering follows the spec (Section 11):
+/// 1. boundary_marker
+/// 2. summary_messages
+/// 3. messages_to_keep (if any)
+/// 4. attachments
+pub fn build_post_compact_messages(result: &FullCompactionResult) -> Vec<Message> {
+    let mut out = vec![result.boundary_marker.clone()];
+    out.extend(result.summary_messages.iter().cloned());
+    if let Some(keep) = &result.messages_to_keep {
+        out.extend(keep.iter().cloned());
+    }
+    out.extend(result.attachments.iter().cloned());
+    out
+}
+
+/// Create a compact boundary marker message.
+fn make_boundary_marker(
+    trigger: openfang_types::message::CompactTrigger,
+    pre_tokens: usize,
+    session_id: Option<&str>,
+    discovered_tools: Vec<String>,
+) -> Message {
+    use openfang_types::message::{
+        CompactBoundaryMetadata, MessageMetadata, MessageType,
+    };
+
+    let mut msg = Message::system("[compact boundary]");
+    msg.session_id = session_id.map(|s| s.to_string());
+    msg.metadata = MessageMetadata {
+        message_type: Some(MessageType::CompactBoundary),
+        compact_metadata: Some(CompactBoundaryMetadata {
+            trigger,
+            pre_tokens,
+            preserved_segment: None,
+            pre_compact_discovered_tools: discovered_tools,
+        }),
+        ..Default::default()
+    };
+    msg
+}
+
+/// Create a summary user message.
+fn make_summary_message(formatted_summary: &str) -> Message {
+    use openfang_types::message::{MessageMetadata, MessageType};
+
+    let text = format!(
+        "This session is being continued from a previous conversation that ran out of context.\n\
+         The summary below covers the earlier portion of the conversation.\n\n\
+         {formatted_summary}\n\n\
+         Continue the conversation from where it left off without asking the user any further \
+         questions. Resume directly - do not acknowledge the summary, do not recap what was \
+         happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if \
+         the break never happened."
+    );
+
+    let mut msg = Message::user(text);
+    msg.metadata = MessageMetadata {
+        message_type: Some(MessageType::CompactSummary),
+        is_compact_summary: true,
+        is_visible_in_transcript_only: true,
+        ..Default::default()
+    };
+    msg
+}
+
+/// Orchestrate a full conversation compaction (spec Section 7).
+///
+/// 1. Validate messages non-empty
+/// 2. Calculate pre-compact tokens
+/// 3. Build prompt, call LLM (with PTL retry loop)
+/// 4. Post-process summary
+/// 5. Build boundary marker and summary message
+/// 6. Assemble result
+pub async fn compact_conversation(
+    driver: Arc<dyn LlmDriver>,
+    model: &str,
+    messages: &[Message],
+    settings: &openfang_types::config::CompactionSettings,
+    trigger: openfang_types::message::CompactTrigger,
+    custom_instructions: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<FullCompactionResult, String> {
+    if messages.is_empty() {
+        return Err("Not enough messages to compact.".to_string());
+    }
+
+    let pre_tokens = estimate_message_tokens(messages);
+
+    // Build the compaction prompt
+    let prompt = get_compact_prompt(custom_instructions);
+    let summary_request = Message::user(prompt);
+
+    // Prepare messages for summarization
+    let mut msgs_to_summarize: Vec<Message> = messages.to_vec();
+    strip_images_from_messages(&mut msgs_to_summarize);
+    msgs_to_summarize.push(summary_request);
+
+    // PTL retry loop
+    let mut ptl_attempts = 0u32;
+    let summary = loop {
+        let request = CompletionRequest {
+            model: model.to_string(),
+            messages: msgs_to_summarize.clone(),
+            tools: vec![],
+            max_tokens: settings.compact_max_output_tokens,
+            temperature: 0.3,
+            system: Some(
+                "You are a helpful AI assistant tasked with summarizing conversations."
+                    .to_string(),
+            ),
+            thinking: None,
+        };
+
+        match driver.complete(request).await {
+            Ok(response) => {
+                let text = response.text();
+                if text.is_empty() {
+                    return Err("Compaction produced empty summary.".to_string());
+                }
+                break text;
+            }
+            Err(e) => {
+                let err_msg = format!("{e}");
+                // Check if this is a prompt-too-long error
+                let is_ptl = err_msg.contains("too long")
+                    || err_msg.contains("context_length")
+                    || err_msg.contains("token limit")
+                    || err_msg.contains("too many tokens");
+
+                if !is_ptl {
+                    return Err(format!("Compaction API error: {err_msg}"));
+                }
+
+                ptl_attempts += 1;
+                if ptl_attempts > settings.max_ptl_retries {
+                    return Err(
+                        "Conversation too long. Could not compact after retries.".to_string()
+                    );
+                }
+
+                warn!(
+                    attempt = ptl_attempts,
+                    "Prompt too long during compaction, truncating and retrying"
+                );
+
+                // Remove the summary request we appended, truncate, re-append
+                let last = msgs_to_summarize.pop(); // the summary request
+                match truncate_head_for_ptl_retry(&msgs_to_summarize, None) {
+                    Some(truncated) => {
+                        msgs_to_summarize = truncated;
+                        if let Some(req) = last {
+                            msgs_to_summarize.push(req);
+                        }
+                    }
+                    None => {
+                        return Err(
+                            "Conversation too long. Could not compact after retries."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    // Post-process the summary
+    let formatted = format_compact_summary(&summary);
+    if formatted.is_empty() {
+        return Err("Compaction produced empty summary after formatting.".to_string());
+    }
+
+    // Build result
+    let boundary = make_boundary_marker(trigger, pre_tokens, session_id, Vec::new());
+    let summary_msg = make_summary_message(&formatted);
+
+    let post_messages = vec![boundary.clone(), summary_msg.clone()];
+    let true_post_tokens = estimate_message_tokens(&post_messages);
+
+    Ok(FullCompactionResult {
+        boundary_marker: boundary,
+        summary_messages: vec![summary_msg],
+        attachments: Vec::new(),
+        messages_to_keep: None,
+        user_display_message: None,
+        pre_compact_token_count: Some(pre_tokens),
+        post_compact_token_count: None,
+        true_post_compact_token_count: Some(true_post_tokens),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -452,13 +1054,10 @@ async fn summarize_messages(
 
     let request = CompletionRequest {
         model: model.to_string(),
-        messages: vec![Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Text {
-                text: summarize_prompt,
-                provider_metadata: None,
-            }]),
-        }],
+        messages: vec![Message::user_with_blocks(vec![ContentBlock::Text {
+            text: summarize_prompt,
+            provider_metadata: None,
+        }])],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
         temperature: 0.3,
@@ -570,13 +1169,10 @@ async fn summarize_in_chunks(
 
     let merge_request = CompletionRequest {
         model: model.to_string(),
-        messages: vec![Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Text {
-                text: merge_prompt,
-                provider_metadata: None,
-            }]),
-        }],
+        messages: vec![Message::user_with_blocks(vec![ContentBlock::Text {
+            text: merge_prompt,
+            provider_metadata: None,
+        }])],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
         temperature: 0.3,
@@ -905,24 +1501,18 @@ mod tests {
             messages.push(Message::user("Query"));
         }
         // Insert a tool use + result pair early in the history
-        messages[1] = Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "tu-1".to_string(),
-                name: "web_search".to_string(),
-                input: serde_json::json!({"query": "test"}),
-                provider_metadata: None,
-            }]),
-        };
-        messages[2] = Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "tu-1".to_string(),
-                tool_name: String::new(),
-                content: "Search results here".to_string(),
-                is_error: false,
-            }]),
-        };
+        messages[1] = Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+            id: "tu-1".to_string(),
+            name: "web_search".to_string(),
+            input: serde_json::json!({"query": "test"}),
+            provider_metadata: None,
+        }]);
+        messages[2] = Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tu-1".to_string(),
+            tool_name: String::new(),
+            content: "Search results here".to_string(),
+            is_error: false,
+        }]);
 
         let session = Session {
             id: openfang_types::agent::SessionId::new(),
@@ -1238,37 +1828,28 @@ mod tests {
         let config = CompactionConfig::default();
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![
-                    ContentBlock::Text {
-                        text: "Let me search".to_string(),
-                        provider_metadata: None,
-                    },
-                    ContentBlock::ToolUse {
-                        id: "tu-1".to_string(),
-                        name: "web_search".to_string(),
-                        input: serde_json::json!({"query": "rust"}),
-                        provider_metadata: None,
-                    },
-                ]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu-1".to_string(),
-                    tool_name: String::new(),
-                    content: "Results found".to_string(),
-                    is_error: false,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::Image {
-                    media_type: "image/png".to_string(),
-                    data: "base64data".to_string(),
-                }]),
-            },
+            Message::assistant_with_blocks(vec![
+                ContentBlock::Text {
+                    text: "Let me search".to_string(),
+                    provider_metadata: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tu-1".to_string(),
+                    name: "web_search".to_string(),
+                    input: serde_json::json!({"query": "rust"}),
+                    provider_metadata: None,
+                },
+            ]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                tool_name: String::new(),
+                content: "Results found".to_string(),
+                is_error: false,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }]),
         ];
 
         let text = build_conversation_text(&messages, &config);
@@ -1394,15 +1975,12 @@ mod tests {
         let config = CompactionConfig::default();
         let blob = "A".repeat(2000);
         let tool_content = format!("result: {blob}");
-        let messages = vec![Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".to_string(),
-                tool_name: String::new(),
-                content: tool_content,
-                is_error: false,
-            }]),
-        }];
+        let messages = vec![Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            tool_name: String::new(),
+            content: tool_content,
+            is_error: false,
+        }])];
         let text = build_conversation_text(&messages, &config);
         // The base64 blob should be stripped/replaced by session_repair
         assert!(text.contains("[base64 blob"));
@@ -1414,15 +1992,12 @@ mod tests {
         let config = CompactionConfig::default();
         // Create a tool result larger than 2K but without base64 blobs
         let large_result = "word ".repeat(500); // ~2500 chars of non-base64 text
-        let messages = vec![Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "t2".to_string(),
-                tool_name: String::new(),
-                content: large_result,
-                is_error: false,
-            }]),
-        }];
+        let messages = vec![Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t2".to_string(),
+            tool_name: String::new(),
+            content: large_result,
+            is_error: false,
+        }])];
         let text = build_conversation_text(&messages, &config);
         // Should be capped at ~2000 chars (plus the "..." suffix)
         let result_part = text.split("[Tool result (OK): ").nth(1).unwrap_or("");
@@ -1438,15 +2013,12 @@ mod tests {
     fn test_compaction_short_results_unchanged() {
         let config = CompactionConfig::default();
         let short_result = "Success: 42 records processed";
-        let messages = vec![Message {
-            role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "t3".to_string(),
-                tool_name: String::new(),
-                content: short_result.to_string(),
-                is_error: false,
-            }]),
-        }];
+        let messages = vec![Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t3".to_string(),
+            tool_name: String::new(),
+            content: short_result.to_string(),
+            is_error: false,
+        }])];
         let text = build_conversation_text(&messages, &config);
         assert!(text.contains(short_result));
     }
@@ -1457,24 +2029,18 @@ mod tests {
         // Split at 2 would separate the ToolUse from its ToolResult.
         let messages = vec![
             Message::user("hello"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "t1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({}),
-                    provider_metadata: None,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    tool_name: "read".to_string(),
-                    content: "file contents".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: "read".to_string(),
+                content: "file contents".to_string(),
+                is_error: false,
+            }]),
             Message::assistant("Done reading."),
         ];
         let adjusted = adjust_split_for_tool_pairs(&messages, 2);

@@ -1,6 +1,8 @@
 //! LLM conversation message types.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// A message in an LLM conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,6 +11,111 @@ pub struct Message {
     pub role: Role,
     /// The content of the message.
     pub content: MessageContent,
+    /// Unique identifier for this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<Uuid>,
+    /// When this message was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Session that owns this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Extensible metadata for compaction, summaries, etc.
+    #[serde(default, skip_serializing_if = "MessageMetadata::is_empty")]
+    pub metadata: MessageMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// Compaction metadata types
+// ---------------------------------------------------------------------------
+
+/// Extensible metadata attached to a message.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageMetadata {
+    /// What kind of special message this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<MessageType>,
+    /// True if this message is a compaction summary.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_compact_summary: bool,
+    /// Hidden from UI, visible in saved transcript only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_visible_in_transcript_only: bool,
+    /// Synthetic/meta message (e.g. PTL retry marker).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_meta: bool,
+    /// Compact boundary details (only on CompactBoundary messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_metadata: Option<CompactBoundaryMetadata>,
+    /// API-level message ID (for streaming chunk grouping / API round detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_message_id: Option<String>,
+}
+
+impl MessageMetadata {
+    /// Returns true when all fields are at their defaults (for skip_serializing).
+    pub fn is_empty(&self) -> bool {
+        self.message_type.is_none()
+            && !self.is_compact_summary
+            && !self.is_visible_in_transcript_only
+            && !self.is_meta
+            && self.compact_metadata.is_none()
+            && self.api_message_id.is_none()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// The kind of special message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageType {
+    /// Regular conversation message.
+    Normal,
+    /// Marks the compaction boundary — all earlier messages were summarized.
+    CompactBoundary,
+    /// Marks a microcompaction event (tool result clearing).
+    MicrocompactBoundary,
+    /// A summary produced by the compaction pipeline.
+    CompactSummary,
+}
+
+/// What triggered a compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactTrigger {
+    /// User explicitly requested compaction.
+    Manual,
+    /// System triggered compaction automatically.
+    Auto,
+}
+
+/// Metadata stored on a compact boundary marker message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactBoundaryMetadata {
+    /// What triggered this compaction.
+    pub trigger: CompactTrigger,
+    /// Token count before compaction.
+    pub pre_tokens: usize,
+    /// Info about messages preserved verbatim after the boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_segment: Option<PreservedSegment>,
+    /// Tool names that were lazily loaded before compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_compact_discovered_tools: Vec<String>,
+}
+
+/// Identifies preserved messages that were kept verbatim across a compaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreservedSegment {
+    /// UUID of the first preserved message.
+    pub head_uuid: Uuid,
+    /// UUID of the splice-point message (just before the preserved segment).
+    pub anchor_uuid: Uuid,
+    /// UUID of the last preserved message.
+    pub tail_uuid: Uuid,
 }
 
 /// The role of a message sender in an LLM conversation.
@@ -168,35 +275,68 @@ impl MessageContent {
 }
 
 impl Message {
+    /// Create a new message with auto-populated uuid and timestamp.
+    ///
+    /// This is the base constructor used by all convenience methods.
+    /// Prefer the named constructors (`user()`, `assistant()`, etc.) when possible.
+    pub fn new(role: Role, content: MessageContent) -> Self {
+        Self {
+            role,
+            content,
+            uuid: Some(Uuid::new_v4()),
+            timestamp: Some(Utc::now()),
+            session_id: None,
+            metadata: MessageMetadata::default(),
+        }
+    }
+
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::System,
-            content: MessageContent::Text(content.into()),
-        }
+        Self::new(Role::System, MessageContent::Text(content.into()))
     }
 
     /// Create a user message.
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: MessageContent::Text(content.into()),
-        }
+        Self::new(Role::User, MessageContent::Text(content.into()))
     }
 
     /// Create a user message with structured content blocks (e.g. text + images).
     pub fn user_with_blocks(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: Role::User,
-            content: MessageContent::Blocks(blocks),
-        }
+        Self::new(Role::User, MessageContent::Blocks(blocks))
     }
 
     /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: MessageContent::Text(content.into()),
+        Self::new(Role::Assistant, MessageContent::Text(content.into()))
+    }
+
+    /// Create a message with structured content blocks for any role.
+    pub fn with_blocks(role: Role, blocks: Vec<ContentBlock>) -> Self {
+        Self::new(role, MessageContent::Blocks(blocks))
+    }
+
+    /// Create an assistant message with structured content blocks.
+    pub fn assistant_with_blocks(blocks: Vec<ContentBlock>) -> Self {
+        Self::new(Role::Assistant, MessageContent::Blocks(blocks))
+    }
+
+    /// Check if this message is a compact boundary marker.
+    pub fn is_compact_boundary(&self) -> bool {
+        self.metadata.message_type == Some(MessageType::CompactBoundary)
+    }
+
+    /// Check if this message is a compaction summary.
+    pub fn is_compact_summary(&self) -> bool {
+        self.metadata.is_compact_summary
+    }
+
+    /// Check if this message has text content blocks (not just tool results).
+    pub fn has_text_blocks(&self) -> bool {
+        match &self.content {
+            MessageContent::Text(s) => !s.is_empty(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.is_empty())),
         }
     }
 }

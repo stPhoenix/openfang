@@ -450,14 +450,11 @@ mod tests {
 
     #[test]
     fn test_build_prompt_simple() {
-        use openfang_types::message::{Message, MessageContent};
+        use openfang_types::message::Message;
 
         let request = CompletionRequest {
             model: "qwen-code/qwen3-coder".to_string(),
-            messages: vec![Message {
-                role: Role::User,
-                content: MessageContent::text("Hello"),
-            }],
+            messages: vec![Message::user("Hello")],
             tools: vec![],
             max_tokens: 1024,
             temperature: 0.7,

@@ -179,6 +179,10 @@ pub async fn build_router(
             axum::routing::post(routes::send_message_stream),
         )
         .route(
+            "/api/agents/{id}/context",
+            axum::routing::get(routes::get_agent_context),
+        )
+        .route(
             "/api/agents/{id}/session",
             axum::routing::get(routes::get_agent_session),
         )

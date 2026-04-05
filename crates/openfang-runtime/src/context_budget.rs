@@ -278,24 +278,18 @@ mod tests {
         let budget = ContextBudget::new(100); // headroom = 75% of 100 * 2.0 = 150 chars
         let big_result = "x".repeat(500);
         let mut messages = vec![
-            Message {
-                role: openfang_types::message::Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    tool_name: String::new(),
-                    content: big_result.clone(),
-                    is_error: false,
-                }]),
-            },
-            Message {
-                role: openfang_types::message::Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "t2".to_string(),
-                    tool_name: String::new(),
-                    content: big_result,
-                    is_error: false,
-                }]),
-            },
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: String::new(),
+                content: big_result.clone(),
+                is_error: false,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t2".to_string(),
+                tool_name: String::new(),
+                content: big_result,
+                is_error: false,
+            }]),
         ];
 
         let compacted = apply_context_guard(&mut messages, &budget, &[]);
@@ -338,15 +332,12 @@ mod tests {
         let budget = ContextBudget::new(100);
         // Chinese text: 500 chars * 3 bytes = 1500 bytes
         let big_chinese: String = "\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{6570}\u{636e}".repeat(83);
-        let mut messages = vec![Message {
-            role: openfang_types::message::Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".to_string(),
-                tool_name: String::new(),
-                content: big_chinese,
-                is_error: false,
-            }]),
-        }];
+        let mut messages = vec![Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            tool_name: String::new(),
+            content: big_chinese,
+            is_error: false,
+        }])];
         // Must not panic on multi-byte content
         let compacted = apply_context_guard(&mut messages, &budget, &[]);
         assert!(compacted > 0);

@@ -886,14 +886,25 @@ async fn handle_command(
                 serde_json::json!({"type": "error", "content": format!("Usage query failed: {e}")})
             }
         },
-        "context" => match state.kernel.context_report(agent_id) {
-            Ok(report) => {
-                let formatted = openfang_runtime::compactor::format_context_report(&report);
+        "context" => match state.kernel.detailed_context_report(agent_id, None) {
+            Ok(data) => {
+                let formatted =
+                    openfang_runtime::context_analysis::render_context_markdown(&data);
+                let pressure = if data.percentage >= 85.0 {
+                    "critical"
+                } else if data.percentage >= 70.0 {
+                    "high"
+                } else if data.percentage >= 50.0 {
+                    "medium"
+                } else {
+                    "low"
+                };
                 serde_json::json!({
                     "type": "command_result",
                     "command": cmd,
                     "message": formatted,
-                    "context_pressure": format!("{:?}", report.pressure).to_lowercase(),
+                    "context_pressure": pressure,
+                    "data": data,
                 })
             }
             Err(e) => {

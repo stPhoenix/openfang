@@ -301,7 +301,7 @@ pub fn inject_attachments_into_session(
     agent_id: AgentId,
     image_blocks: Vec<openfang_types::message::ContentBlock>,
 ) {
-    use openfang_types::message::{Message, MessageContent, Role};
+    use openfang_types::message::Message;
 
     let entry = match kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -319,10 +319,9 @@ pub fn inject_attachments_into_session(
         },
     };
 
-    session.messages.push(Message {
-        role: Role::User,
-        content: MessageContent::Blocks(image_blocks),
-    });
+    session
+        .messages
+        .push(Message::user_with_blocks(image_blocks));
 
     if let Err(e) = kernel.memory.save_session(&session) {
         tracing::warn!(error = %e, "Failed to save session with image attachments");
@@ -642,6 +641,47 @@ pub async fn get_agent_session(
                 Json(serde_json::json!({"error": "Session load failed"})),
             )
         }
+    }
+}
+
+/// GET /api/agents/:id/context — Detailed context window analysis.
+pub async fn get_agent_context(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    match state.kernel.detailed_context_report(agent_id, None) {
+        Ok(data) => {
+            let markdown = openfang_runtime::context_analysis::render_context_markdown(&data);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "data": data,
+                    "markdown": markdown,
+                    // Backward-compatible fields
+                    "usage_percent": data.percentage,
+                    "estimated_tokens": data.total_tokens,
+                    "context_window": data.max_tokens,
+                    "pressure": if data.percentage >= 85.0 { "Critical" }
+                                else if data.percentage >= 70.0 { "High" }
+                                else if data.percentage >= 50.0 { "Medium" }
+                                else { "Low" },
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
     }
 }
 

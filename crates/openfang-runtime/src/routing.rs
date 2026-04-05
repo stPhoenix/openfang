@@ -195,10 +195,7 @@ mod tests {
     fn test_simple_greeting_routes_to_simple() {
         let router = ModelRouter::new(default_config());
         let request = make_request(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::text("Hello!"),
-            }],
+            vec![Message::user("Hello!")],
             vec![],
         );
         let (complexity, model) = router.select_model(&request);
@@ -210,13 +207,10 @@ mod tests {
     fn test_code_markers_increase_complexity() {
         let router = ModelRouter::new(default_config());
         let request = make_request(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::text(
-                    "Write a function that implements async file reading with struct and impl blocks:\n\
-                     ```rust\nfn main() { }\n```"
-                ),
-            }],
+            vec![Message::user(
+                "Write a function that implements async file reading with struct and impl blocks:\n\
+                 ```rust\nfn main() { }\n```"
+            )],
             vec![],
         );
         let complexity = router.score(&request);
@@ -235,10 +229,7 @@ mod tests {
             })
             .collect();
         let request = make_request(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::text("Use the available tools to solve this problem."),
-            }],
+            vec![Message::user("Use the available tools to solve this problem.")],
             tools,
         );
         let complexity = router.score(&request);
@@ -251,13 +242,13 @@ mod tests {
         let router = ModelRouter::new(default_config());
         // 20 messages with moderate content
         let messages: Vec<Message> = (0..20)
-            .map(|i| Message {
-                role: if i % 2 == 0 { Role::User } else { Role::Assistant },
-                content: MessageContent::text(format!(
+            .map(|i| Message::new(
+                if i % 2 == 0 { Role::User } else { Role::Assistant },
+                MessageContent::text(format!(
                     "This is message {} with enough content to add some token weight to the conversation.",
                     i
                 )),
-            })
+            ))
             .collect();
         let request = make_request(messages, vec![]);
         let complexity = router.score(&request);
@@ -350,20 +341,14 @@ mod tests {
     fn test_system_prompt_adds_complexity() {
         let router = ModelRouter::new(default_config());
         let mut request = make_request(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::text("Hi"),
-            }],
+            vec![Message::user("Hi")],
             vec![],
         );
         request.system = Some("A".repeat(2000)); // Long system prompt
         let complexity_with_long_system = router.score(&request);
 
         let mut request2 = make_request(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::text("Hi"),
-            }],
+            vec![Message::user("Hi")],
             vec![],
         );
         request2.system = Some("Be helpful.".to_string());

@@ -3,6 +3,7 @@
 //! Two-level navigation: Phase::Boot (Welcome/Wizard) → Phase::Main with 16 tabs.
 
 pub mod chat_runner;
+pub mod context_widget;
 pub mod event;
 pub mod screens;
 pub mod theme;
@@ -1212,6 +1213,9 @@ impl App {
                 self.chat.status_msg = Some(format!("Error: {e}"));
             }
         }
+        // Refresh context usage display
+        self.refresh_context_usage();
+
         // Auto-send the next staged message if any
         if let Some(msg) = self.chat.take_staged() {
             self.send_message(msg);
@@ -1757,6 +1761,7 @@ impl App {
             "/help for commands \u{2022} /exit to quit".to_string(),
         );
         self.active_tab = Tab::Chat;
+        self.refresh_context_usage();
     }
 
     fn enter_chat_inprocess(&mut self, id: AgentId, name: String) {
@@ -1783,6 +1788,42 @@ impl App {
             "/help for commands \u{2022} /exit to quit".to_string(),
         );
         self.active_tab = Tab::Chat;
+        self.refresh_context_usage();
+    }
+
+    fn refresh_context_usage(&mut self) {
+        match (&self.backend, &self.chat_target) {
+            (Backend::Daemon { base_url }, Some(target)) => {
+                if let Some(ref id) = target.agent_id_daemon {
+                    let client = crate::daemon_client();
+                    let url = format!("{base_url}/api/agents/{id}/context");
+                    if let Ok(r) = client.get(&url).send() {
+                        if r.status().is_success() {
+                            if let Ok(body) = r.json::<serde_json::Value>() {
+                                let est =
+                                    body["estimated_tokens"].as_u64().unwrap_or(0) as usize;
+                                let window =
+                                    body["context_window"].as_u64().unwrap_or(0) as usize;
+                                let pct = body["usage_percent"].as_f64().unwrap_or(0.0);
+                                self.chat.context_usage = Some((est, window, pct));
+                            }
+                        }
+                    }
+                }
+            }
+            (Backend::InProcess { kernel }, Some(target)) => {
+                if let Some(id) = target.agent_id_inprocess {
+                    if let Ok(report) = kernel.context_report(id) {
+                        self.chat.context_usage = Some((
+                            report.estimated_tokens,
+                            report.context_window,
+                            report.usage_percent,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn send_message(&mut self, message: String) {

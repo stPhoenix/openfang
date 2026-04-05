@@ -1177,6 +1177,140 @@ pub struct KernelConfig {
     /// PII detection configuration (regex + optional NER).
     #[serde(default)]
     pub pii: PiiConfig,
+    /// Context compaction settings.
+    #[serde(default)]
+    pub compaction: CompactionSettings,
+}
+
+// ---------------------------------------------------------------------------
+// Context Compaction Settings
+// ---------------------------------------------------------------------------
+
+/// Context compaction configuration.
+///
+/// Controls the multi-layered compaction pipeline that manages conversation
+/// context within the model's token window. Configure in `[compaction]`.
+///
+/// Environment variable overrides:
+/// - `OPENFANG_DISABLE_COMPACT` — disables all compaction
+/// - `OPENFANG_DISABLE_AUTO_COMPACT` — disables auto-compact only
+/// - `OPENFANG_MAX_CONTEXT_TOKENS` — override context window size
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionSettings {
+    /// Master switch for all compaction (auto and manual).
+    pub enabled: bool,
+    /// Enable automatic compaction when token threshold is exceeded.
+    pub auto_compact_enabled: bool,
+    /// Buffer tokens before autocompact triggers.
+    /// Autocompact fires at: effective_window - this value.
+    pub autocompact_buffer_tokens: usize,
+    /// Buffer before the warning UI appears.
+    pub warning_threshold_buffer_tokens: usize,
+    /// Max output tokens reserved for the summarization API call.
+    pub compact_max_output_tokens: u32,
+    /// Stop auto-compacting after this many consecutive failures (circuit breaker).
+    pub max_consecutive_failures: u32,
+    /// Max prompt-too-long truncation retries during compaction.
+    pub max_ptl_retries: u32,
+    /// Max recently-read files to re-attach after compaction.
+    pub post_compact_max_files: usize,
+    /// Total token budget for all post-compact attachments.
+    pub post_compact_token_budget: usize,
+    /// Max tokens per restored file after compaction.
+    pub post_compact_max_tokens_per_file: usize,
+    /// Microcompaction (lightweight pre-API tool result clearing).
+    pub microcompact: MicrocompactConfig,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: !std::env::var("OPENFANG_DISABLE_COMPACT")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            auto_compact_enabled: !std::env::var("OPENFANG_DISABLE_AUTO_COMPACT")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            autocompact_buffer_tokens: 13_000,
+            warning_threshold_buffer_tokens: 20_000,
+            compact_max_output_tokens: 20_000,
+            max_consecutive_failures: 3,
+            max_ptl_retries: 3,
+            post_compact_max_files: 5,
+            post_compact_token_budget: 50_000,
+            post_compact_max_tokens_per_file: 5_000,
+            microcompact: MicrocompactConfig::default(),
+        }
+    }
+}
+
+impl CompactionSettings {
+    /// Calculate the effective context window after reserving output tokens.
+    ///
+    /// `context_window` and `max_output_tokens` come from the `ModelCatalog`.
+    pub fn effective_context_window(
+        &self,
+        context_window: usize,
+        max_output_tokens: usize,
+    ) -> usize {
+        context_window.saturating_sub(max_output_tokens.min(20_000))
+    }
+
+    /// Token count at which autocompaction should trigger.
+    pub fn auto_compact_threshold(
+        &self,
+        context_window: usize,
+        max_output_tokens: usize,
+    ) -> usize {
+        self.effective_context_window(context_window, max_output_tokens)
+            .saturating_sub(self.autocompact_buffer_tokens)
+    }
+
+    /// Token count at which a warning should be shown.
+    pub fn warning_threshold(
+        &self,
+        context_window: usize,
+        max_output_tokens: usize,
+    ) -> usize {
+        self.auto_compact_threshold(context_window, max_output_tokens)
+            .saturating_sub(self.warning_threshold_buffer_tokens)
+    }
+
+    /// Token count at which the context is effectively full (blocking limit).
+    pub fn blocking_limit(
+        &self,
+        context_window: usize,
+        max_output_tokens: usize,
+    ) -> usize {
+        self.effective_context_window(context_window, max_output_tokens)
+            .saturating_sub(3_000)
+    }
+}
+
+/// Microcompaction configuration (lightweight pre-API token pruning).
+///
+/// Clears old tool result content before the API call, without summarization.
+/// Configure in `[compaction.microcompact]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MicrocompactConfig {
+    /// Enable time-based microcompaction.
+    pub enabled: bool,
+    /// Minutes since last assistant message before clearing old tool results.
+    pub gap_threshold_minutes: u64,
+    /// Number of most-recent tool results to keep (never cleared).
+    pub keep_recent: usize,
+}
+
+impl Default for MicrocompactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gap_threshold_minutes: 60,
+            keep_recent: 5,
+        }
+    }
 }
 
 /// PII detection configuration.
@@ -1447,6 +1581,7 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             pii: PiiConfig::default(),
+            compaction: CompactionSettings::default(),
         }
     }
 }

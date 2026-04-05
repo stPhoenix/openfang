@@ -1353,10 +1353,7 @@ mod tests {
     #[test]
     fn test_extract_system_from_messages() {
         let messages = vec![
-            Message {
-                role: Role::System,
-                content: MessageContent::Text("System prompt here.".to_string()),
-            },
+            Message::new(Role::System, MessageContent::Text("System prompt here.".to_string())),
             Message::user("Hi"),
         ];
         let result = extract_system(&messages, &None);
@@ -1479,26 +1476,20 @@ mod tests {
         // convert_messages should echo it back at the part level.
         let messages = vec![
             Message::user("Search for rust"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "call_123".to_string(),
-                    name: "web_search".to_string(),
-                    input: serde_json::json!({"query": "rust"}),
-                    provider_metadata: Some(serde_json::json!({
-                        "thought_signature": "sig_xyz789"
-                    })),
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_123".to_string(),
-                    tool_name: "web_search".to_string(),
-                    content: "Results about Rust programming".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "call_123".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "rust"}),
+                provider_metadata: Some(serde_json::json!({
+                    "thought_signature": "sig_xyz789"
+                })),
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_123".to_string(),
+                tool_name: "web_search".to_string(),
+                content: "Results about Rust programming".to_string(),
+                is_error: false,
+            }]),
         ];
 
         let (contents, _) = convert_messages(&messages, &None);
@@ -1527,15 +1518,12 @@ mod tests {
         // convert_messages should echo it back on the text part.
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::Text {
-                    text: "Let me think...".to_string(),
-                    provider_metadata: Some(serde_json::json!({
-                        "thought_signature": "text_sig_abc"
-                    })),
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::Text {
+                text: "Let me think...".to_string(),
+                provider_metadata: Some(serde_json::json!({
+                    "thought_signature": "text_sig_abc"
+                })),
+            }]),
         ];
 
         let (contents, _) = convert_messages(&messages, &None);
@@ -1598,24 +1586,18 @@ mod tests {
         // GeminiPart::FunctionCall with thought_signature: None
         let messages = vec![
             Message::user("Hello"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                    id: "call_456".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "/tmp/test"}),
-                    provider_metadata: None,
-                }]),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_456".to_string(),
-                    tool_name: "read_file".to_string(),
-                    content: "file contents".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "call_456".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+                provider_metadata: None,
+            }]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_456".to_string(),
+                tool_name: "read_file".to_string(),
+                content: "file contents".to_string(),
+                is_error: false,
+            }]),
         ];
 
         let (contents, _) = convert_messages(&messages, &None);
@@ -1855,19 +1837,13 @@ mod tests {
         // Now convert back to Gemini format and verify signatures are echoed
         let messages = vec![
             Message::user("Search for rust"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(completion.content),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id,
-                    tool_name: "web_search".to_string(),
-                    content: "search results".to_string(),
-                    is_error: false,
-                }]),
-            },
+            Message::assistant_with_blocks(completion.content),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name: "web_search".to_string(),
+                content: "search results".to_string(),
+                is_error: false,
+            }]),
         ];
         let (contents, _) = convert_messages(&messages, &None);
         let model_turn = &contents[1];

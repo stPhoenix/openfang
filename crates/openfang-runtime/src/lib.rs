@@ -15,6 +15,7 @@ pub mod auth_cooldown;
 pub mod browser;
 pub mod command_lane;
 pub mod compactor;
+pub mod context_analysis;
 pub mod context_budget;
 pub mod context_overflow;
 pub mod copilot_oauth;
@@ -32,6 +33,7 @@ pub mod llm_errors;
 pub mod loop_guard;
 pub mod mcp;
 pub mod mcp_server;
+pub mod microcompact;
 #[cfg(feature = "ner")]
 pub mod ner_engine;
 pub mod media_understanding;

@@ -32,6 +32,8 @@ pub struct ChatMessage {
     pub role: Role,
     pub text: String,
     pub tool: Option<ToolInfo>,
+    /// Pre-built ratatui lines for rich rendering (bypasses dim_style).
+    pub styled_lines: Option<Vec<Line<'static>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,8 @@ pub struct ChatState {
     pub streaming_chars: usize,
     /// Status message (errors, etc.)
     pub status_msg: Option<String>,
+    /// Cached context window usage: (estimated_tokens, context_window, usage_percent).
+    pub context_usage: Option<(usize, usize, f64)>,
     /// Messages staged while the agent is streaming — sent automatically when done.
     pub staged_messages: Vec<String>,
     /// Accumulates ToolInputDelta text for the current tool call.
@@ -116,6 +120,7 @@ impl ChatState {
             last_cost_usd: None,
             streaming_chars: 0,
             status_msg: None,
+            context_usage: None,
             staged_messages: Vec::new(),
             tool_input_buf: String::new(),
             show_model_picker: false,
@@ -138,6 +143,7 @@ impl ChatState {
         self.last_cost_usd = None;
         self.streaming_chars = 0;
         self.status_msg = None;
+        self.context_usage = None;
         self.staged_messages.clear();
         self.tool_input_buf.clear();
         self.show_model_picker = false;
@@ -151,8 +157,25 @@ impl ChatState {
             role,
             text,
             tool: None,
+            styled_lines: None,
         });
         self.scroll_offset = 0; // Auto-scroll to bottom
+    }
+
+    /// Push a message with pre-built styled lines (for rich rendering).
+    pub fn push_styled_message(
+        &mut self,
+        role: Role,
+        text: String,
+        styled_lines: Vec<Line<'static>>,
+    ) {
+        self.messages.push(ChatMessage {
+            role,
+            text,
+            tool: None,
+            styled_lines: Some(styled_lines),
+        });
+        self.scroll_offset = 0;
     }
 
     /// Append streaming text delta.
@@ -203,6 +226,7 @@ impl ChatState {
                 result: String::new(),
                 is_error: false,
             }),
+            styled_lines: None,
         });
         self.scroll_offset = 0;
         self.active_tool = None;
@@ -388,7 +412,7 @@ impl ChatState {
 
 /// Render the chat screen.
 pub fn draw(f: &mut Frame, area: Rect, state: &mut ChatState) {
-    let block = Block::default()
+    let mut block = Block::default()
         .title(Line::from(vec![Span::styled(
             format!(" {} ", state.agent_name),
             theme::title_style(),
@@ -401,6 +425,23 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut ChatState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER))
         .padding(Padding::horizontal(1));
+
+    if let Some((used, total, pct)) = state.context_usage {
+        let color = if pct > 70.0 {
+            theme::RED
+        } else if pct > 50.0 {
+            theme::YELLOW
+        } else {
+            theme::GREEN
+        };
+        block = block.title_bottom(
+            Line::from(vec![Span::styled(
+                format!(" {} / {} tokens \u{2014} {:.1}% ", format_tokens(used), format_tokens(total), pct),
+                Style::default().fg(color),
+            )])
+            .alignment(Alignment::Right),
+        );
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -650,11 +691,17 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &ChatState) {
                 }
             }
             Role::System => {
-                for sline in msg.text.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {sline}"),
-                        theme::dim_style(),
-                    )]));
+                if let Some(ref styled) = msg.styled_lines {
+                    for line in styled {
+                        lines.push(line.clone());
+                    }
+                } else {
+                    for sline in msg.text.lines() {
+                        lines.push(Line::from(vec![Span::styled(
+                            format!("  {sline}"),
+                            theme::dim_style(),
+                        )]));
+                    }
                 }
             }
             Role::Tool => {
@@ -879,6 +926,19 @@ fn sanitize_function_tags(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Format a token count with thousands separators (e.g. 200000 → "200,000").
+fn format_tokens(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
 }
 
 /// Truncate a string to `max_len` chars, appending `…` if truncated.

@@ -760,15 +760,12 @@ mod tests {
     #[test]
     fn test_convert_message_normalizes_tool_input() {
         // Simulate a ToolUse block with a stringified JSON input (legacy session data)
-        let msg = Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "tu-1".to_string(),
-                name: "web_search".to_string(),
-                input: serde_json::Value::String(r#"{"query": "test"}"#.to_string()),
-                provider_metadata: None,
-            }]),
-        };
+        let msg = Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+            id: "tu-1".to_string(),
+            name: "web_search".to_string(),
+            input: serde_json::Value::String(r#"{"query": "test"}"#.to_string()),
+            provider_metadata: None,
+        }]);
         let api_msg = convert_message(&msg);
         if let ApiContent::Blocks(blocks) = api_msg.content {
             match &blocks[0] {
