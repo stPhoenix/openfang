@@ -499,6 +499,26 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
+
+            // Look up the model's actual context window from the catalog
+            // instead of hardcoding 200K — different models have different limits.
+            let model_ctx_window = state
+                .kernel
+                .registry
+                .get(agent_id)
+                .and_then(|e| {
+                    state
+                        .kernel
+                        .model_catalog
+                        .read()
+                        .ok()
+                        .and_then(|cat| {
+                            cat.find_model(&e.manifest.model.model)
+                                .map(|m| m.context_window)
+                        })
+                })
+                .unwrap_or(200_000) as f64;
+
             match state.kernel.send_message_streaming(
                 agent_id,
                 &content,
@@ -713,9 +733,9 @@ async fn handle_text_message(
                                 cleaned
                             };
 
-                            // Estimate context pressure
+                            // Estimate context pressure using the model's actual context window
                             let ctx_pct =
-                                (usage.input_tokens as f64 / 200_000.0 * 100.0).min(100.0);
+                                (usage.input_tokens as f64 / model_ctx_window * 100.0).min(100.0);
                             let pressure = if ctx_pct > 85.0 {
                                 "critical"
                             } else if ctx_pct > 70.0 {

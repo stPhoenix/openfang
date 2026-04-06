@@ -401,6 +401,13 @@ pub async fn run_agent_loop(
         }
     }
 
+    // Pre-save the session with the user message so it persists even if the
+    // LLM call fails (provider error, quota exceeded, etc.). Without this,
+    // refreshing the page after an error would lose the user's message.
+    if let Err(e) = memory.save_session_async(session).await {
+        warn!(agent = %manifest.name, "Failed to pre-save user message: {e}");
+    }
+
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
@@ -1660,6 +1667,13 @@ pub async fn run_agent_loop_streaming(
                 }
             }
         }
+    }
+
+    // Pre-save the session with the user message so it persists even if the
+    // LLM call fails (provider error, quota exceeded, etc.). Without this,
+    // refreshing the page after an error would lose the user's message.
+    if let Err(e) = memory.save_session_async(session).await {
+        warn!(agent = %manifest.name, "Failed to pre-save user message (streaming): {e}");
     }
 
     // Validate and repair session history (drop orphans, merge consecutive)

@@ -39,6 +39,14 @@
 - **Self-inspection & self-modification** — Agents can now inspect and modify their own manifests at runtime via `agent_self_inspect` and `agent_self_modify`.
 - **Auth-gated reads** — `require_auth_for_reads` flag enforces authentication on most GET endpoints.
 - **Strict provider affinity** — Removed implicit provider auto-detection and silent fallback. When a configured provider is unreachable, the system now returns an error instead of silently switching to a different provider. Explicitly configured `[[fallback_providers]]` and per-agent `[[fallback_models]]` still work as intended.
+- **Argon2 password hashing** — Dashboard authentication upgraded from SHA-256 to Argon2id. Legacy hashes are auto-migrated on first login. New `openfang auth hash-password` CLI command.
+- **ONNX NER engine** — Optional ML-driven Named Entity Recognition for PII detection using ONNX Runtime, complementing the existing regex-based scanner.
+- **SearXNG search provider** — Self-hosted search via SearXNG with dynamic category support, pagination, and noise filtering. Configurable as a search backend in `config.toml`.
+- **Prompt injection scanner** — Detects override attempts, data exfiltration patterns, and shell reference injection in user messages and skills.
+- **RBAC tool access tiers** — `SenderRole` and `ToolAccessTier` enforce role-based capability restrictions per agent.
+- **Context analysis** — `/context` command with token breakdown, suggestions, and grid visualization. Always-visible context pressure indicator in the chat footer using the model's actual context window from the catalog.
+- **Chat message persistence** — User messages are now pre-saved to SQLite before the LLM call, so they survive provider errors, timeouts, and page refreshes.
+- **Docker dev environment** — `docker-compose.dev.yml` with live code editing, build caching, and memory-capped containers.
 - **Bug fixes** — Resolved 10+ issues (#771, #811, #752, #772, #661, #875, #872, #867, #824, #833, #766).
 
 ---

@@ -14,13 +14,6 @@ services:
     environment:
       - OPENFANG_LISTEN=0.0.0.0:4200
       - OPENFANG_HOME=/data
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
-      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
     entrypoint: ["/usr/local/bin/openfang"]
     command: ["start"]
     mem_limit: 4g
