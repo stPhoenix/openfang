@@ -131,6 +131,12 @@ pub enum CronAction {
         /// Timeout in seconds (10..=3600, default: 120).
         timeout_secs: Option<u64>,
     },
+    /// Run the execution evolution analyzer on unanalyzed sessions.
+    EvolveAnalyze,
+    /// Check for degraded tools and evolve dependent skills.
+    EvolveToolDegradation,
+    /// Run periodic skill health metric checks and trigger evolution.
+    EvolveMetricCheck,
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +342,9 @@ impl CronJob {
                     }
                 }
             }
+            CronAction::EvolveAnalyze
+            | CronAction::EvolveToolDegradation
+            | CronAction::EvolveMetricCheck => { /* no fields to validate */ }
         }
         Ok(())
     }

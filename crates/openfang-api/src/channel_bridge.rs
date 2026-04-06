@@ -600,6 +600,15 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                         .unwrap_or_default()
                                 )
                             }
+                            openfang_types::scheduler::CronAction::EvolveAnalyze => {
+                                "Run evolution analyzer".to_string()
+                            }
+                            openfang_types::scheduler::CronAction::EvolveToolDegradation => {
+                                "Run tool degradation check".to_string()
+                            }
+                            openfang_types::scheduler::CronAction::EvolveMetricCheck => {
+                                "Run skill metric check".to_string()
+                            }
                         };
                         match self.kernel.send_message(j.agent_id, &message).await {
                             Ok(result) => {

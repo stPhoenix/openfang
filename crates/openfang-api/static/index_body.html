@@ -137,6 +137,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
               <span class="nav-label">Scheduler</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'evolution' }" @click="navigate('evolution')" :aria-current="page === 'evolution' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"/></svg></span>
+              <span class="nav-label">Evolution</span>
+            </a>
           </div>
         </template>
       </div>
@@ -5277,6 +5281,382 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
             </div>
           </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ── Evolution Analyzer ── -->
+    <template x-if="page === 'evolution'">
+      <div x-data="evolutionPage()">
+        <div class="page-header">
+          <h2>Evolution Analyzer</h2>
+          <div class="flex gap-2">
+            <template x-if="analyzerAgentId">
+              <button class="btn btn-ghost btn-sm" @click="navigate('agents')">View Agent</button>
+            </template>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="runAnalysis()" :disabled="running || !config.enabled">
+              <span x-show="!running">Run Analysis</span>
+              <span x-show="running">Analyzing...</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="page-body" x-init="loadData()">
+          <!-- Loading / Error -->
+          <template x-if="loading"><div class="loading-spinner" style="padding:40px;text-align:center">Loading...</div></template>
+          <template x-if="loadError"><div class="alert alert-danger" x-text="loadError"></div></template>
+
+          <template x-if="!loading && !loadError">
+            <div>
+              <!-- Config toggle -->
+              <div style="margin-bottom:16px">
+                <button class="btn btn-ghost btn-sm" @click="showConfig = !showConfig">
+                  <span x-text="showConfig ? 'Hide Configuration' : 'Show Configuration'"></span>
+                </button>
+                <span class="badge" :class="config.enabled ? 'badge-success' : 'badge-dim'" x-text="config.enabled ? 'Enabled' : 'Disabled'" style="margin-left:8px"></span>
+              </div>
+
+              <!-- Config Panel -->
+              <div x-show="showConfig" x-transition class="card" style="margin-bottom:16px;padding:16px">
+                <div class="card-header">Analyzer Configuration</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+                  <div>
+                    <label class="form-label">Provider</label>
+                    <select class="form-select" x-model="config.provider" @change="onProviderChange()">
+                      <template x-if="providersLoading"><option disabled>Loading...</option></template>
+                      <template x-if="!providersLoading && providers.filter(p => !p.is_local).length > 0">
+                        <optgroup label="Cloud">
+                          <template x-for="p in providers.filter(p => !p.is_local)" :key="p.id">
+                            <option :value="p.id" x-text="p.display_name" :selected="p.id === config.provider"></option>
+                          </template>
+                        </optgroup>
+                      </template>
+                      <template x-if="!providersLoading && providers.filter(p => p.is_local).length > 0">
+                        <optgroup label="Local">
+                          <template x-for="p in providers.filter(p => p.is_local)" :key="p.id">
+                            <option :value="p.id" x-text="p.display_name" :selected="p.id === config.provider"></option>
+                          </template>
+                        </optgroup>
+                      </template>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="form-label">Model</label>
+                    <select class="form-select" x-model="config.model">
+                      <template x-if="modelsLoading"><option disabled>Loading...</option></template>
+                      <template x-if="!modelsLoading && filteredModels.length === 0"><option disabled>No models for this provider</option></template>
+                      <template x-for="m in filteredModels" :key="m.id">
+                        <option :value="m.id" x-text="m.display_name || m.id" :selected="m.id === config.model"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="form-label">API Key (optional override)</label>
+                    <input type="password" class="form-input" x-model="config.api_key" placeholder="Uses provider default if empty">
+                  </div>
+                  <div>
+                    <label class="form-label">Base URL (optional)</label>
+                    <input type="text" class="form-input" x-model="config.base_url" placeholder="Provider default">
+                  </div>
+                  <div>
+                    <label class="form-label">Batch Size</label>
+                    <input type="number" class="form-input" x-model="config.batch_size" min="1" max="100">
+                  </div>
+                  <div style="display:flex;align-items:end;gap:12px">
+                    <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                      <input type="checkbox" x-model="config.enabled"> Enabled
+                    </label>
+                    <button class="btn btn-primary btn-sm" @click="saveConfig()" :disabled="saving">
+                      <span x-text="saving ? 'Saving...' : 'Save'"></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Stats Cards -->
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px">
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="stats.total_analyses"></div>
+                  <div style="font-size:12px;opacity:0.7">Total Analyses</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="stats.sessions_analyzed"></div>
+                  <div style="font-size:12px;opacity:0.7">Analyzed</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="stats.sessions_pending"></div>
+                  <div style="font-size:12px;opacity:0.7">Pending</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="completionPct()"></div>
+                  <div style="font-size:12px;opacity:0.7">Completion Rate</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="stats.total_suggestions"></div>
+                  <div style="font-size:12px;opacity:0.7">Suggestions</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                  <div style="font-size:24px;font-weight:700" x-text="stats.total_tool_issues"></div>
+                  <div style="font-size:12px;opacity:0.7">Tool Issues</div>
+                </div>
+              </div>
+
+              <!-- Not enabled warning -->
+              <template x-if="!config.enabled">
+                <div class="alert" style="margin-bottom:16px;padding:12px;border-radius:8px;background:var(--bg-tertiary);color:var(--text-secondary)">
+                  The evolution analyzer is disabled. Enable it in the configuration above to start analyzing sessions.
+                </div>
+              </template>
+
+              <!-- Tab Navigation -->
+              <div style="display:flex;gap:0;border-bottom:1px solid var(--border-color);margin-bottom:16px">
+                <button class="btn btn-ghost btn-sm" :class="{ 'active-tab': activeTab === 'analyses' }" @click="activeTab = 'analyses'"
+                  style="border-radius:8px 8px 0 0;border-bottom:2px solid transparent;padding:8px 16px"
+                  :style="activeTab === 'analyses' ? 'border-bottom-color:var(--primary);color:var(--primary)' : ''">
+                  Analyses
+                </button>
+                <button class="btn btn-ghost btn-sm" :class="{ 'active-tab': activeTab === 'skills' }" @click="activeTab = 'skills'"
+                  style="border-radius:8px 8px 0 0;border-bottom:2px solid transparent;padding:8px 16px"
+                  :style="activeTab === 'skills' ? 'border-bottom-color:var(--primary);color:var(--primary)' : ''">
+                  Skill Records <span class="badge badge-dim" style="margin-left:4px" x-text="skillRecords.length"></span>
+                </button>
+                <button class="btn btn-ghost btn-sm" :class="{ 'active-tab': activeTab === 'tools' }" @click="activeTab = 'tools'"
+                  style="border-radius:8px 8px 0 0;border-bottom:2px solid transparent;padding:8px 16px"
+                  :style="activeTab === 'tools' ? 'border-bottom-color:var(--primary);color:var(--primary)' : ''">
+                  Tool Quality <span class="badge badge-dim" style="margin-left:4px" x-text="toolQualityRecords.length"></span>
+                </button>
+              </div>
+
+              <!-- ═══ Tab: Analyses ═══ -->
+              <template x-if="activeTab === 'analyses'">
+                <div>
+                  <div class="card" style="overflow-x:auto">
+                    <div class="card-header">Analysis Results</div>
+                    <template x-if="analyses.length === 0">
+                      <div style="padding:24px;text-align:center;opacity:0.6">No analyses yet. Click "Run Analysis" to analyze unanalyzed sessions.</div>
+                    </template>
+                    <template x-if="analyses.length > 0">
+                      <table class="table" style="margin-top:8px">
+                        <thead>
+                          <tr>
+                            <th>Session</th>
+                            <th>Agent</th>
+                            <th>Completed</th>
+                            <th>Issues</th>
+                            <th>Suggestions</th>
+                            <th>Model</th>
+                            <th>Analyzed</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="a in analyses" :key="a.id">
+                            <tr style="cursor:pointer" @click="selectAnalysis(a)" :class="{ 'active-row': selectedAnalysis && selectedAnalysis.id === a.id }">
+                              <td><code x-text="shortId(a.session_id)"></code></td>
+                              <td><code x-text="shortId(a.agent_id)"></code></td>
+                              <td>
+                                <span class="badge" :class="a.task_completed ? 'badge-success' : 'badge-danger'" x-text="a.task_completed ? 'Yes' : 'No'"></span>
+                              </td>
+                              <td x-text="a.tool_issues ? a.tool_issues.length : 0"></td>
+                              <td x-text="a.evolution_suggestions ? a.evolution_suggestions.length : 0"></td>
+                              <td style="font-size:12px" x-text="a.model_used"></td>
+                              <td style="font-size:12px" x-text="fmtTime(a.analyzed_at)"></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </template>
+                  </div>
+
+                  <!-- Analysis Detail -->
+                  <template x-if="selectedAnalysis">
+                    <div class="card" style="margin-top:16px;padding:16px">
+                      <div class="card-header">Analysis Detail</div>
+
+                      <div style="margin-top:12px">
+                        <strong>Execution Note</strong>
+                        <p style="margin:4px 0 12px;opacity:0.85" x-text="selectedAnalysis.execution_note"></p>
+                      </div>
+
+                      <!-- Tool Issues -->
+                      <template x-if="selectedAnalysis.tool_issues && selectedAnalysis.tool_issues.length > 0">
+                        <div style="margin-bottom:12px">
+                          <strong>Tool Issues</strong>
+                          <table class="table" style="margin-top:4px">
+                            <thead><tr><th>Tool</th><th>Type</th><th>Description</th></tr></thead>
+                            <tbody>
+                              <template x-for="ti in selectedAnalysis.tool_issues" :key="ti.tool_name + ti.issue_type">
+                                <tr>
+                                  <td><code x-text="ti.tool_name"></code></td>
+                                  <td><span class="badge" :class="issueClass(ti.issue_type)" x-text="ti.issue_type"></span></td>
+                                  <td x-text="ti.description"></td>
+                                </tr>
+                              </template>
+                            </tbody>
+                          </table>
+                        </div>
+                      </template>
+
+                      <!-- Skill Judgments -->
+                      <template x-if="selectedAnalysis.skill_judgments && selectedAnalysis.skill_judgments.length > 0">
+                        <div style="margin-bottom:12px">
+                          <strong>Skill Judgments</strong>
+                          <table class="table" style="margin-top:4px">
+                            <thead><tr><th>Skill</th><th>Applied</th><th>Quality</th><th>Note</th></tr></thead>
+                            <tbody>
+                              <template x-for="sj in selectedAnalysis.skill_judgments" :key="sj.skill_name">
+                                <tr>
+                                  <td><code x-text="sj.skill_name"></code></td>
+                                  <td><span class="badge" :class="sj.applied ? 'badge-success' : 'badge-dim'" x-text="sj.applied ? 'Yes' : 'No'"></span></td>
+                                  <td><span class="badge" :class="qualityClass(sj.quality)" x-text="sj.quality"></span></td>
+                                  <td x-text="sj.note"></td>
+                                </tr>
+                              </template>
+                            </tbody>
+                          </table>
+                        </div>
+                      </template>
+
+                      <!-- Evolution Suggestions -->
+                      <template x-if="selectedAnalysis.evolution_suggestions && selectedAnalysis.evolution_suggestions.length > 0">
+                        <div style="margin-bottom:12px">
+                          <strong>Evolution Suggestions</strong>
+                          <table class="table" style="margin-top:4px">
+                            <thead><tr><th>Kind</th><th>Target</th><th>Priority</th><th>Description</th></tr></thead>
+                            <tbody>
+                              <template x-for="es in selectedAnalysis.evolution_suggestions" :key="es.description">
+                                <tr>
+                                  <td><span class="badge" :class="kindClass(es.kind)" x-text="es.kind"></span></td>
+                                  <td><code x-text="es.target_skill || '-'"></code></td>
+                                  <td x-text="es.priority"></td>
+                                  <td x-text="es.description"></td>
+                                </tr>
+                              </template>
+                            </tbody>
+                          </table>
+                        </div>
+                      </template>
+
+                      <div style="font-size:12px;opacity:0.5;margin-top:8px">
+                        Tokens: <span x-text="selectedAnalysis.input_tokens"></span> in / <span x-text="selectedAnalysis.output_tokens"></span> out
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+
+              <!-- ═══ Tab: Skill Records ═══ -->
+              <template x-if="activeTab === 'skills'">
+                <div>
+                  <div class="card" style="overflow-x:auto">
+                    <div class="card-header">Skill Records</div>
+                    <template x-if="skillRecords.length === 0">
+                      <div style="padding:24px;text-align:center;opacity:0.6">No skill records yet. Skills are tracked after evolution analysis runs.</div>
+                    </template>
+                    <template x-if="skillRecords.length > 0">
+                      <table class="table" style="margin-top:8px">
+                        <thead>
+                          <tr>
+                            <th>Name</th>
+                            <th>Category</th>
+                            <th>Active</th>
+                            <th>Gen</th>
+                            <th>Selections</th>
+                            <th>Applied</th>
+                            <th>Applied %</th>
+                            <th>Completions</th>
+                            <th>Completion %</th>
+                            <th>Fallbacks</th>
+                            <th>Updated</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="s in skillRecords" :key="s.skill_id">
+                            <tr>
+                              <td><code x-text="s.name"></code></td>
+                              <td><span class="badge badge-dim" x-text="s.category || '-'"></span></td>
+                              <td>
+                                <span class="badge" :class="s.is_active ? 'badge-success' : 'badge-dim'" x-text="s.is_active ? 'Yes' : 'No'"></span>
+                              </td>
+                              <td x-text="s.lineage ? s.lineage.generation : 0"></td>
+                              <td x-text="s.total_selections"></td>
+                              <td x-text="s.total_applied"></td>
+                              <td x-text="skillAppliedRate(s)"></td>
+                              <td x-text="s.total_completions"></td>
+                              <td x-text="skillCompletionRate(s)"></td>
+                              <td x-text="s.total_fallbacks"></td>
+                              <td style="font-size:12px" x-text="fmtTime(s.last_updated)"></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+              <!-- ═══ Tab: Tool Quality ═══ -->
+              <template x-if="activeTab === 'tools'">
+                <div>
+                  <!-- Manual Triggers -->
+                  <div style="display:flex;gap:8px;margin-bottom:16px">
+                    <button class="btn btn-ghost btn-sm" @click="triggerDegradation()" :disabled="triggerRunning">
+                      <span x-text="triggerRunning ? 'Running...' : 'Check Tool Degradation'"></span>
+                    </button>
+                    <button class="btn btn-ghost btn-sm" @click="triggerMetrics()" :disabled="triggerRunning">
+                      <span x-text="triggerRunning ? 'Running...' : 'Check Skill Metrics'"></span>
+                    </button>
+                  </div>
+
+                  <div class="card" style="overflow-x:auto">
+                    <div class="card-header">Tool Quality Records</div>
+                    <template x-if="toolQualityRecords.length === 0">
+                      <div style="padding:24px;text-align:center;opacity:0.6">No tool quality data yet. Tool executions are recorded automatically during agent sessions.</div>
+                    </template>
+                    <template x-if="toolQualityRecords.length > 0">
+                      <table class="table" style="margin-top:8px">
+                        <thead>
+                          <tr>
+                            <th>Tool</th>
+                            <th>Backend</th>
+                            <th>Server</th>
+                            <th>Calls</th>
+                            <th>Success %</th>
+                            <th>Penalty</th>
+                            <th>Avg Time (ms)</th>
+                            <th>LLM Flags</th>
+                            <th>Last Updated</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="t in toolQualityRecords" :key="t.tool_key">
+                            <tr>
+                              <td><code x-text="t.tool_name"></code></td>
+                              <td><span class="badge badge-dim" x-text="t.backend || '-'"></span></td>
+                              <td style="font-size:12px" x-text="t.server || '-'"></td>
+                              <td x-text="t.total_calls"></td>
+                              <td>
+                                <span class="badge" :class="toolSuccessRate(t) !== '-' && parseInt(toolSuccessRate(t)) >= 80 ? 'badge-success' : parseInt(toolSuccessRate(t)) >= 50 ? 'badge-warning' : 'badge-danger'"
+                                  x-text="toolSuccessRate(t)"></span>
+                              </td>
+                              <td>
+                                <span class="badge" :class="parseFloat(toolPenalty(t)) >= 1 ? 'badge-success' : parseFloat(toolPenalty(t)) >= 0.5 ? 'badge-warning' : 'badge-danger'"
+                                  x-text="toolPenalty(t)"></span>
+                              </td>
+                              <td x-text="t.total_calls > 0 ? (t.total_execution_time_ms / t.total_calls).toFixed(0) : '-'"></td>
+                              <td x-text="t.llm_flagged_count"></td>
+                              <td style="font-size:12px" x-text="fmtTime(t.last_updated)"></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+            </div>
+          </template>
         </div>
       </div>
     </template>

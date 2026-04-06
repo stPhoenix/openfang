@@ -621,6 +621,57 @@ pub async fn build_router(
             "/api/cron/jobs/{id}/run",
             axum::routing::post(routes::run_cron_job),
         )
+        // Evolution analyzer endpoints
+        .route(
+            "/api/evolve/config",
+            axum::routing::get(routes::evolve_get_config).put(routes::evolve_set_config),
+        )
+        .route("/api/evolve/run", axum::routing::post(routes::evolve_run))
+        .route(
+            "/api/evolve/analyze/{session_id}",
+            axum::routing::post(routes::evolve_analyze_session),
+        )
+        .route(
+            "/api/evolve/analyses",
+            axum::routing::get(routes::evolve_list_analyses),
+        )
+        .route(
+            "/api/evolve/analyses/{id}",
+            axum::routing::get(routes::evolve_get_analysis),
+        )
+        .route(
+            "/api/evolve/stats",
+            axum::routing::get(routes::evolve_stats),
+        )
+        .route(
+            "/api/evolve/agent",
+            axum::routing::get(routes::evolve_get_agent),
+        )
+        // Skill records and tool quality endpoints
+        .route(
+            "/api/evolve/skills",
+            axum::routing::get(routes::evolve_list_skills),
+        )
+        .route(
+            "/api/evolve/skills/{id}",
+            axum::routing::get(routes::evolve_get_skill),
+        )
+        .route(
+            "/api/evolve/tools",
+            axum::routing::get(routes::evolve_list_tools),
+        )
+        .route(
+            "/api/evolve/tools/{key}",
+            axum::routing::get(routes::evolve_get_tool),
+        )
+        .route(
+            "/api/evolve/trigger/degradation",
+            axum::routing::post(routes::evolve_trigger_degradation),
+        )
+        .route(
+            "/api/evolve/trigger/metrics",
+            axum::routing::post(routes::evolve_trigger_metrics),
+        )
         // Webhook trigger endpoints (external event injection)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))
         .route("/hooks/agent", axum::routing::post(routes::webhook_agent))

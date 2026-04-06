@@ -157,6 +157,8 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Execution evolution analyzer engine.
+    pub evolve_engine: openfang_evolve::EvolveEngine,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1078,6 +1080,10 @@ impl OpenFangKernel {
         let initial_bindings = config.bindings.clone();
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
+        let evolve_engine = openfang_evolve::EvolveEngine::new(
+            config.evolve.clone(),
+            memory.usage_conn(),
+        );
 
         let kernel = Self {
             config,
@@ -1127,6 +1133,7 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            evolve_engine,
             self_handle: OnceLock::new(),
         };
 
@@ -5809,6 +5816,159 @@ impl OpenFangKernel {
         context_parts.join("\n\n")
     }
 
+    // -----------------------------------------------------------------------
+    // Evolution Analyzer Agent
+    // -----------------------------------------------------------------------
+
+    /// Build the `AgentManifest` for the evolution analyzer agent.
+    fn build_evolve_agent_manifest(&self) -> openfang_types::agent::AgentManifest {
+        let config = self.evolve_engine.config();
+        openfang_types::agent::AgentManifest {
+            name: "evolution-analyzer".to_string(),
+            version: "0.1.0".to_string(),
+            description: "Analyzes agent conversations to identify skill improvements and evolution opportunities".to_string(),
+            author: "openfang-evolve".to_string(),
+            module: "builtin:chat".to_string(),
+            model: openfang_types::agent::ModelConfig {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                max_tokens: 8192,
+                temperature: 0.3,
+                system_prompt: openfang_evolve::prompt::system_prompt(),
+                api_key_env: config.api_key.clone(),
+                base_url: config.base_url.clone(),
+            },
+            tags: vec!["system".to_string(), "evolution".to_string()],
+            generate_identity_files: false,
+            ..Default::default()
+        }
+    }
+
+    /// Spawn (or respawn) the evolution analyzer agent.
+    ///
+    /// Uses registry-only removal (not `kill_agent`) so that persistent session
+    /// history is preserved across respawns — the fixed ID is reused.
+    pub fn spawn_evolve_agent(&self) -> KernelResult<AgentId> {
+        // Unregister existing agent if respawning (e.g., config change).
+        // We only remove from registry, NOT from persistent storage, so
+        // session history is preserved across respawns.
+        if let Some(old_id) = self.evolve_engine.analyzer_agent_id() {
+            self.evolve_engine.clear_analyzer_agent();
+            let _ = self.registry.remove(old_id);
+        }
+
+        // Also unregister any orphaned agent registered under the same name
+        // (can happen if the engine state was cleared but the agent wasn't removed)
+        if let Some(entry) = self.registry.find_by_name("evolution-analyzer") {
+            let _ = self.registry.remove(entry.id);
+        }
+
+        let manifest = self.build_evolve_agent_manifest();
+        let fixed_id = AgentId::from_string("evolution-analyzer");
+        let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_id))?;
+        self.evolve_engine.set_analyzer_agent(agent_id);
+        tracing::info!(agent_id = %agent_id, "evolution analyzer agent spawned");
+        Ok(agent_id)
+    }
+
+    /// Ensure the evolution analyzer agent exists, spawning it if necessary.
+    pub fn ensure_evolve_agent(&self) -> KernelResult<AgentId> {
+        if let Some(id) = self.evolve_engine.analyzer_agent_id() {
+            if self.registry.get(id).is_some() {
+                return Ok(id);
+            }
+        }
+        self.spawn_evolve_agent()
+    }
+
+    /// Analyze a single session via the evolution analyzer agent.
+    pub async fn evolve_analyze_session(
+        &self,
+        session_id: &str,
+        agent_id_str: &str,
+        messages: &[openfang_types::message::Message],
+        available_skills: &[String],
+    ) -> Result<openfang_evolve::ExecutionAnalysis, openfang_evolve::EvolveError> {
+        let analyzer_id = self
+            .ensure_evolve_agent()
+            .map_err(|e| openfang_evolve::EvolveError::Other(e.to_string()))?;
+
+        // Reset session so each analysis starts fresh
+        if let Err(e) = self.reset_session(analyzer_id) {
+            warn!(agent_id = %analyzer_id, "failed to reset analyzer session: {e}");
+        }
+
+        let send_fn = |user_message: String| async move {
+            match self.send_message(analyzer_id, &user_message).await {
+                Ok(result) => Ok((
+                    result.response,
+                    result.total_usage.input_tokens,
+                    result.total_usage.output_tokens,
+                )),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        // Collect known skill IDs for fuzzy correction
+        let known_skill_ids: Vec<String> = self
+            .skill_registry
+            .read()
+            .ok()
+            .map(|reg| reg.skill_names())
+            .unwrap_or_default();
+
+        self.evolve_engine
+            .analyze_session(
+                session_id,
+                agent_id_str,
+                messages,
+                available_skills,
+                &known_skill_ids,
+                send_fn,
+            )
+            .await
+    }
+
+    /// Analyze all unanalyzed sessions via the evolution analyzer agent.
+    pub async fn evolve_analyze_unanalyzed(
+        &self,
+        session_loader: impl Fn(&str, &str) -> Option<Vec<openfang_types::message::Message>>,
+        available_skills: &[String],
+    ) -> Result<Vec<openfang_evolve::ExecutionAnalysis>, openfang_evolve::EvolveError> {
+        let analyzer_id = self
+            .ensure_evolve_agent()
+            .map_err(|e| openfang_evolve::EvolveError::Other(e.to_string()))?;
+
+        // Reset session so each analysis run starts fresh (avoids context bleed
+        // between analysis batches and prevents unbounded session growth).
+        if let Err(e) = self.reset_session(analyzer_id) {
+            warn!(agent_id = %analyzer_id, "failed to reset analyzer session: {e}");
+        }
+
+        let send_fn = |user_message: String| async move {
+            match self.send_message(analyzer_id, &user_message).await {
+                Ok(result) => Ok((
+                    result.response,
+                    result.total_usage.input_tokens,
+                    result.total_usage.output_tokens,
+                )),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        // Collect known skill IDs for fuzzy correction
+        let known_skill_ids: Vec<String> = self
+            .skill_registry
+            .read()
+            .ok()
+            .map(|reg| reg.skill_names())
+            .unwrap_or_default();
+
+        self.evolve_engine
+            .analyze_unanalyzed(session_loader, available_skills, &known_skill_ids, send_fn)
+            .await
+    }
+
     /// Execute a cron job on demand and deliver its result.
     ///
     /// This is the same logic used by the background cron tick loop, extracted
@@ -5930,6 +6090,51 @@ impl OpenFangKernel {
                         Err(err_msg)
                     }
                 }
+            }
+            CronAction::EvolveAnalyze => {
+                let skill_names: Vec<String> = {
+                    let reg = self.skill_registry.read().unwrap();
+                    reg.list().iter().map(|s| s.manifest.skill.name.clone()).collect()
+                };
+                let memory = self.memory.clone();
+                let session_loader = |sid: &str, _aid: &str| -> Option<Vec<openfang_types::message::Message>> {
+                    let session_id = openfang_types::agent::SessionId(
+                        uuid::Uuid::parse_str(sid).ok()?
+                    );
+                    let session = memory.get_session(session_id).ok()??;
+                    Some(session.messages)
+                };
+                match self.evolve_analyze_unanalyzed(session_loader, &skill_names).await {
+                    Ok(results) => {
+                        let msg = format!("analyzed {} sessions", results.len());
+                        self.cron_scheduler.record_success(job_id);
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let err_msg = format!("evolve analyze failed: {e}");
+                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        Err(err_msg)
+                    }
+                }
+            }
+            CronAction::EvolveToolDegradation => {
+                // Tool degradation checks are logged but don't execute evolution yet
+                // (requires evolver agent integration in a future phase)
+                let count = openfang_evolve::triggers::check_metric_triggers(
+                    self.evolve_engine.store(),
+                )
+                .len();
+                let msg = format!("tool degradation check: {count} candidates found");
+                self.cron_scheduler.record_success(job_id);
+                Ok(msg)
+            }
+            CronAction::EvolveMetricCheck => {
+                let candidates = openfang_evolve::triggers::check_metric_triggers(
+                    self.evolve_engine.store(),
+                );
+                let msg = format!("metric check: {} candidates found", candidates.len());
+                self.cron_scheduler.record_success(job_id);
+                Ok(msg)
             }
         }
     }

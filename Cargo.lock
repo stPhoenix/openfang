@@ -4207,6 +4207,7 @@ dependencies = [
  "hex",
  "hmac",
  "openfang-channels",
+ "openfang-evolve",
  "openfang-extensions",
  "openfang-hands",
  "openfang-kernel",
@@ -4327,6 +4328,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfang-evolve"
+version = "0.5.5"
+dependencies = [
+ "chrono",
+ "openfang-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "openfang-extensions"
 version = "0.5.5"
 dependencies = [
@@ -4386,6 +4404,7 @@ dependencies = [
  "hex",
  "libc",
  "openfang-channels",
+ "openfang-evolve",
  "openfang-extensions",
  "openfang-hands",
  "openfang-memory",

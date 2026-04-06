@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 11;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,18 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
+    }
+
+    if current_version < 11 {
+        migrate_v11(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -323,6 +335,141 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (8, datetime('now'), 'Add audit_entries table for persistent Merkle audit trail');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 9: Add evolution analysis tables and session tracking column.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Add evolution_analyzed column to sessions
+    if !column_exists(conn, "sessions", "evolution_analyzed") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN evolution_analyzed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    conn.execute_batch(
+        "
+        -- Execution analyses (one per analyzed session)
+        CREATE TABLE IF NOT EXISTS execution_analyses (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            task_completed INTEGER NOT NULL,
+            execution_note TEXT NOT NULL,
+            model_used TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            analyzed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ea_session ON execution_analyses(session_id);
+        CREATE INDEX IF NOT EXISTS idx_ea_agent ON execution_analyses(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_ea_analyzed_at ON execution_analyses(analyzed_at);
+
+        -- Tool issues identified during analysis
+        CREATE TABLE IF NOT EXISTS evolve_tool_issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_id TEXT NOT NULL REFERENCES execution_analyses(id) ON DELETE CASCADE,
+            tool_name TEXT NOT NULL,
+            issue_type TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_eti_analysis ON evolve_tool_issues(analysis_id);
+
+        -- Per-skill judgments from analysis
+        CREATE TABLE IF NOT EXISTS evolve_skill_judgments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_id TEXT NOT NULL REFERENCES execution_analyses(id) ON DELETE CASCADE,
+            skill_name TEXT NOT NULL,
+            applied INTEGER NOT NULL,
+            quality TEXT NOT NULL,
+            note TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_esj_analysis ON evolve_skill_judgments(analysis_id);
+
+        -- Evolution suggestions from analysis
+        CREATE TABLE IF NOT EXISTS evolve_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_id TEXT NOT NULL REFERENCES execution_analyses(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            target_skill TEXT,
+            description TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 3
+        );
+        CREATE INDEX IF NOT EXISTS idx_es_analysis ON evolve_suggestions(analysis_id);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add evolution analysis tables and session tracking column');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 10: Add skill records and tool quality records tables.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        -- Skill evolution tracking records
+        CREATE TABLE IF NOT EXISTS skill_records (
+            skill_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            path TEXT,
+            is_active INTEGER DEFAULT 1,
+            category TEXT,
+            tags TEXT,
+            visibility TEXT,
+            creator_id TEXT,
+            lineage TEXT,
+            tool_dependencies TEXT,
+            critical_tools TEXT,
+            total_selections INTEGER DEFAULT 0,
+            total_applied INTEGER DEFAULT 0,
+            total_completions INTEGER DEFAULT 0,
+            total_fallbacks INTEGER DEFAULT 0,
+            first_seen TEXT,
+            last_updated TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sr_active ON skill_records(is_active);
+        CREATE INDEX IF NOT EXISTS idx_sr_name ON skill_records(name);
+
+        -- Tool quality tracking records
+        CREATE TABLE IF NOT EXISTS tool_quality_records (
+            tool_key TEXT PRIMARY KEY,
+            backend TEXT,
+            server TEXT,
+            tool_name TEXT,
+            total_calls INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            total_execution_time_ms REAL DEFAULT 0,
+            recent_executions TEXT,
+            description_quality TEXT,
+            llm_flagged_count INTEGER DEFAULT 0,
+            description_hash TEXT,
+            first_seen TEXT,
+            last_updated TEXT
+        );
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (10, datetime('now'), 'Add skill records and tool quality records tables');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 11: Add evolve_config table for persisting evolution settings.
+fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS evolve_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (11, datetime('now'), 'Add evolve_config table');
         ",
     )?;
     Ok(())

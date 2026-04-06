@@ -10,17 +10,41 @@ OpenFang is an open-source Agent Operating System written in Rust (14 crates).
 ## Build & Verify Workflow
 After every feature implementation, run ALL THREE checks:
 ```bash
-cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
-make test                              # All tests must pass (currently 1744+)
-# Uses memory-aware parallelism (auto-scales JOBS and TEST_THREADS based on available RAM)
-# Run `make mem-check` to see current values
-cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
+make build    # Compile all workspace crates (lib only)
+make test     # Run full test suite (memory-aware parallelism)
+make clippy   # Lint with clippy (warnings are errors)
 ```
+Or run all three at once: `make check`
+
+### Key Make Targets
+| Target | Description |
+|--------|-------------|
+| `make build` | Compile all workspace crates (`--lib` only) |
+| `make build-release` | Build optimized release binary (openfang-cli) |
+| `make test` | Full test suite with memory-aware parallelism |
+| `make test-quick` | Lib-only tests (faster, no integration tests) |
+| `make clippy` | Lint (warnings are errors) |
+| `make check` | Build + clippy + test (full CI check) |
+| `make mem-check` | Show available RAM and parallelism settings |
+| `make install` | Install openfang binary via `cargo install` |
+| `make start` | Start daemon in foreground |
+| `make start-detach` | Start daemon in background (log: /tmp/openfang.log) |
+| `make stop` | Stop the running daemon |
+| `make restart` | Stop and restart the daemon |
+| `make reinstall` | Stop, rebuild, install, and restart |
+| `make kill-port` | Kill any process on port 4200 |
+| `make clean` | Remove all build artifacts |
+| `make docker-dev` | Build on host and run in Docker |
+| `make docker-dev-up` | Start dev container (assumes binary built) |
+| `make docker-dev-stop` | Stop dev container |
+| `make docker-dev-restart` | Rebuild on host and restart container |
+| `make docker-dev-logs` | Show dev container logs |
+| `make docker-dev-clean` | Remove dev volumes |
 
 ### OOM Prevention
 - `Cargo.toml` `[profile.dev]` uses `debug = "line-tables-only"` to keep test binaries ~200MB (not ~600MB)
 - `.cargo/config.toml` uses mold linker and limits to 8 build jobs
-- Makefile auto-scales parallelism based on `/proc/meminfo`
+- Makefile auto-scales JOBS and TEST_THREADS based on `/proc/meminfo`
 - Docker containers are capped at 4GB to avoid competing with host builds
 - Prereqs: `sudo apt install mold clang`; optionally enable zram for fast compressed swap
 
@@ -35,20 +59,18 @@ cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 
 #### Step 1: Stop any running daemon
 ```bash
-tasklist | grep -i openfang
-taskkill //PID <pid> //F
-# Wait 2-3 seconds for port to release
-sleep 3
+make stop          # Graceful stop
+make kill-port     # Force-kill anything on :4200
 ```
 
 #### Step 2: Build fresh release binary
 ```bash
-cargo build --release -p openfang-cli
+make build-release
 ```
 
 #### Step 3: Start daemon with required API keys
 ```bash
-GROQ_API_KEY=<key> target/release/openfang.exe start &
+GROQ_API_KEY=<key> make start
 sleep 6  # Wait for full boot
 curl -s http://127.0.0.1:4200/api/health  # Verify it's up
 ```
@@ -96,8 +118,8 @@ curl -s http://127.0.0.1:4200/ | grep -c "newComponentName"
 
 #### Step 8: Cleanup
 ```bash
-tasklist | grep -i openfang
-taskkill //PID <pid> //F
+make stop
+make kill-port
 ```
 
 ### Key API Endpoints for Testing
@@ -125,9 +147,8 @@ taskkill //PID <pid> //F
 - Config fields need: struct field + `#[serde(default)]` + Default impl entry + Serialize/Deserialize derives
 
 ## Common Gotchas
-- `openfang.exe` may be locked if daemon is running — use `--lib` flag or kill daemon first
+- Binary may be locked if daemon is running — use `make build` (lib only) or `make stop` first
 - `PeerRegistry` is `Option<PeerRegistry>` on kernel but `Option<Arc<PeerRegistry>>` on `AppState` — wrap with `.as_ref().map(|r| Arc::new(r.clone()))`
 - Config fields added to `KernelConfig` struct MUST also be added to the `Default` impl or build fails
 - `AgentLoopResult` field is `.response` not `.response_text`
 - CLI command to start daemon is `start` not `daemon`
-- On Windows: use `taskkill //PID <pid> //F` (double slashes in MSYS2/Git Bash)

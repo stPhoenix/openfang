@@ -3,7 +3,8 @@
        docker-dev docker-dev-up docker-dev-stop docker-dev-restart docker-dev-logs docker-dev-clean
 
 # Memory-aware parallelism to avoid OOM on Linux (systemd-oomd)
-# Each rustc peaks at ~2-4GB; each test binary ~200MB (with line-tables-only debug)
+# [profile.test] in Cargo.toml uses debug=false to keep test binaries small (~4MB vs ~250MB)
+# .cargo/config.toml caps build jobs; TEST_THREADS limits parallel test execution
 AVAILABLE_GB := $(shell awk '/MemAvailable/ {printf "%d", $$2/1048576}' /proc/meminfo)
 JOBS ?= $(shell echo $$(( $(AVAILABLE_GB) > 48 ? 8 : $(AVAILABLE_GB) > 24 ? 4 : 2 )))
 TEST_THREADS ?= $(shell echo $$(( $(AVAILABLE_GB) > 32 ? 4 : $(AVAILABLE_GB) > 16 ? 2 : 1 )))
@@ -27,17 +28,11 @@ mem-check: ## Show current memory and recommended parallelism
 	@echo "Available: $(AVAILABLE_GB) GB | JOBS=$(JOBS) | TEST_THREADS=$(TEST_THREADS)"
 	@echo "Swap: $$(swapon --show=SIZE --noheadings 2>/dev/null || echo 'none')"
 
-test: ## Run full test suite (one crate at a time to avoid OOM)
-	@for crate in $$(cargo metadata --no-deps --format-version=1 | python3 -c "import sys,json; [print(p['name']) for p in json.load(sys.stdin)['packages']]"); do \
-		echo "\n\033[36m=== Testing $$crate ===\033[0m"; \
-		cargo test -p $$crate -j $(JOBS) -- --test-threads=$(TEST_THREADS) || exit 1; \
-	done
+test: ## Run full test suite (parallel workspace build, shared deps)
+	cargo test --workspace -j $(JOBS) -- --test-threads=$(TEST_THREADS)
 
 test-quick: ## Run lib-only tests (faster, no integration tests)
-	@for crate in $$(cargo metadata --no-deps --format-version=1 | python3 -c "import sys,json; [print(p['name']) for p in json.load(sys.stdin)['packages']]"); do \
-		echo "\n\033[36m=== Testing $$crate (lib) ===\033[0m"; \
-		cargo test -p $$crate --lib -j $(JOBS) -- --test-threads=$(TEST_THREADS) || exit 1; \
-	done
+	cargo test --workspace --lib -j $(JOBS) -- --test-threads=$(TEST_THREADS)
 
 clippy: ## Lint with clippy (warnings are errors)
 	cargo clippy --workspace --all-targets -- -D warnings

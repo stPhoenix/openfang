@@ -1180,6 +1180,50 @@ pub struct KernelConfig {
     /// Context compaction settings.
     #[serde(default)]
     pub compaction: CompactionSettings,
+    /// Execution evolution analyzer configuration.
+    #[serde(default)]
+    pub evolve: EvolveConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Execution Evolution Analyzer
+// ---------------------------------------------------------------------------
+
+/// Execution evolution analyzer configuration.
+///
+/// Controls the LLM-powered analyzer that reviews completed agent sessions
+/// and produces structured analyses with skill judgments and evolution
+/// suggestions. Configure in `[evolve]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvolveConfig {
+    /// Whether the evolution analyzer is enabled.
+    pub enabled: bool,
+    /// LLM provider for the analyzer (e.g., "anthropic", "openai", "groq").
+    pub provider: String,
+    /// Model to use for analysis.
+    pub model: String,
+    /// Optional API key override (falls back to provider's default env var).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Optional base URL override for the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Max sessions to analyze in a single batch run.
+    pub batch_size: usize,
+}
+
+impl Default for EvolveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            api_key: None,
+            base_url: None,
+            batch_size: 20,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,6 +1626,7 @@ impl Default for KernelConfig {
             heartbeat: HeartbeatSettings::default(),
             pii: PiiConfig::default(),
             compaction: CompactionSettings::default(),
+            evolve: EvolveConfig::default(),
         }
     }
 }

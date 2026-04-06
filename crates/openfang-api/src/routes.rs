@@ -11749,6 +11749,346 @@ pub async fn wizard_spawn(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Evolution Analyzer Endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/evolve/config — Get the current evolve configuration.
+pub async fn evolve_get_config(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(serde_json::to_value(state.kernel.evolve_engine.config()).unwrap_or_default())
+}
+
+/// PUT /api/evolve/config — Update evolve configuration.
+pub async fn evolve_set_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match serde_json::from_value::<openfang_types::config::EvolveConfig>(body) {
+        Ok(new_config) => {
+            let old_config = state.kernel.evolve_engine.config();
+            let model_changed = old_config.provider != new_config.provider
+                || old_config.model != new_config.model;
+            state.kernel.evolve_engine.update_config(new_config);
+            // Respawn analyzer agent if provider/model changed
+            if model_changed && state.kernel.evolve_engine.analyzer_agent_id().is_some() {
+                let _ = state.kernel.spawn_evolve_agent();
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "status": "updated" })))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid config: {e}") })),
+        ),
+    }
+}
+
+/// POST /api/evolve/run — Analyze all unanalyzed sessions.
+pub async fn evolve_run(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+
+    let skill_names: Vec<String> = {
+        let reg = state.kernel.skill_registry.read().unwrap();
+        reg.list().iter().map(|s| s.manifest.skill.name.clone()).collect()
+    };
+    let memory = state.kernel.memory.clone();
+    let session_loader = move |sid: &str, _aid: &str| -> Option<Vec<openfang_types::message::Message>> {
+        let session_id = openfang_types::agent::SessionId(
+            uuid::Uuid::parse_str(sid).ok()?
+        );
+        let session = memory.get_session(session_id).ok()??;
+        Some(session.messages)
+    };
+
+    match state.kernel.evolve_analyze_unanalyzed(session_loader, &skill_names).await {
+        Ok(results) => {
+            let summaries: Vec<serde_json::Value> = results
+                .iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id.to_string(),
+                        "session_id": a.session_id,
+                        "agent_id": a.agent_id,
+                        "task_completed": a.task_completed,
+                        "suggestions": a.evolution_suggestions.len(),
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "analyzed": results.len(),
+                    "results": summaries,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /api/evolve/analyze/{session_id} — Analyze a specific session.
+pub async fn evolve_analyze_session(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+
+    let sid = match uuid::Uuid::parse_str(&session_id) {
+        Ok(u) => openfang_types::agent::SessionId(u),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid session ID" })),
+            );
+        }
+    };
+
+    let session = match state.kernel.memory.get_session(sid) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "session not found" })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            );
+        }
+    };
+
+    let skill_names: Vec<String> = {
+        let reg = state.kernel.skill_registry.read().unwrap();
+        reg.list().iter().map(|s| s.manifest.skill.name.clone()).collect()
+    };
+
+    match state
+        .kernel
+        .evolve_analyze_session(
+            &session_id,
+            &session.agent_id.to_string(),
+            &session.messages,
+            &skill_names,
+        )
+        .await
+    {
+        Ok(analysis) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&analysis).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/analyses — List execution analyses (paginated).
+pub async fn evolve_list_analyses(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(200);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    match state.kernel.evolve_engine.store().list_analyses(limit, offset) {
+        Ok(analyses) => {
+            let json_list: Vec<serde_json::Value> = analyses
+                .iter()
+                .map(|a| serde_json::to_value(a).unwrap_or_default())
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "analyses": json_list })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/analyses/{id} — Get a single analysis by ID.
+pub async fn evolve_get_analysis(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.evolve_engine.store().get_analysis(&id) {
+        Ok(Some(analysis)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&analysis).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "analysis not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/agent — Get the analyzer agent ID.
+pub async fn evolve_get_agent(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let agent_id = state.kernel.evolve_engine.analyzer_agent_id();
+    Json(serde_json::json!({ "agent_id": agent_id.map(|id| id.to_string()) }))
+}
+
+/// GET /api/evolve/stats — Get aggregate evolution statistics.
+pub async fn evolve_stats(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.kernel.evolve_engine.stats() {
+        Ok(stats) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&stats).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/skills — List skill records with optional active-only filter.
+pub async fn evolve_list_skills(
+    State(state): State<Arc<AppState>>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let active_only = query.get("active").map(|v| v == "true").unwrap_or(false);
+    match state.kernel.evolve_engine.store().list_skill_records(active_only) {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&records).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/skills/:id — Get a single skill record by ID.
+pub async fn evolve_get_skill(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(skill_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.evolve_engine.store().get_skill_record(&skill_id) {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&record).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "skill record not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/tools — List tool quality records.
+pub async fn evolve_list_tools(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.kernel.evolve_engine.store().list_tool_quality_records() {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&records).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/evolve/tools/:key — Get a single tool quality record.
+pub async fn evolve_get_tool(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(tool_key): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .evolve_engine
+        .store()
+        .get_tool_quality_record(&tool_key)
+    {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&record).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "tool quality record not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /api/evolve/trigger/degradation — Manually trigger tool degradation check.
+pub async fn evolve_trigger_degradation(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let candidates = openfang_evolve::triggers::check_metric_triggers(
+        state.kernel.evolve_engine.store(),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "candidates": candidates.len(),
+            "message": format!("{} degradation candidates found", candidates.len())
+        })),
+    )
+}
+
+/// POST /api/evolve/trigger/metrics — Manually trigger skill metric check.
+pub async fn evolve_trigger_metrics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let candidates = openfang_evolve::triggers::check_metric_triggers(
+        state.kernel.evolve_engine.store(),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "candidates": candidates.len(),
+            "message": format!("{} metric check candidates found", candidates.len())
+        })),
+    )
+}
+
 #[cfg(test)]
 mod channel_config_tests {
     use super::*;

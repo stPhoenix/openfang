@@ -14,6 +14,7 @@ members = [
     "crates/openfang-desktop",
     "crates/openfang-hands",
     "crates/openfang-extensions",
+    "crates/openfang-evolve",
     "xtask",
 ]
 
@@ -179,4 +180,14 @@ codegen-units = 16
 opt-level = 1
 
 [profile.dev.package."*"]
+opt-level = 2
+
+# Test profile: inherits dev but strips debug info further to shrink test binaries
+# (prevents OOM during parallel test compilation/linking)
+[profile.test]
+debug = false
+opt-level = 1
+codegen-units = 16
+
+[profile.test.package."*"]
 opt-level = 2
