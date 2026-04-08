@@ -369,6 +369,21 @@ pub struct SkillLineage {
 }
 
 // ---------------------------------------------------------------------------
+// SkillImport
+// ---------------------------------------------------------------------------
+
+/// Lightweight skill description used to import kernel-registered skills into
+/// the evolution store on startup.
+#[derive(Debug, Clone)]
+pub struct SkillImport {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub tags: Vec<String>,
+    pub tools: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // SkillRecord
 // ---------------------------------------------------------------------------
 
@@ -444,130 +459,6 @@ impl SkillRecord {
             return 0.0;
         }
         self.total_fallbacks as f64 / self.total_selections as f64
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ToolExecutionRecord
-// ---------------------------------------------------------------------------
-
-/// Single tool invocation record for quality tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolExecutionRecord {
-    /// When the execution occurred.
-    pub timestamp: DateTime<Utc>,
-    /// Whether the tool call succeeded.
-    pub success: bool,
-    /// Wall-clock time in milliseconds.
-    pub execution_time_ms: f64,
-    /// Error description (or `"[LLM] ..."` for analysis-identified issues).
-    pub error_message: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// DescriptionQuality
-// ---------------------------------------------------------------------------
-
-/// LLM-evaluated quality of a tool's description.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DescriptionQuality {
-    /// 0-1: How clear is the purpose/usage?
-    pub clarity: f64,
-    /// 0-1: Are inputs/outputs documented?
-    pub completeness: f64,
-    /// When the evaluation was performed.
-    pub evaluated_at: DateTime<Utc>,
-    /// LLM's reasoning.
-    pub reasoning: String,
-}
-
-// ---------------------------------------------------------------------------
-// ToolQualityRecord
-// ---------------------------------------------------------------------------
-
-/// Quality profile for a single tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolQualityRecord {
-    /// Format: `backend:server:tool_name`.
-    pub tool_key: String,
-    /// Tool backend identifier.
-    pub backend: String,
-    /// MCP server name (or empty).
-    pub server: String,
-    /// Tool function name.
-    pub tool_name: String,
-    /// Lifetime invocation count.
-    pub total_calls: u64,
-    /// Lifetime success count.
-    pub success_count: u64,
-    /// Cumulative execution time.
-    pub total_execution_time_ms: f64,
-    /// Rolling window (max 100).
-    pub recent_executions: Vec<ToolExecutionRecord>,
-    /// LLM-evaluated clarity + completeness.
-    pub description_quality: Option<DescriptionQuality>,
-    /// Times the analysis LLM flagged this tool.
-    pub llm_flagged_count: u64,
-    /// Hash of current tool description (change detection).
-    pub description_hash: Option<String>,
-    /// First observation.
-    pub first_seen: DateTime<Utc>,
-    /// Last modification.
-    pub last_updated: DateTime<Utc>,
-}
-
-/// Maximum rolling window size for recent tool executions.
-pub const MAX_RECENT_EXECUTIONS: usize = 100;
-
-impl ToolQualityRecord {
-    /// Lifetime success rate.
-    pub fn success_rate(&self) -> f64 {
-        if self.total_calls == 0 {
-            return 1.0;
-        }
-        self.success_count as f64 / self.total_calls as f64
-    }
-
-    /// Success rate over the rolling window.
-    pub fn recent_success_rate(&self) -> f64 {
-        if self.recent_executions.is_empty() {
-            return 1.0;
-        }
-        let successes = self.recent_executions.iter().filter(|e| e.success).count();
-        successes as f64 / self.recent_executions.len() as f64
-    }
-
-    /// Count of consecutive failures from most recent execution backward.
-    pub fn consecutive_failures(&self) -> u64 {
-        self.recent_executions
-            .iter()
-            .rev()
-            .take_while(|e| !e.success)
-            .count() as u64
-    }
-
-    /// Penalty factor (0.2-1.0) for tool ranking adjustments.
-    pub fn penalty(&self) -> f64 {
-        if self.total_calls < 3 {
-            return 1.0;
-        }
-
-        let rate = self.recent_success_rate();
-        let threshold = 0.4;
-
-        if rate >= threshold {
-            return 1.0;
-        }
-
-        let mut base = 0.3 + (rate / threshold) * 0.7;
-
-        let consec = self.consecutive_failures();
-        if consec >= 3 {
-            let extra = ((consec - 2) as f64 * 0.1).min(0.3);
-            base -= extra;
-        }
-
-        base.clamp(0.2, 1.0)
     }
 }
 
@@ -764,103 +655,6 @@ mod tests {
         assert_eq!(rec.applied_rate(), 0.0);
         assert_eq!(rec.effective_rate(), 0.0);
         assert_eq!(rec.fallback_rate(), 0.0);
-    }
-
-    #[test]
-    fn tool_quality_penalty() {
-        let mut rec = ToolQualityRecord {
-            tool_key: "builtin::web_search".into(),
-            backend: "builtin".into(),
-            server: String::new(),
-            tool_name: "web_search".into(),
-            total_calls: 0,
-            success_count: 0,
-            total_execution_time_ms: 0.0,
-            recent_executions: vec![],
-            description_quality: None,
-            llm_flagged_count: 0,
-            description_hash: None,
-            first_seen: Utc::now(),
-            last_updated: Utc::now(),
-        };
-
-        // New tool (< 3 calls) => no penalty
-        rec.total_calls = 2;
-        assert_eq!(rec.penalty(), 1.0);
-
-        // Healthy tool => no penalty
-        rec.total_calls = 10;
-        rec.success_count = 9;
-        rec.recent_executions = (0..10)
-            .map(|_| ToolExecutionRecord {
-                timestamp: Utc::now(),
-                success: true,
-                execution_time_ms: 100.0,
-                error_message: None,
-            })
-            .collect();
-        assert_eq!(rec.penalty(), 1.0);
-
-        // All recent failures => heavy penalty
-        rec.total_calls = 10;
-        rec.recent_executions = (0..10)
-            .map(|_| ToolExecutionRecord {
-                timestamp: Utc::now(),
-                success: false,
-                execution_time_ms: 100.0,
-                error_message: Some("error".into()),
-            })
-            .collect();
-        let p = rec.penalty();
-        assert!((0.2..0.4).contains(&p), "penalty was {p}");
-    }
-
-    #[test]
-    fn tool_quality_consecutive_failures() {
-        let mut rec = ToolQualityRecord {
-            tool_key: "test".into(),
-            backend: String::new(),
-            server: String::new(),
-            tool_name: "test".into(),
-            total_calls: 5,
-            success_count: 3,
-            total_execution_time_ms: 500.0,
-            recent_executions: vec![
-                ToolExecutionRecord {
-                    timestamp: Utc::now(),
-                    success: true,
-                    execution_time_ms: 100.0,
-                    error_message: None,
-                },
-                ToolExecutionRecord {
-                    timestamp: Utc::now(),
-                    success: false,
-                    execution_time_ms: 100.0,
-                    error_message: Some("err".into()),
-                },
-                ToolExecutionRecord {
-                    timestamp: Utc::now(),
-                    success: false,
-                    execution_time_ms: 100.0,
-                    error_message: Some("err".into()),
-                },
-            ],
-            description_quality: None,
-            llm_flagged_count: 0,
-            description_hash: None,
-            first_seen: Utc::now(),
-            last_updated: Utc::now(),
-        };
-        assert_eq!(rec.consecutive_failures(), 2);
-
-        // Add one more failure
-        rec.recent_executions.push(ToolExecutionRecord {
-            timestamp: Utc::now(),
-            success: false,
-            execution_time_ms: 100.0,
-            error_message: Some("err".into()),
-        });
-        assert_eq!(rec.consecutive_failures(), 3);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 /// Persistent store for execution analyses backed by SQLite.
 ///
 /// Shares the same database connection as the rest of the memory substrate.
+#[derive(Clone)]
 pub struct EvolveStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -93,6 +94,29 @@ impl EvolveStore {
             "UPDATE sessions SET evolution_analyzed = 1 WHERE id = ?1",
             [session_id],
         )?;
+        Ok(())
+    }
+
+    /// Mark all unanalyzed sessions belonging to the given agent IDs as analyzed.
+    pub fn mark_agent_sessions_analyzed(&self, agent_ids: &[String]) -> Result<(), EvolveError> {
+        if agent_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let placeholders: Vec<String> = agent_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "UPDATE sessions SET evolution_analyzed = 1 WHERE (evolution_analyzed = 0 OR evolution_analyzed IS NULL) AND agent_id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = agent_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
         Ok(())
     }
 
@@ -244,7 +268,10 @@ impl EvolveStore {
     }
 
     /// Get aggregate statistics.
-    pub fn stats(&self) -> Result<EvolveStats, EvolveError> {
+    ///
+    /// `exclude_agent_ids` filters out sessions belonging to evolution agents
+    /// (analyzer, evolver) so the pending count matches what "Run Analysis" sees.
+    pub fn stats(&self, exclude_agent_ids: &[String]) -> Result<EvolveStats, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
 
         let total_analyses: u64 = conn
@@ -253,20 +280,39 @@ impl EvolveStore {
             })
             .unwrap_or(0) as u64;
 
-        let sessions_analyzed: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE evolution_analyzed = 1",
-                [],
-                |row| row.get::<_, i64>(0),
+        let (analyzed_query, pending_query) = if exclude_agent_ids.is_empty() {
+            (
+                "SELECT COUNT(*) FROM sessions WHERE evolution_analyzed = 1".to_string(),
+                "SELECT COUNT(*) FROM sessions WHERE evolution_analyzed = 0 OR evolution_analyzed IS NULL".to_string(),
             )
+        } else {
+            let placeholders: Vec<String> = exclude_agent_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
+            let not_in = placeholders.join(", ");
+            (
+                format!("SELECT COUNT(*) FROM sessions WHERE evolution_analyzed = 1 AND agent_id NOT IN ({})", not_in),
+                format!("SELECT COUNT(*) FROM sessions WHERE (evolution_analyzed = 0 OR evolution_analyzed IS NULL) AND agent_id NOT IN ({})", not_in),
+            )
+        };
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = exclude_agent_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let sessions_analyzed: u64 = conn
+            .query_row(&analyzed_query, params.as_slice(), |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or(0) as u64;
 
         let sessions_pending: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE evolution_analyzed = 0 OR evolution_analyzed IS NULL",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(&pending_query, params.as_slice(), |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or(0) as u64;
 
         let avg_completion_rate: f64 = conn
@@ -361,6 +407,67 @@ impl EvolveStore {
         }
     }
 
+    /// Get a skill record by human-readable name (returns the first match).
+    pub fn get_skill_record_by_name(&self, name: &str) -> Result<Option<SkillRecord>, EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated
+             FROM skill_records WHERE name = ?1 LIMIT 1",
+        )?;
+        match stmt.query_row([name], Self::row_to_skill_record) {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update the filesystem path of a skill record by name.
+    ///
+    /// Used when a bundled skill is materialized to disk for evolution.
+    pub fn update_skill_path_by_name(&self, name: &str, new_path: &str) -> Result<(), EvolveError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE skill_records SET path = ?1, last_updated = ?2 WHERE name = ?3",
+            rusqlite::params![new_path, chrono::Utc::now().to_rfc3339(), name],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically increment skill counters by skill **name** (not ID).
+    ///
+    /// This is used by the analyzer flow where judgments reference skills by name.
+    pub fn update_skill_counters_by_name(
+        &self,
+        name: &str,
+        selections: u64,
+        applied: u64,
+        completions: u64,
+        fallbacks: u64,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE skill_records SET
+                total_selections = total_selections + ?2,
+                total_applied = total_applied + ?3,
+                total_completions = total_completions + ?4,
+                total_fallbacks = total_fallbacks + ?5,
+                last_updated = ?6
+             WHERE name = ?1",
+            rusqlite::params![
+                name,
+                selections as i64,
+                applied as i64,
+                completions as i64,
+                fallbacks as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// List skill records, optionally filtering to active only.
     pub fn list_skill_records(&self, active_only: bool) -> Result<Vec<SkillRecord>, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
@@ -419,83 +526,6 @@ impl EvolveStore {
         Ok(())
     }
 
-    // -- Tool Quality Records --
-
-    /// Save or upsert a tool quality record.
-    pub fn save_tool_quality_record(&self, record: &ToolQualityRecord) -> Result<(), EvolveError> {
-        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO tool_quality_records (tool_key, backend, server, tool_name, total_calls, success_count, total_execution_time_ms, recent_executions, description_quality, llm_flagged_count, description_hash, first_seen, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(tool_key) DO UPDATE SET
-                total_calls = excluded.total_calls,
-                success_count = excluded.success_count,
-                total_execution_time_ms = excluded.total_execution_time_ms,
-                recent_executions = excluded.recent_executions,
-                description_quality = excluded.description_quality,
-                llm_flagged_count = excluded.llm_flagged_count,
-                description_hash = excluded.description_hash,
-                last_updated = excluded.last_updated",
-            rusqlite::params![
-                record.tool_key,
-                record.backend,
-                record.server,
-                record.tool_name,
-                record.total_calls as i64,
-                record.success_count as i64,
-                record.total_execution_time_ms,
-                serde_json::to_string(&record.recent_executions).unwrap_or_default(),
-                record.description_quality.as_ref().map(|q| serde_json::to_string(q).unwrap_or_default()),
-                record.llm_flagged_count as i64,
-                record.description_hash,
-                record.first_seen.to_rfc3339(),
-                record.last_updated.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Get a tool quality record by key.
-    pub fn get_tool_quality_record(&self, tool_key: &str) -> Result<Option<ToolQualityRecord>, EvolveError> {
-        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
-        let mut stmt = conn.prepare(
-            "SELECT tool_key, backend, server, tool_name, total_calls, success_count, total_execution_time_ms, recent_executions, description_quality, llm_flagged_count, description_hash, first_seen, last_updated
-             FROM tool_quality_records WHERE tool_key = ?1",
-        )?;
-        match stmt.query_row([tool_key], Self::row_to_tool_quality_record) {
-            Ok(r) => Ok(Some(r)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// List all tool quality records.
-    pub fn list_tool_quality_records(&self) -> Result<Vec<ToolQualityRecord>, EvolveError> {
-        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
-        let mut stmt = conn.prepare(
-            "SELECT tool_key, backend, server, tool_name, total_calls, success_count, total_execution_time_ms, recent_executions, description_quality, llm_flagged_count, description_hash, first_seen, last_updated
-             FROM tool_quality_records ORDER BY tool_key",
-        )?;
-        let rows = stmt
-            .query_map([], Self::row_to_tool_quality_record)?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
-    }
-
-    /// Get problematic tools (recent_success_rate < max_success_rate AND total_calls >= min_calls).
-    pub fn get_problematic_tools(
-        &self,
-        min_calls: u64,
-        max_success_rate: f64,
-    ) -> Result<Vec<ToolQualityRecord>, EvolveError> {
-        let all = self.list_tool_quality_records()?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.total_calls >= min_calls && r.recent_success_rate() < max_success_rate)
-            .collect())
-    }
-
     // -- Private helpers --
 
     fn row_to_skill_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRecord> {
@@ -541,32 +571,6 @@ impl EvolveStore {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
             last_updated: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(17)?)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        })
-    }
-
-    fn row_to_tool_quality_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolQualityRecord> {
-        let recent_str: String = row.get(7)?;
-        let desc_quality_str: Option<String> = row.get(8)?;
-
-        Ok(ToolQualityRecord {
-            tool_key: row.get(0)?,
-            backend: row.get(1)?,
-            server: row.get(2)?,
-            tool_name: row.get(3)?,
-            total_calls: row.get::<_, i64>(4)? as u64,
-            success_count: row.get::<_, i64>(5)? as u64,
-            total_execution_time_ms: row.get(6)?,
-            recent_executions: serde_json::from_str(&recent_str).unwrap_or_default(),
-            description_quality: desc_quality_str
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            llm_flagged_count: row.get::<_, i64>(9)? as u64,
-            description_hash: row.get(10)?,
-            first_seen: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(11)?)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            last_updated: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(12)?)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
         })
@@ -759,21 +763,6 @@ mod tests {
                 last_updated TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS tool_quality_records (
-                tool_key TEXT PRIMARY KEY,
-                backend TEXT,
-                server TEXT,
-                tool_name TEXT,
-                total_calls INTEGER DEFAULT 0,
-                success_count INTEGER DEFAULT 0,
-                total_execution_time_ms REAL DEFAULT 0,
-                recent_executions TEXT,
-                description_quality TEXT,
-                llm_flagged_count INTEGER DEFAULT 0,
-                description_hash TEXT,
-                first_seen TEXT,
-                last_updated TEXT
-            );
             ",
         )
         .unwrap();
@@ -922,7 +911,7 @@ mod tests {
         let conn = setup_db();
         let store = EvolveStore::new(conn);
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats(&[]).unwrap();
         assert_eq!(stats.total_analyses, 0);
         assert_eq!(stats.sessions_analyzed, 0);
     }
@@ -952,12 +941,54 @@ mod tests {
         let analysis = sample_analysis();
         store.save_analysis(&analysis).unwrap();
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats(&[]).unwrap();
         assert_eq!(stats.total_analyses, 1);
         assert_eq!(stats.sessions_analyzed, 1);
         assert_eq!(stats.sessions_pending, 1);
         assert_eq!(stats.total_suggestions, 1);
         assert_eq!(stats.total_tool_issues, 1);
+    }
+
+    #[test]
+    fn stats_excludes_evolution_agents() {
+        let conn = setup_db();
+        let store = EvolveStore::new(conn.clone());
+
+        {
+            let c = conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, created_at, updated_at, evolution_analyzed)
+                 VALUES ('s1', 'user-agent', X'', 0, '2024-01-01', '2024-01-01', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, created_at, updated_at, evolution_analyzed)
+                 VALUES ('s2', 'evolution-analyzer', X'', 0, '2024-01-02', '2024-01-02', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, created_at, updated_at, evolution_analyzed)
+                 VALUES ('s3', 'evolver-agent', X'', 0, '2024-01-03', '2024-01-03', 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Without exclusion, all 3 are pending
+        let stats = store.stats(&[]).unwrap();
+        assert_eq!(stats.sessions_pending, 3);
+
+        // With exclusion, only user session is pending
+        let stats = store
+            .stats(&[
+                "evolution-analyzer".to_string(),
+                "evolver-agent".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(stats.sessions_pending, 1);
+        assert_eq!(stats.sessions_analyzed, 0);
     }
 
     #[test]
@@ -1073,81 +1104,4 @@ mod tests {
         assert!(!loaded.is_active);
     }
 
-    fn sample_tool_quality_record() -> ToolQualityRecord {
-        ToolQualityRecord {
-            tool_key: "builtin::web_search".into(),
-            backend: "builtin".into(),
-            server: String::new(),
-            tool_name: "web_search".into(),
-            total_calls: 20,
-            success_count: 18,
-            total_execution_time_ms: 5000.0,
-            recent_executions: vec![ToolExecutionRecord {
-                timestamp: Utc::now(),
-                success: true,
-                execution_time_ms: 250.0,
-                error_message: None,
-            }],
-            description_quality: None,
-            llm_flagged_count: 0,
-            description_hash: None,
-            first_seen: Utc::now(),
-            last_updated: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn save_and_get_tool_quality_record() {
-        let conn = setup_db();
-        let store = EvolveStore::new(conn);
-        let rec = sample_tool_quality_record();
-
-        store.save_tool_quality_record(&rec).unwrap();
-        let loaded = store
-            .get_tool_quality_record("builtin::web_search")
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.total_calls, 20);
-        assert_eq!(loaded.success_count, 18);
-        assert_eq!(loaded.recent_executions.len(), 1);
-    }
-
-    #[test]
-    fn get_problematic_tools() {
-        let conn = setup_db();
-        let store = EvolveStore::new(conn);
-
-        // Healthy tool
-        let mut healthy = sample_tool_quality_record();
-        healthy.tool_key = "healthy".into();
-        healthy.total_calls = 10;
-        healthy.recent_executions = (0..10)
-            .map(|_| ToolExecutionRecord {
-                timestamp: Utc::now(),
-                success: true,
-                execution_time_ms: 100.0,
-                error_message: None,
-            })
-            .collect();
-        store.save_tool_quality_record(&healthy).unwrap();
-
-        // Problematic tool
-        let mut bad = sample_tool_quality_record();
-        bad.tool_key = "bad_tool".into();
-        bad.total_calls = 10;
-        bad.success_count = 2;
-        bad.recent_executions = (0..10)
-            .map(|i| ToolExecutionRecord {
-                timestamp: Utc::now(),
-                success: i < 2,
-                execution_time_ms: 100.0,
-                error_message: if i >= 2 { Some("error".into()) } else { None },
-            })
-            .collect();
-        store.save_tool_quality_record(&bad).unwrap();
-
-        let problems = store.get_problematic_tools(5, 0.5).unwrap();
-        assert_eq!(problems.len(), 1);
-        assert_eq!(problems[0].tool_key, "bad_tool");
-    }
 }

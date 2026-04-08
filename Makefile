@@ -28,11 +28,11 @@ mem-check: ## Show current memory and recommended parallelism
 	@echo "Available: $(AVAILABLE_GB) GB | JOBS=$(JOBS) | TEST_THREADS=$(TEST_THREADS)"
 	@echo "Swap: $$(swapon --show=SIZE --noheadings 2>/dev/null || echo 'none')"
 
-test: ## Run full test suite (parallel workspace build, shared deps)
-	cargo test --workspace -j $(JOBS) -- --test-threads=$(TEST_THREADS)
+test: ## Run full test suite (nextest: process-per-test)
+	cargo nextest run --workspace --test-threads $(TEST_THREADS)
 
 test-quick: ## Run lib-only tests (faster, no integration tests)
-	cargo test --workspace --lib -j $(JOBS) -- --test-threads=$(TEST_THREADS)
+	cargo nextest run --workspace --lib --test-threads $(TEST_THREADS)
 
 clippy: ## Lint with clippy (warnings are errors)
 	cargo clippy --workspace --all-targets -- -D warnings

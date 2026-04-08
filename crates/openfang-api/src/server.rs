@@ -657,20 +657,16 @@ pub async fn build_router(
             axum::routing::get(routes::evolve_get_skill),
         )
         .route(
-            "/api/evolve/tools",
-            axum::routing::get(routes::evolve_list_tools),
-        )
-        .route(
-            "/api/evolve/tools/{key}",
-            axum::routing::get(routes::evolve_get_tool),
-        )
-        .route(
-            "/api/evolve/trigger/degradation",
-            axum::routing::post(routes::evolve_trigger_degradation),
-        )
-        .route(
             "/api/evolve/trigger/metrics",
             axum::routing::post(routes::evolve_trigger_metrics),
+        )
+        .route(
+            "/api/evolve/execute",
+            axum::routing::post(routes::evolve_execute),
+        )
+        .route(
+            "/api/evolve/execute-all",
+            axum::routing::post(routes::evolve_execute_all),
         )
         // Webhook trigger endpoints (external event injection)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))

@@ -10,12 +10,19 @@ pub mod correction;
 pub mod evolver;
 pub mod patch;
 pub mod prompt;
-pub mod quality;
 pub mod store;
 pub mod triggers;
 pub mod types;
 
 pub use types::*;
+
+/// Sentinel path value used for bundled (compile-time embedded) skills.
+pub const BUNDLED_PATH: &str = "<bundled>";
+
+/// Check if a skill record path refers to a bundled (non-disk) skill.
+pub fn is_bundled_path(path: &str) -> bool {
+    path == BUNDLED_PATH
+}
 
 use openfang_types::agent::AgentId;
 use openfang_types::config::EvolveConfig;
@@ -153,6 +160,8 @@ impl EvolveEngine {
     /// `send_message` is a callback provided by the kernel that sends a user
     /// message to the analyzer agent and returns `(response_text, input_tokens, output_tokens)`.
     /// `known_skill_ids` is used for fuzzy correction of hallucinated skill IDs.
+    /// `context_window` is the model's context window in tokens for budget-aware truncation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn analyze_session<F, Fut>(
         &self,
         session_id: &str,
@@ -160,6 +169,7 @@ impl EvolveEngine {
         messages: &[Message],
         available_skills: &[String],
         known_skill_ids: &[String],
+        context_window: usize,
         send_message: F,
     ) -> Result<ExecutionAnalysis, EvolveError>
     where
@@ -177,7 +187,8 @@ impl EvolveEngine {
             ));
         }
 
-        let user_content = prompt::build_user_message(messages, available_skills);
+        let user_content =
+            prompt::build_user_message(messages, available_skills, context_window);
         debug!(session_id, "sending analysis request to analyzer agent");
 
         let (response_text, input_tokens, output_tokens) = send_message(user_content)
@@ -233,6 +244,7 @@ impl EvolveEngine {
         session_loader: L,
         available_skills: &[String],
         known_skill_ids: &[String],
+        context_window: usize,
         mut send_message: S,
     ) -> Result<Vec<ExecutionAnalysis>, EvolveError>
     where
@@ -260,6 +272,10 @@ impl EvolveEngine {
             exclude_ids.push(id.to_string());
         }
 
+        // Mark evolution agents' own sessions as analyzed so they don't
+        // accumulate in the pending count (they'll never be analyzed anyway).
+        self.store.mark_agent_sessions_analyzed(&exclude_ids)?;
+
         let pending = self.store.list_unanalyzed_session_ids(config.batch_size, &exclude_ids)?;
         if pending.is_empty() {
             debug!("no unanalyzed sessions found");
@@ -281,7 +297,8 @@ impl EvolveEngine {
                 continue;
             }
 
-            let user_content = prompt::build_user_message(&messages, available_skills);
+            let user_content =
+                prompt::build_user_message(&messages, available_skills, context_window);
             debug!(session_id, "sending analysis request to analyzer agent");
 
             match send_message(user_content).await {
@@ -345,11 +362,23 @@ impl EvolveEngine {
     }
 
     /// Get aggregate statistics.
+    ///
+    /// Excludes evolution agents' own sessions from pending/analyzed counts
+    /// so the stats match what "Run Analysis" would actually process.
     pub fn stats(&self) -> Result<EvolveStats, EvolveError> {
-        self.store.stats()
+        let mut exclude_ids = Vec::new();
+        if let Some(id) = self.analyzer_agent_id() {
+            exclude_ids.push(id.to_string());
+        }
+        if let Some(id) = self.evolver_agent_id() {
+            exclude_ids.push(id.to_string());
+        }
+        self.store.stats(&exclude_ids)
     }
 
     /// Update skill record counters based on analysis judgments.
+    ///
+    /// Uses name-based lookup since analyzer judgments reference skills by name.
     fn update_counters_from_analysis(&self, analysis: &ExecutionAnalysis) {
         for judgment in &analysis.skill_judgments {
             let selections = 1u64;
@@ -365,7 +394,7 @@ impl EvolveEngine {
                 0
             };
 
-            if let Err(e) = self.store.update_skill_counters(
+            if let Err(e) = self.store.update_skill_counters_by_name(
                 &judgment.skill_name,
                 selections,
                 applied,
@@ -380,4 +409,62 @@ impl EvolveEngine {
             }
         }
     }
+
+    /// Import kernel-registered skills into the evolution store.
+    ///
+    /// Called once at kernel startup to ensure all installed skills have
+    /// records in the evolution store. Skips skills that already have records.
+    pub fn sync_skills_from_registry(&self, skills: Vec<SkillImport>) {
+        let mut synced = 0u32;
+        for skill in skills {
+            // Skip if a record already exists for this skill name
+            if let Ok(Some(_)) = self.store.get_skill_record_by_name(&skill.name) {
+                continue;
+            }
+
+            let uuid_short = uuid::Uuid::new_v4().to_string()[..8].to_string();
+            let now = chrono::Utc::now();
+
+            let record = SkillRecord {
+                skill_id: format!("{}__imp_{}", skill.name, uuid_short),
+                name: skill.name,
+                description: skill.description,
+                path: skill.path,
+                is_active: true,
+                category: SkillCategory::Reference,
+                tags: skill.tags,
+                visibility: SkillVisibility::Private,
+                creator_id: "system".into(),
+                lineage: SkillLineage {
+                    origin: SkillOrigin::Imported,
+                    generation: 0,
+                    parent_skill_ids: vec![],
+                    source_task_id: None,
+                    change_summary: "Imported from skill registry".into(),
+                    content_diff: String::new(),
+                    content_snapshot: std::collections::HashMap::new(),
+                    created_at: now,
+                    created_by: "system".into(),
+                },
+                tool_dependencies: skill.tools,
+                critical_tools: vec![],
+                total_selections: 0,
+                total_applied: 0,
+                total_completions: 0,
+                total_fallbacks: 0,
+                first_seen: now,
+                last_updated: now,
+            };
+
+            if let Err(e) = self.store.save_skill_record(&record) {
+                debug!(skill = %record.skill_id, error = %e, "failed to sync skill record");
+            } else {
+                synced += 1;
+            }
+        }
+        if synced > 0 {
+            info!(count = synced, "synced skills from registry into evolution store");
+        }
+    }
+
 }

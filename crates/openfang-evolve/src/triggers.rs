@@ -1,13 +1,11 @@
 //! Evolution triggers and anti-loop mechanisms.
 //!
-//! Three independent triggers feed into the SkillEvolver pipeline:
+//! Two independent triggers feed into the SkillEvolver pipeline:
 //! 1. Post-Analysis (synchronous) — after analysis produces suggestions
-//! 2. Tool Degradation (background) — when tools degrade, find dependent skills
-//! 3. Metric Monitor (background) — periodic skill health checks
+//! 2. Metric Monitor (background) — periodic skill health checks
 
 use crate::store::EvolveStore;
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -31,12 +29,6 @@ pub const MIN_APPLIED_FOR_DERIVED: f64 = 0.25;
 
 /// Minimum total_selections before a skill is eligible for metric checks.
 pub const MIN_SELECTIONS: u64 = 5;
-
-/// Minimum total_calls before a tool is flagged as problematic.
-pub const PROBLEMATIC_MIN_CALLS: u64 = 5;
-
-/// Success rate below this flags a tool as problematic.
-pub const PROBLEMATIC_SUCCESS_RATE: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Trigger 1: Post-Analysis (Synchronous)
@@ -80,107 +72,7 @@ pub fn build_contexts_from_analysis(
 }
 
 // ---------------------------------------------------------------------------
-// Trigger 2: Tool Degradation (Background)
-// ---------------------------------------------------------------------------
-
-/// State tracking for tool degradation trigger anti-loop.
-#[derive(Debug, Default)]
-pub struct ToolDegradationState {
-    /// Map of tool_key -> set of skill_ids already evaluated for that tool.
-    pub addressed: HashMap<String, HashSet<String>>,
-}
-
-impl ToolDegradationState {
-    /// Prune tools that have recovered (no longer in problematic list).
-    pub fn prune_recovered(&mut self, problematic_keys: &HashSet<String>) {
-        self.addressed.retain(|key, _| problematic_keys.contains(key));
-    }
-
-    /// Check if a skill has already been addressed for a given tool.
-    pub fn is_addressed(&self, tool_key: &str, skill_id: &str) -> bool {
-        self.addressed
-            .get(tool_key)
-            .map(|set| set.contains(skill_id))
-            .unwrap_or(false)
-    }
-
-    /// Mark a skill as addressed for a given tool.
-    pub fn mark_addressed(&mut self, tool_key: &str, skill_id: &str) {
-        self.addressed
-            .entry(tool_key.to_string())
-            .or_default()
-            .insert(skill_id.to_string());
-    }
-}
-
-/// Find skills that depend on problematic tools and build FIX contexts.
-///
-/// Returns candidate contexts that should go through LLM confirmation.
-pub fn process_tool_degradation(
-    problematic_tools: &[ToolQualityRecord],
-    store: &EvolveStore,
-    state: &mut ToolDegradationState,
-) -> Vec<EvolutionContext> {
-    let problematic_keys: HashSet<String> = problematic_tools
-        .iter()
-        .map(|t| t.tool_key.clone())
-        .collect();
-
-    // Prune tools that have recovered
-    state.prune_recovered(&problematic_keys);
-
-    let active_skills = match store.list_skill_records(true) {
-        Ok(skills) => skills,
-        Err(_) => return vec![],
-    };
-
-    let mut contexts = Vec::new();
-
-    for tool in problematic_tools {
-        for skill in &active_skills {
-            // Skip if already addressed
-            if state.is_addressed(&tool.tool_key, &skill.skill_id) {
-                continue;
-            }
-
-            // Check if skill depends on this tool
-            if !skill.tool_dependencies.contains(&tool.tool_key)
-                && !skill
-                    .tool_dependencies
-                    .iter()
-                    .any(|d| d.contains(&tool.tool_name))
-            {
-                continue;
-            }
-
-            contexts.push(EvolutionContext {
-                evolution_type: SuggestionKind::Fix,
-                target_skills: vec![skill.clone()],
-                direction: format!(
-                    "Tool '{}' has degraded (success rate: {:.0}%, {} consecutive failures). \
-                     Adapt skill to handle tool failures or suggest alternative approaches.",
-                    tool.tool_key,
-                    tool.recent_success_rate() * 100.0,
-                    tool.consecutive_failures()
-                ),
-                category: None,
-                trigger_context: format!(
-                    "Tool degradation: {} (total calls: {}, success rate: {:.0}%)",
-                    tool.tool_key, tool.total_calls, tool.recent_success_rate() * 100.0
-                ),
-                source_analysis: None,
-            });
-
-            // Mark as addressed regardless of whether evolution proceeds
-            state.mark_addressed(&tool.tool_key, &skill.skill_id);
-        }
-    }
-
-    contexts
-}
-
-// ---------------------------------------------------------------------------
-// Trigger 3: Metric Monitor (Background)
+// Trigger 2: Metric Monitor (Background)
 // ---------------------------------------------------------------------------
 
 /// Diagnose a skill's health based on cumulative metrics.
@@ -356,22 +248,6 @@ mod tests {
         let skill = make_skill("mediocre__imp_1234", 10, 6, 4, 2);
         let (kind, _) = diagnose_skill_health(&skill).unwrap();
         assert_eq!(kind, SuggestionKind::Derived);
-    }
-
-    #[test]
-    fn tool_degradation_state_lifecycle() {
-        let mut state = ToolDegradationState::default();
-
-        // Mark addressed
-        state.mark_addressed("web_search", "skill_1");
-        assert!(state.is_addressed("web_search", "skill_1"));
-        assert!(!state.is_addressed("web_search", "skill_2"));
-
-        // Prune recovered tools
-        let still_bad = HashSet::from(["shell_exec".to_string()]);
-        state.prune_recovered(&still_bad);
-        // web_search recovered, so its entries should be gone
-        assert!(!state.is_addressed("web_search", "skill_1"));
     }
 
     #[test]

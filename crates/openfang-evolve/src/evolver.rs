@@ -300,6 +300,13 @@ fn build_evolution_prompt(context: &EvolutionContext) -> String {
 }
 
 fn read_skill_content(skill_dir: &Path) -> String {
+    if skill_dir == Path::new(crate::BUNDLED_PATH) {
+        warn!(
+            "attempted to read skill from <bundled> path; \
+             caller should have materialized first"
+        );
+        return String::new();
+    }
     let skill_md = skill_dir.join("SKILL.md");
     std::fs::read_to_string(&skill_md).unwrap_or_default()
 }

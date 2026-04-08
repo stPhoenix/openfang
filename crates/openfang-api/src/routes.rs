@@ -11775,6 +11775,9 @@ pub async fn evolve_set_config(
             if model_changed && state.kernel.evolve_engine.analyzer_agent_id().is_some() {
                 let _ = state.kernel.spawn_evolve_agent();
             }
+            if model_changed && state.kernel.evolve_engine.evolver_agent_id().is_some() {
+                let _ = state.kernel.spawn_evolver_agent();
+            }
             (StatusCode::OK, Json(serde_json::json!({ "status": "updated" })))
         }
         Err(e) => (
@@ -12015,64 +12018,6 @@ pub async fn evolve_get_skill(
     }
 }
 
-/// GET /api/evolve/tools — List tool quality records.
-pub async fn evolve_list_tools(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    match state.kernel.evolve_engine.store().list_tool_quality_records() {
-        Ok(records) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&records).unwrap_or_default()),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("{e}") })),
-        ),
-    }
-}
-
-/// GET /api/evolve/tools/:key — Get a single tool quality record.
-pub async fn evolve_get_tool(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(tool_key): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    match state
-        .kernel
-        .evolve_engine
-        .store()
-        .get_tool_quality_record(&tool_key)
-    {
-        Ok(Some(record)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&record).unwrap_or_default()),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "tool quality record not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("{e}") })),
-        ),
-    }
-}
-
-/// POST /api/evolve/trigger/degradation — Manually trigger tool degradation check.
-pub async fn evolve_trigger_degradation(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let candidates = openfang_evolve::triggers::check_metric_triggers(
-        state.kernel.evolve_engine.store(),
-    );
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "candidates": candidates.len(),
-            "message": format!("{} degradation candidates found", candidates.len())
-        })),
-    )
-}
-
 /// POST /api/evolve/trigger/metrics — Manually trigger skill metric check.
 pub async fn evolve_trigger_metrics(
     State(state): State<Arc<AppState>>,
@@ -12085,6 +12030,154 @@ pub async fn evolve_trigger_metrics(
         Json(serde_json::json!({
             "candidates": candidates.len(),
             "message": format!("{} metric check candidates found", candidates.len())
+        })),
+    )
+}
+
+/// POST /api/evolve/execute — Execute a single evolution suggestion.
+pub async fn evolve_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+
+    let kind_str = body["kind"].as_str().unwrap_or("fix");
+    let kind = match kind_str {
+        "fix" => openfang_evolve::types::SuggestionKind::Fix,
+        "derived" => openfang_evolve::types::SuggestionKind::Derived,
+        "captured" => openfang_evolve::types::SuggestionKind::Captured,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("unknown kind: {kind_str}") })),
+            );
+        }
+    };
+
+    let description = body["description"]
+        .as_str()
+        .unwrap_or("Evolution triggered from UI")
+        .to_string();
+
+    let analysis_id = body["analysis_id"]
+        .as_str()
+        .and_then(|s| s.parse::<openfang_evolve::AnalysisId>().ok());
+
+    // Look up the target skill record.
+    let target_skills = if let Some(target) = body["target_skill"].as_str() {
+        let store = state.kernel.evolve_engine.store();
+        // Try by ID first, then by name.
+        let record = store
+            .get_skill_record(target)
+            .ok()
+            .flatten()
+            .or_else(|| store.get_skill_record_by_name(target).ok().flatten());
+        record.into_iter().collect()
+    } else {
+        vec![]
+    };
+
+    let context = openfang_evolve::EvolutionContext {
+        evolution_type: kind,
+        target_skills,
+        direction: description,
+        category: None,
+        trigger_context: "Manual trigger from UI".to_string(),
+        source_analysis: analysis_id,
+    };
+
+    match state.kernel.execute_evolution(context).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&result).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /api/evolve/execute-all — Execute all suggestions from an analysis.
+pub async fn evolve_execute_all(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+
+    let analysis_id = match body["analysis_id"].as_str() {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "analysis_id is required" })),
+            );
+        }
+    };
+
+    let analysis = match state.kernel.evolve_engine.store().get_analysis(&analysis_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "analysis not found" })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            );
+        }
+    };
+
+    let contexts = openfang_evolve::triggers::build_contexts_from_analysis(
+        &analysis,
+        state.kernel.evolve_engine.store(),
+    );
+
+    let total = contexts.len();
+    let mut succeeded = 0u32;
+    let mut failed = 0u32;
+    let mut results = Vec::new();
+
+    for context in contexts {
+        match state.kernel.execute_evolution(context).await {
+            Ok(result) => {
+                succeeded += 1;
+                results.push(serde_json::json!({
+                    "skill_id": result.evolved_skill_id,
+                    "summary": result.change_summary,
+                    "success": true,
+                }));
+            }
+            Err(e) => {
+                failed += 1;
+                results.push(serde_json::json!({
+                    "error": format!("{e}"),
+                    "success": false,
+                }));
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "executed": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
         })),
     )
 }

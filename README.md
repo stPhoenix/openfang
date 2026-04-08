@@ -47,6 +47,7 @@
 - **Context analysis** — `/context` command with token breakdown, suggestions, and grid visualization. Always-visible context pressure indicator in the chat footer using the model's actual context window from the catalog.
 - **Chat message persistence** — User messages are now pre-saved to SQLite before the LLM call, so they survive provider errors, timeouts, and page refreshes.
 - **Docker dev environment** — `docker-compose.dev.yml` with live code editing, build caching, and memory-capped containers.
+- **Skill evolution engine** — `openfang-evolve` crate with execution analysis, skill health diagnostics, metric-driven triggers, and an evolver agent that generates improved skill versions with full lineage tracking. Dashboard Evolution tab with graph visualization.
 - **Bug fixes** — Resolved 10+ issues (#771, #811, #752, #772, #661, #875, #872, #867, #824, #833, #766).
 
 ---
@@ -246,9 +247,57 @@ OpenFang doesn't bolt security on after the fact. Every layer is independently t
 
 ---
 
+## Skill Evolution Engine
+
+OpenFang agents don't just execute — they **evolve**. The `openfang-evolve` crate implements a closed-loop system that analyzes agent behavior, identifies patterns, and improves skills over time.
+
+### How It Works
+
+```
+Session Complete ──► Execution Analyzer ──► Skill Judgments ──► Metric Triggers
+                          │                      │                    │
+                          ▼                      ▼                    ▼
+                    Suggestions ◄──── Skill Health Diagnostics ──► Evolver Agent
+                                                                      │
+                                                                      ▼
+                                                               New Skill Version
+                                                              (with lineage tracking)
+```
+
+1. **Execution Analyzer** — A dedicated agent reviews completed sessions. It produces structured analyses: task completion, tool issues, skill judgments (good/poor/not_applicable), and evolution suggestions. Uses any configured LLM provider.
+
+2. **Skill Judgments** — Each analysis scores the skills used in a session. Counters track selections, applications, completions, and fallbacks per skill over time.
+
+3. **Metric Triggers** — Automatic health diagnostics flag underperforming skills: low effectiveness (selected but not applied), high fallback rates, or poor completion ratios.
+
+4. **Evolver Agent** — Takes suggestions and health diagnostics, generates improved skill versions with diffs, change summaries, and full lineage tracking (parent IDs, generation number, origin).
+
+5. **Confirmation Loop** — Evolved skills go through validation before replacing active versions.
+
+### Dashboard
+
+The Evolution tab in the dashboard provides:
+
+- **Overview** — Total analyses, pending sessions, completion rate, suggestions count
+- **Skills Library** — All tracked skills with scores, selection/completion rates, and version counts. Filter by origin (bundled, captured, derived, evolved) or search by name.
+- **Skill Detail** — Evolution graph visualization showing the lineage tree across generations. Click nodes to inspect individual versions, view diffs, and change summaries.
+- **Suggestions** — Pending evolution suggestions with priority levels and target skills
+
+### Configuration
+
+```toml
+[evolve]
+enabled = true
+provider = "lmstudio"           # Any configured LLM provider
+model = "qwen3.5-27b"           # Model for analysis
+batch_size = 20                  # Sessions per analysis run
+```
+
+---
+
 ## Architecture
 
-14 Rust crates. 137,728 lines of code. Modular kernel design.
+15 Rust crates. 137,728 lines of code. Modular kernel design.
 
 ```
 openfang-kernel      Orchestration, workflows, metering, RBAC, scheduler, budget tracking
@@ -256,6 +305,7 @@ openfang-runtime     Agent loop, 3 LLM drivers, 53 tools, WASM sandbox, MCP, A2A
 openfang-api         140+ REST/WS/SSE endpoints, OpenAI-compatible API, dashboard
 openfang-channels    40 messaging adapters with rate limiting, DM/group policies
 openfang-memory      SQLite persistence, vector embeddings, canonical sessions, compaction
+openfang-evolve      Execution analysis, skill evolution, metric triggers, lineage tracking
 openfang-types       Core types, taint tracking, Ed25519 manifest signing, model catalog
 openfang-skills      60 bundled skills, SKILL.md parser, FangHub marketplace
 openfang-hands       7 autonomous Hands, HAND.toml parser, lifecycle management

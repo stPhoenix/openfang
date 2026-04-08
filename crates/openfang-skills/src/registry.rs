@@ -256,6 +256,69 @@ impl SkillRegistry {
         Ok(())
     }
 
+    /// Get the skills directory path.
+    pub fn skills_dir(&self) -> &Path {
+        &self.skills_dir
+    }
+
+    /// Materialize a bundled skill to disk, making it a mutable user skill.
+    ///
+    /// Writes the bundled SKILL.md content to `skills_dir/<name>/SKILL.md`,
+    /// auto-converts it via the existing SKILL.md → skill.toml pipeline,
+    /// and updates the registry entry to point to the new disk path.
+    ///
+    /// Returns the new skill directory path on success.
+    pub fn materialize_bundled(&mut self, name: &str) -> Result<PathBuf, SkillError> {
+        // 1. Check that this skill exists and is bundled
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+        if skill.path != Path::new("<bundled>") {
+            return Err(SkillError::InvalidManifest(format!(
+                "skill '{}' is not bundled (path: {})",
+                name,
+                skill.path.display()
+            )));
+        }
+
+        // 2. Get the bundled content
+        let content = bundled::get_bundled_content(name).ok_or_else(|| {
+            SkillError::NotFound(format!("bundled content not found for '{}'", name))
+        })?;
+
+        // 3. Write to skills_dir/<name>/SKILL.md
+        let skill_dir = self.skills_dir.join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(skill_dir.join("SKILL.md"), content)?;
+
+        // 4. Auto-convert SKILL.md → skill.toml + prompt_context.md
+        if openclaw_compat::detect_skillmd(&skill_dir) {
+            let converted = openclaw_compat::convert_skillmd(&skill_dir)
+                .map_err(|e| SkillError::InvalidManifest(e.to_string()))?;
+            openclaw_compat::write_openfang_manifest(&skill_dir, &converted.manifest)?;
+            openclaw_compat::write_prompt_context(&skill_dir, &converted.prompt_context)?;
+        }
+
+        // 5. Reload from disk (temporarily unfreeze if needed)
+        let was_frozen = self.frozen;
+        if was_frozen {
+            self.frozen = false;
+        }
+        let result = self.load_skill(&skill_dir);
+        if was_frozen {
+            self.frozen = true;
+        }
+        result?;
+
+        info!(
+            skill = %name,
+            path = %skill_dir.display(),
+            "materialized bundled skill to disk for evolution"
+        );
+        Ok(skill_dir)
+    }
+
     /// Get all tool definitions from all enabled skills.
     pub fn all_tool_definitions(&self) -> Vec<SkillToolDef> {
         self.skills
@@ -558,6 +621,73 @@ input_schema = {{ type = "object" }}
 
         // Verify that skill.toml was written
         assert!(skill_dir.join("skill.toml").exists());
+    }
+
+    #[test]
+    fn test_materialize_bundled_skill() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+
+        // Load bundled skills first
+        let bundled_count = registry.load_bundled();
+        assert!(bundled_count > 0);
+
+        // "github" should be bundled
+        let skill = registry.get("github").unwrap();
+        assert_eq!(skill.path, PathBuf::from("<bundled>"));
+
+        // Materialize it
+        let new_path = registry.materialize_bundled("github").unwrap();
+        assert_eq!(new_path, dir.path().join("github"));
+
+        // Verify files exist on disk
+        assert!(new_path.join("skill.toml").exists());
+
+        // Registry entry should now point to real path
+        let skill = registry.get("github").unwrap();
+        assert_eq!(skill.path, new_path);
+        assert_ne!(skill.path, PathBuf::from("<bundled>"));
+    }
+
+    #[test]
+    fn test_materialize_non_bundled_fails() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill(dir.path(), "user-skill");
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        // Trying to materialize a non-bundled skill should fail
+        let result = registry.materialize_bundled("user-skill");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_materialize_nonexistent_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+
+        let result = registry.materialize_bundled("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_materialize_works_when_frozen() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_bundled();
+        registry.freeze();
+
+        // Should succeed even when frozen
+        let result = registry.materialize_bundled("github");
+        assert!(result.is_ok());
+
+        // Registry should still be frozen after
+        assert!(registry.is_frozen());
+
+        // Skill should point to disk
+        let skill = registry.get("github").unwrap();
+        assert_ne!(skill.path, PathBuf::from("<bundled>"));
     }
 
     /// #851: Global skills should be visible via snapshot even without workspace skills.

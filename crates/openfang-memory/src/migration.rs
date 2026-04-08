@@ -435,25 +435,8 @@ fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_sr_active ON skill_records(is_active);
         CREATE INDEX IF NOT EXISTS idx_sr_name ON skill_records(name);
 
-        -- Tool quality tracking records
-        CREATE TABLE IF NOT EXISTS tool_quality_records (
-            tool_key TEXT PRIMARY KEY,
-            backend TEXT,
-            server TEXT,
-            tool_name TEXT,
-            total_calls INTEGER DEFAULT 0,
-            success_count INTEGER DEFAULT 0,
-            total_execution_time_ms REAL DEFAULT 0,
-            recent_executions TEXT,
-            description_quality TEXT,
-            llm_flagged_count INTEGER DEFAULT 0,
-            description_hash TEXT,
-            first_seen TEXT,
-            last_updated TEXT
-        );
-
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
-        VALUES (10, datetime('now'), 'Add skill records and tool quality records tables');
+        VALUES (10, datetime('now'), 'Add skill records table');
         ",
     )?;
     Ok(())

@@ -189,6 +189,14 @@ pub fn parse_bundled(name: &str, content: &str) -> Result<SkillManifest, crate::
     Ok(converted.manifest)
 }
 
+/// Look up bundled SKILL.md content by name. Returns `None` if not a bundled skill.
+pub fn get_bundled_content(name: &str) -> Option<&'static str> {
+    bundled_skills()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +262,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_get_bundled_content() {
+        // Known bundled skill
+        let content = get_bundled_content("github");
+        assert!(content.is_some(), "github should be a bundled skill");
+        assert!(content.unwrap().contains("github"), "content should mention github");
+
+        // Non-existent skill
+        assert!(get_bundled_content("nonexistent-skill-xyz").is_none());
     }
 
     #[test]

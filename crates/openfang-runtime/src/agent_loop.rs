@@ -979,7 +979,6 @@ pub async fn run_agent_loop(
                             }
                         }
                     };
-
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
                         let ctx = crate::hooks::HookContext {
@@ -2239,7 +2238,6 @@ pub async fn run_agent_loop_streaming(
                             }
                         }
                     };
-
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
                         let ctx = crate::hooks::HookContext {

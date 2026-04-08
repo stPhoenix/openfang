@@ -1085,6 +1085,29 @@ impl OpenFangKernel {
             memory.usage_conn(),
         );
 
+        // Sync installed skills into the evolution store so the Skills Library
+        // is populated from the start (not only after an analysis run).
+        {
+            let imports: Vec<openfang_evolve::SkillImport> = skill_registry
+                .list()
+                .iter()
+                .map(|s| openfang_evolve::SkillImport {
+                    name: s.manifest.skill.name.clone(),
+                    description: s.manifest.skill.description.clone(),
+                    path: s.path.to_string_lossy().to_string(),
+                    tags: s.manifest.skill.tags.clone(),
+                    tools: s
+                        .manifest
+                        .tools
+                        .provided
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect(),
+                })
+                .collect();
+            evolve_engine.sync_skills_from_registry(imports);
+        }
+
         let kernel = Self {
             config,
             registry: AgentRegistry::new(),
@@ -5881,6 +5904,129 @@ impl OpenFangKernel {
         self.spawn_evolve_agent()
     }
 
+    /// Build the agent manifest for the skill evolver (separate from analyzer).
+    fn build_evolver_agent_manifest(&self) -> openfang_types::agent::AgentManifest {
+        let config = self.evolve_engine.config();
+        openfang_types::agent::AgentManifest {
+            name: "evolution-evolver".to_string(),
+            version: "0.1.0".to_string(),
+            description: "Evolves skills by generating patches and new skill content based on analysis suggestions".to_string(),
+            author: "openfang-evolve".to_string(),
+            module: "builtin:chat".to_string(),
+            model: openfang_types::agent::ModelConfig {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                max_tokens: 16384,
+                temperature: 0.2,
+                system_prompt: openfang_evolve::prompt::evolver_system_prompt(),
+                api_key_env: config.api_key.clone(),
+                base_url: config.base_url.clone(),
+            },
+            tags: vec!["system".to_string(), "evolution".to_string(), "evolver".to_string()],
+            generate_identity_files: false,
+            ..Default::default()
+        }
+    }
+
+    /// Spawn (or respawn) the evolution evolver agent.
+    pub fn spawn_evolver_agent(&self) -> KernelResult<AgentId> {
+        if let Some(old_id) = self.evolve_engine.evolver_agent_id() {
+            self.evolve_engine.clear_evolver_agent();
+            let _ = self.registry.remove(old_id);
+        }
+
+        if let Some(entry) = self.registry.find_by_name("evolution-evolver") {
+            let _ = self.registry.remove(entry.id);
+        }
+
+        let manifest = self.build_evolver_agent_manifest();
+        let fixed_id = AgentId::from_string("evolution-evolver");
+        let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_id))?;
+        self.evolve_engine.set_evolver_agent(agent_id);
+        tracing::info!(agent_id = %agent_id, "evolution evolver agent spawned");
+        Ok(agent_id)
+    }
+
+    /// Ensure the evolution evolver agent exists, spawning it if necessary.
+    pub fn ensure_evolver_agent(&self) -> KernelResult<AgentId> {
+        if let Some(id) = self.evolve_engine.evolver_agent_id() {
+            if self.registry.get(id).is_some() {
+                return Ok(id);
+            }
+        }
+        self.spawn_evolver_agent()
+    }
+
+    /// Materialize any bundled skills that are targets of evolution contexts.
+    ///
+    /// For each target skill with path `"<bundled>"`:
+    /// 1. Writes the embedded SKILL.md to `~/.openfang/skills/<name>/`
+    /// 2. Updates the skill registry entry to point to the new path
+    /// 3. Updates the evolution store record with the new path
+    /// 4. Updates the in-flight `SkillRecord.path` so the evolver sees it
+    fn materialize_bundled_targets(
+        &self,
+        contexts: &mut [openfang_evolve::EvolutionContext],
+    ) {
+        for ctx in contexts.iter_mut() {
+            for skill in ctx.target_skills.iter_mut() {
+                if !openfang_evolve::is_bundled_path(&skill.path) {
+                    continue;
+                }
+
+                // Materialize to disk via the skill registry
+                let new_path = {
+                    let mut reg = match self.skill_registry.write() {
+                        Ok(reg) => reg,
+                        Err(e) => {
+                            warn!(
+                                skill = %skill.name,
+                                error = %e,
+                                "failed to acquire registry lock for materialization"
+                            );
+                            continue;
+                        }
+                    };
+                    match reg.materialize_bundled(&skill.name) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            warn!(
+                                skill = %skill.name,
+                                error = %e,
+                                "failed to materialize bundled skill for evolution"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                let new_path_str = new_path.to_string_lossy().to_string();
+
+                // Update the evolution store record
+                if let Err(e) = self
+                    .evolve_engine
+                    .store()
+                    .update_skill_path_by_name(&skill.name, &new_path_str)
+                {
+                    warn!(
+                        skill = %skill.name,
+                        error = %e,
+                        "failed to update skill path in evolution store"
+                    );
+                }
+
+                // Update the in-flight SkillRecord so the evolver sees the real path
+                skill.path = new_path_str;
+
+                info!(
+                    skill = %skill.name,
+                    path = %new_path.display(),
+                    "shadow-copied bundled skill for evolution"
+                );
+            }
+        }
+    }
+
     /// Analyze a single session via the evolution analyzer agent.
     pub async fn evolve_analyze_session(
         &self,
@@ -5917,6 +6063,15 @@ impl OpenFangKernel {
             .map(|reg| reg.skill_names())
             .unwrap_or_default();
 
+        // Look up the model's context window for budget-aware prompt truncation
+        let evolve_config = self.evolve_engine.config();
+        let context_window = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|cat| cat.find_model(&evolve_config.model).map(|e| e.context_window as usize))
+            .unwrap_or(openfang_evolve::prompt::DEFAULT_CONTEXT_WINDOW);
+
         self.evolve_engine
             .analyze_session(
                 session_id,
@@ -5924,6 +6079,7 @@ impl OpenFangKernel {
                 messages,
                 available_skills,
                 &known_skill_ids,
+                context_window,
                 send_fn,
             )
             .await
@@ -5964,9 +6120,318 @@ impl OpenFangKernel {
             .map(|reg| reg.skill_names())
             .unwrap_or_default();
 
+        // Look up the model's context window for budget-aware prompt truncation
+        let evolve_config = self.evolve_engine.config();
+        let context_window = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|cat| cat.find_model(&evolve_config.model).map(|e| e.context_window as usize))
+            .unwrap_or(openfang_evolve::prompt::DEFAULT_CONTEXT_WINDOW);
+
         self.evolve_engine
-            .analyze_unanalyzed(session_loader, available_skills, &known_skill_ids, send_fn)
+            .analyze_unanalyzed(session_loader, available_skills, &known_skill_ids, context_window, send_fn)
             .await
+    }
+
+    /// Execute a single skill evolution from an `EvolutionContext`.
+    ///
+    /// Full pipeline: materialize bundled targets → spawn evolver agent →
+    /// run LLM evolution loop → apply patch → persist new SkillRecord →
+    /// deactivate parents → reload skill in registry.
+    pub async fn execute_evolution(
+        &self,
+        mut context: openfang_evolve::EvolutionContext,
+    ) -> Result<openfang_evolve::EvolutionResult, openfang_evolve::EvolveError> {
+        use openfang_evolve::types::{SkillLineage, SkillOrigin, SuggestionKind};
+
+        if !self.evolve_engine.is_enabled() {
+            return Err(openfang_evolve::EvolveError::NotEnabled);
+        }
+
+        // Materialize any bundled skills so the evolver has real files on disk.
+        self.materialize_bundled_targets(std::slice::from_mut(&mut context));
+
+        // Determine the skill directory for the evolution.
+        let skills_dir = self.config.home_dir.join("skills");
+        let skill_dir = match context.evolution_type {
+            SuggestionKind::Fix => {
+                // Fix modifies the existing directory in-place.
+                context
+                    .target_skills
+                    .first()
+                    .map(|s| {
+                        let p = std::path::Path::new(&s.path);
+                        // path points to SKILL.md or the dir itself — normalize to dir
+                        if p.is_file() {
+                            p.parent().unwrap_or(p).to_path_buf()
+                        } else {
+                            p.to_path_buf()
+                        }
+                    })
+                    .ok_or_else(|| {
+                        openfang_evolve::EvolveError::Other(
+                            "FIX evolution requires a target skill".into(),
+                        )
+                    })?
+            }
+            SuggestionKind::Derived => {
+                let name = context
+                    .target_skills
+                    .first()
+                    .map(|s| format!("{}-derived", s.name))
+                    .unwrap_or_else(|| {
+                        format!("derived-{}", &uuid::Uuid::new_v4().to_string()[..8])
+                    });
+                let dir = skills_dir.join(&name);
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    openfang_evolve::EvolveError::Other(format!(
+                        "failed to create derived skill dir: {e}"
+                    ))
+                })?;
+                dir
+            }
+            SuggestionKind::Captured => {
+                let name = format!("captured-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+                let dir = skills_dir.join(&name);
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    openfang_evolve::EvolveError::Other(format!(
+                        "failed to create captured skill dir: {e}"
+                    ))
+                })?;
+                dir
+            }
+        };
+
+        // Ensure the evolver agent is spawned.
+        let evolver_id = self
+            .ensure_evolver_agent()
+            .map_err(|e| openfang_evolve::EvolveError::Other(e.to_string()))?;
+
+        // Reset session so each evolution starts with a clean context.
+        if let Err(e) = self.reset_session(evolver_id) {
+            warn!(agent_id = %evolver_id, "failed to reset evolver session: {e}");
+        }
+
+        let send_fn = |user_message: String| async move {
+            match self.send_message(evolver_id, &user_message).await {
+                Ok(result) => Ok((
+                    result.response,
+                    result.total_usage.input_tokens,
+                    result.total_usage.output_tokens,
+                )),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        info!(
+            evolution_type = %context.evolution_type,
+            target_count = context.target_skills.len(),
+            skill_dir = %skill_dir.display(),
+            "executing skill evolution"
+        );
+
+        let result =
+            openfang_evolve::evolver::evolve(&context, &skill_dir, send_fn).await?;
+
+        // --- Persist the evolution result ---
+
+        let parent_ids: Vec<String> = context
+            .target_skills
+            .iter()
+            .map(|s| s.skill_id.clone())
+            .collect();
+
+        let generation = match context.evolution_type {
+            SuggestionKind::Fix | SuggestionKind::Derived => {
+                context
+                    .target_skills
+                    .iter()
+                    .map(|s| s.lineage.generation)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            }
+            SuggestionKind::Captured => 0,
+        };
+
+        let origin = match context.evolution_type {
+            SuggestionKind::Fix => SkillOrigin::Fixed,
+            SuggestionKind::Derived => SkillOrigin::Derived,
+            SuggestionKind::Captured => SkillOrigin::Captured,
+        };
+
+        let config = self.evolve_engine.config();
+        let skill_name = context
+            .target_skills
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| result.evolved_skill_id.split("__").next().unwrap_or("unknown").to_string());
+
+        let new_record = openfang_evolve::SkillRecord {
+            skill_id: result.evolved_skill_id.clone(),
+            name: skill_name,
+            description: result.change_summary.clone(),
+            path: skill_dir.to_string_lossy().to_string(),
+            is_active: true,
+            category: context
+                .category
+                .clone()
+                .unwrap_or(
+                    context
+                        .target_skills
+                        .first()
+                        .map(|s| s.category.clone())
+                        .unwrap_or_default(),
+                ),
+            tags: context
+                .target_skills
+                .first()
+                .map(|s| s.tags.clone())
+                .unwrap_or_default(),
+            visibility: openfang_evolve::types::SkillVisibility::Private,
+            creator_id: "system".to_string(),
+            lineage: SkillLineage {
+                origin,
+                generation,
+                parent_skill_ids: parent_ids.clone(),
+                source_task_id: None,
+                change_summary: result.change_summary.clone(),
+                content_diff: result.content_diff.clone(),
+                content_snapshot: result.content_snapshot.clone(),
+                created_at: chrono::Utc::now(),
+                created_by: config.model.clone(),
+            },
+            tool_dependencies: context
+                .target_skills
+                .first()
+                .map(|s| s.tool_dependencies.clone())
+                .unwrap_or_default(),
+            critical_tools: context
+                .target_skills
+                .first()
+                .map(|s| s.critical_tools.clone())
+                .unwrap_or_default(),
+            total_selections: 0,
+            total_applied: 0,
+            total_completions: 0,
+            total_fallbacks: 0,
+            first_seen: chrono::Utc::now(),
+            last_updated: chrono::Utc::now(),
+        };
+
+        // Save the new evolved skill record.
+        if let Err(e) = self.evolve_engine.store().save_skill_record(&new_record) {
+            warn!(skill_id = %new_record.skill_id, error = %e, "failed to save evolved skill record");
+        }
+
+        // Deactivate parent skill(s).
+        for parent_id in &parent_ids {
+            if let Err(e) = self.evolve_engine.store().deactivate_skill(parent_id) {
+                warn!(parent_id = %parent_id, error = %e, "failed to deactivate parent skill");
+            }
+        }
+
+        // Reload the skill in the registry so agents see it immediately.
+        if let Ok(mut reg) = self.skill_registry.write() {
+            match reg.load_skill(&skill_dir) {
+                Ok(name) => {
+                    info!(skill = %name, "reloaded evolved skill into registry");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to reload evolved skill into registry");
+                }
+            }
+        }
+
+        info!(
+            skill_id = %result.evolved_skill_id,
+            summary = %result.change_summary,
+            "skill evolution completed"
+        );
+
+        Ok(result)
+    }
+
+    /// Execute evolution with an LLM confirmation gate (for background triggers).
+    ///
+    /// Sends a confirmation prompt to the analyzer agent. If the LLM confirms,
+    /// proceeds with evolution; otherwise skips.
+    pub async fn execute_evolution_with_confirmation(
+        &self,
+        mut context: openfang_evolve::EvolutionContext,
+    ) -> Result<openfang_evolve::EvolutionResult, openfang_evolve::EvolveError> {
+        let analyzer_id = self
+            .ensure_evolve_agent()
+            .map_err(|e| openfang_evolve::EvolveError::Other(e.to_string()))?;
+
+        // Read skill content for the confirmation prompt.
+        let skill_content = context
+            .target_skills
+            .first()
+            .and_then(|s| {
+                let p = std::path::Path::new(&s.path);
+                let skill_md = if p.is_file() { p.to_path_buf() } else { p.join("SKILL.md") };
+                std::fs::read_to_string(&skill_md).ok()
+            })
+            .unwrap_or_default();
+
+        // Truncate to avoid blowing context.
+        let truncated_content: String = skill_content.chars().take(3000).collect();
+
+        let proposed_type = match context.evolution_type {
+            openfang_evolve::types::SuggestionKind::Fix => "fix",
+            openfang_evolve::types::SuggestionKind::Derived => "derived",
+            openfang_evolve::types::SuggestionKind::Captured => "captured",
+        };
+
+        let skill_id = context
+            .target_skills
+            .first()
+            .map(|s| s.skill_id.as_str())
+            .unwrap_or("none");
+
+        let prompt = openfang_evolve::prompt::confirmation_prompt(
+            skill_id,
+            &truncated_content,
+            proposed_type,
+            &context.direction,
+            &context.trigger_context,
+            "", // recent_analyses — omitted for brevity in background triggers
+        );
+
+        let (proceed, reasoning, adjusted_direction) = match self
+            .send_message(analyzer_id, &prompt)
+            .await
+        {
+            Ok(result) => match openfang_evolve::confirm::parse_confirmation(&result.response) {
+                Ok(c) => (c.proceed, c.reasoning, c.adjusted_direction),
+                Err(_) => (false, "failed to parse confirmation response".into(), None),
+            },
+            Err(e) => {
+                warn!(error = %e, "confirmation LLM call failed, skipping evolution");
+                return Err(openfang_evolve::EvolveError::Other(
+                    format!("confirmation failed: {e}"),
+                ));
+            }
+        };
+
+        if !proceed {
+            info!(
+                reasoning = %reasoning,
+                "evolution declined by confirmation gate"
+            );
+            return Err(openfang_evolve::EvolveError::Other(format!(
+                "evolution declined: {reasoning}",
+            )));
+        }
+
+        // Apply adjusted direction if the LLM refined it.
+        if let Some(adjusted) = adjusted_direction {
+            context.direction = adjusted;
+        }
+
+        self.execute_evolution(context).await
     }
 
     /// Execute a cron job on demand and deliver its result.
@@ -6118,21 +6583,56 @@ impl OpenFangKernel {
                 }
             }
             CronAction::EvolveToolDegradation => {
-                // Tool degradation checks are logged but don't execute evolution yet
-                // (requires evolver agent integration in a future phase)
-                let count = openfang_evolve::triggers::check_metric_triggers(
+                if !self.evolve_engine.is_enabled() {
+                    self.cron_scheduler.record_success(job_id);
+                    return Ok("evolve engine not enabled".into());
+                }
+
+                let mut candidates = openfang_evolve::triggers::check_metric_triggers(
                     self.evolve_engine.store(),
-                )
-                .len();
-                let msg = format!("tool degradation check: {count} candidates found");
+                );
+                self.materialize_bundled_targets(&mut candidates);
+
+                let total = candidates.len();
+                let mut evolved = 0u32;
+                for ctx in candidates {
+                    match self.execute_evolution_with_confirmation(ctx).await {
+                        Ok(_) => evolved += 1,
+                        Err(e) => {
+                            debug!("tool degradation evolution skipped/failed: {e}");
+                        }
+                    }
+                }
+
+                let msg = format!(
+                    "tool degradation check: {total} candidates, {evolved} evolved"
+                );
                 self.cron_scheduler.record_success(job_id);
                 Ok(msg)
             }
             CronAction::EvolveMetricCheck => {
-                let candidates = openfang_evolve::triggers::check_metric_triggers(
+                if !self.evolve_engine.is_enabled() {
+                    self.cron_scheduler.record_success(job_id);
+                    return Ok("evolve engine not enabled".into());
+                }
+
+                let mut candidates = openfang_evolve::triggers::check_metric_triggers(
                     self.evolve_engine.store(),
                 );
-                let msg = format!("metric check: {} candidates found", candidates.len());
+                self.materialize_bundled_targets(&mut candidates);
+
+                let total = candidates.len();
+                let mut evolved = 0u32;
+                for ctx in candidates {
+                    match self.execute_evolution_with_confirmation(ctx).await {
+                        Ok(_) => evolved += 1,
+                        Err(e) => {
+                            debug!("metric check evolution skipped/failed: {e}");
+                        }
+                    }
+                }
+
+                let msg = format!("metric check: {total} candidates, {evolved} evolved");
                 self.cron_scheduler.record_success(job_id);
                 Ok(msg)
             }
@@ -7390,6 +7890,7 @@ impl KernelHandle for OpenFangKernel {
         })
         .to_string())
     }
+
 }
 
 // --- OFP Wire Protocol integration ---

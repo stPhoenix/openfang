@@ -3,10 +3,17 @@
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 
 /// Maximum number of messages to include in the analysis prompt.
-/// If a session exceeds this, we keep the first KEEP_HEAD and last KEEP_TAIL.
+/// If a session exceeds this, we keep the first 1/4 and last 3/4.
 const MAX_MESSAGES: usize = 100;
-const KEEP_HEAD: usize = 20;
-const KEEP_TAIL: usize = 60;
+
+/// Rough chars-per-token estimate (conservative — overestimates tokens slightly).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Tokens reserved for the system prompt (~1500 tokens) and model response headroom.
+const RESERVED_TOKENS: usize = 4000;
+
+/// Fallback context window when the model's actual limit is unknown.
+pub const DEFAULT_CONTEXT_WINDOW: usize = 32_000;
 
 /// Build the system prompt for the execution analyzer.
 pub fn system_prompt() -> String {
@@ -72,8 +79,87 @@ Rules:
         .to_string()
 }
 
+/// Per-field truncation limits, reduced progressively to fit the budget.
+struct FieldLimits {
+    tool_input: usize,
+    tool_result: usize,
+    thinking: usize,
+}
+
+impl FieldLimits {
+    fn default_limits() -> Self {
+        Self {
+            tool_input: 500,
+            tool_result: 1000,
+            thinking: 200,
+        }
+    }
+
+    fn reduced() -> Self {
+        Self {
+            tool_input: 200,
+            tool_result: 300,
+            thinking: 50,
+        }
+    }
+
+    fn minimal() -> Self {
+        Self {
+            tool_input: 100,
+            tool_result: 150,
+            thinking: 0,
+        }
+    }
+}
+
 /// Build the user message containing the conversation transcript and skill list.
-pub fn build_user_message(messages: &[Message], available_skills: &[String]) -> String {
+///
+/// `context_window` is the model's context window in tokens. The prompt is
+/// progressively truncated to fit within `(context_window - RESERVED_TOKENS)`.
+pub fn build_user_message(
+    messages: &[Message],
+    available_skills: &[String],
+    context_window: usize,
+) -> String {
+    let budget_tokens = context_window.saturating_sub(RESERVED_TOKENS);
+    let char_budget = budget_tokens * CHARS_PER_TOKEN;
+
+    // Phase 1: Try with default limits
+    let result = build_with_limits(messages, available_skills, MAX_MESSAGES, &FieldLimits::default_limits());
+    if result.len() <= char_budget {
+        return result;
+    }
+
+    // Phase 2: Reduce message count (keep head/tail ratio 1:3)
+    let reduced_max = MAX_MESSAGES / 2;
+    let result = build_with_limits(messages, available_skills, reduced_max, &FieldLimits::reduced());
+    if result.len() <= char_budget {
+        return result;
+    }
+
+    // Phase 3: Aggressive reduction
+    let minimal_max = 30;
+    let result = build_with_limits(messages, available_skills, minimal_max, &FieldLimits::minimal());
+    if result.len() <= char_budget {
+        return result;
+    }
+
+    // Phase 4: Hard-truncate as last resort
+    if result.len() > char_budget && char_budget > 20 {
+        let mut truncated = result[..char_budget - 15].to_string();
+        truncated.push_str("\n[TRUNCATED]\n");
+        return truncated;
+    }
+
+    result
+}
+
+fn build_with_limits(
+    messages: &[Message],
+    available_skills: &[String],
+    max_messages: usize,
+    limits: &FieldLimits,
+) -> String {
     let mut parts = Vec::new();
 
     // Skills section
@@ -93,7 +179,7 @@ pub fn build_user_message(messages: &[Message], available_skills: &[String]) -> 
     // Conversation transcript
     parts.push("## Conversation Transcript\n".to_string());
 
-    let msgs = truncate_messages(messages);
+    let msgs = truncate_messages(messages, max_messages);
     for msg in &msgs {
         let role_label = match msg.role {
             Role::User => "USER",
@@ -101,7 +187,7 @@ pub fn build_user_message(messages: &[Message], available_skills: &[String]) -> 
             Role::System => "SYSTEM",
         };
 
-        let content_text = extract_message_text(&msg.content);
+        let content_text = extract_message_text(&msg.content, limits);
         if !content_text.is_empty() {
             parts.push(format!("[{role_label}]\n{content_text}\n"));
         }
@@ -111,28 +197,36 @@ pub fn build_user_message(messages: &[Message], available_skills: &[String]) -> 
 }
 
 /// Truncate messages if they exceed the limit, keeping head and tail.
-fn truncate_messages(messages: &[Message]) -> Vec<&Message> {
-    if messages.len() <= MAX_MESSAGES {
+fn truncate_messages(messages: &[Message], max_messages: usize) -> Vec<&Message> {
+    if messages.len() <= max_messages {
         return messages.iter().collect();
     }
 
-    let mut result: Vec<&Message> = messages[..KEEP_HEAD].iter().collect();
-    result.push(&messages[KEEP_HEAD]); // placeholder position — we'll note truncation in text
-    let tail_start = messages.len() - KEEP_TAIL;
-    result.extend(messages[tail_start..].iter());
+    // Keep head/tail ratio at roughly 1:3
+    let keep_head = max_messages / 4;
+    let keep_tail = max_messages - keep_head;
+    let keep_head = keep_head.max(1);
+
+    let mut result: Vec<&Message> = messages[..keep_head].iter().collect();
+    let tail_start = messages.len().saturating_sub(keep_tail);
+    if tail_start > keep_head {
+        result.extend(messages[tail_start..].iter());
+    } else {
+        result.extend(messages[keep_head..].iter());
+    }
     result
 }
 
 /// Extract readable text from a MessageContent (either simple text or blocks).
-fn extract_message_text(content: &MessageContent) -> String {
+fn extract_message_text(content: &MessageContent, limits: &FieldLimits) -> String {
     match content {
         MessageContent::Text(text) => text.clone(),
-        MessageContent::Blocks(blocks) => extract_text_from_blocks(blocks),
+        MessageContent::Blocks(blocks) => extract_text_from_blocks(blocks, limits),
     }
 }
 
 /// Extract readable text content from content blocks.
-fn extract_text_from_blocks(content: &[ContentBlock]) -> String {
+fn extract_text_from_blocks(content: &[ContentBlock], limits: &FieldLimits) -> String {
     let mut parts = Vec::new();
     for block in content {
         match block {
@@ -147,9 +241,8 @@ fn extract_text_from_blocks(content: &[ContentBlock]) -> String {
                 } else {
                     serde_json::to_string(input).unwrap_or_default()
                 };
-                // Truncate very long tool inputs
-                let truncated = if input_str.len() > 500 {
-                    format!("{}... [truncated]", &input_str[..500])
+                let truncated = if input_str.len() > limits.tool_input {
+                    format!("{}... [truncated]", &input_str[..limits.tool_input])
                 } else {
                     input_str
                 };
@@ -162,9 +255,8 @@ fn extract_text_from_blocks(content: &[ContentBlock]) -> String {
                 ..
             } => {
                 let error_tag = if *is_error { " ERROR" } else { "" };
-                // Truncate very long tool results
-                let truncated = if result_content.len() > 1000 {
-                    format!("{}... [truncated]", &result_content[..1000])
+                let truncated = if result_content.len() > limits.tool_result {
+                    format!("{}... [truncated]", &result_content[..limits.tool_result])
                 } else {
                     result_content.clone()
                 };
@@ -173,9 +265,11 @@ fn extract_text_from_blocks(content: &[ContentBlock]) -> String {
                 ));
             }
             ContentBlock::Thinking { thinking } => {
-                // Include a brief note about thinking but not the full content
-                let preview = if thinking.len() > 200 {
-                    format!("{}...", &thinking[..200])
+                if limits.thinking == 0 {
+                    continue;
+                }
+                let preview = if thinking.len() > limits.thinking {
+                    format!("{}...", &thinking[..limits.thinking])
                 } else {
                     thinking.clone()
                 };
@@ -477,7 +571,7 @@ mod tests {
     #[test]
     fn build_user_message_no_skills() {
         let msgs = vec![test_msg("Hello")];
-        let result = build_user_message(&msgs, &[]);
+        let result = build_user_message(&msgs, &[], 200_000);
         assert!(result.contains("None"));
         assert!(result.contains("[USER]"));
         assert!(result.contains("Hello"));
@@ -487,7 +581,7 @@ mod tests {
     fn build_user_message_with_skills() {
         let msgs = vec![];
         let skills = vec!["docker".to_string(), "git-expert".to_string()];
-        let result = build_user_message(&msgs, &skills);
+        let result = build_user_message(&msgs, &skills, 200_000);
         assert!(result.contains("- docker"));
         assert!(result.contains("- git-expert"));
     }
@@ -495,16 +589,43 @@ mod tests {
     #[test]
     fn truncate_under_limit() {
         let msgs: Vec<Message> = (0..50).map(|i| test_msg(&format!("msg {i}"))).collect();
-        let result = truncate_messages(&msgs);
+        let result = truncate_messages(&msgs, MAX_MESSAGES);
         assert_eq!(result.len(), 50);
     }
 
     #[test]
     fn truncate_over_limit() {
         let msgs: Vec<Message> = (0..200).map(|i| test_msg(&format!("msg {i}"))).collect();
-        let result = truncate_messages(&msgs);
-        // KEEP_HEAD (20) + 1 (placeholder) + KEEP_TAIL (60) = 81
-        assert_eq!(result.len(), 81);
+        let result = truncate_messages(&msgs, MAX_MESSAGES);
+        // KEEP_HEAD (25) + KEEP_TAIL (75) = 100
+        assert_eq!(result.len(), MAX_MESSAGES);
+    }
+
+    #[test]
+    fn small_context_window_truncates() {
+        // 200 messages with ~100 chars each ≈ 20K chars ≈ 5K tokens
+        let msgs: Vec<Message> = (0..200)
+            .map(|i| test_msg(&"x".repeat(100)))
+            .collect();
+        let large = build_user_message(&msgs, &[], 200_000);
+        let small = build_user_message(&msgs, &[], 2_000);
+        assert!(small.len() < large.len(), "small context should produce shorter prompt");
+        // 2000 tokens - 4000 reserved = 0 (saturating), so it should hard-truncate
+    }
+
+    #[test]
+    fn context_budget_respected() {
+        let msgs: Vec<Message> = (0..100)
+            .map(|_| test_msg(&"word ".repeat(200)))
+            .collect();
+        let context_window = 8_000; // 8K tokens
+        let result = build_user_message(&msgs, &[], context_window);
+        let estimated_tokens = result.len() / CHARS_PER_TOKEN;
+        let budget = context_window.saturating_sub(RESERVED_TOKENS);
+        assert!(
+            estimated_tokens <= budget,
+            "prompt ({estimated_tokens} tokens) should fit within budget ({budget} tokens)"
+        );
     }
 
     #[test]
