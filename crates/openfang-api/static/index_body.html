@@ -5683,7 +5683,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                   x-text="(row._analysis.session_id || '').substring(0, 8) + '...'"></a>
                               </td>
                               <td style="font-size:12px;opacity:0.7" x-text="fmtTime(row._analysis.analyzed_at)"></td>
-                              <td>
+                              <td style="white-space:nowrap">
                                 <template x-if="row.executed_at">
                                   <span class="badge badge-success badge-sm">Done</span>
                                 </template>
@@ -5695,6 +5695,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                     <span x-show="!row._executing">Evolve</span>
                                   </button>
                                 </template>
+                                <button class="btn btn-xs btn-error" style="margin-left:4px"
+                                  @click="deleteSuggestion(row._analysis.id, row)"
+                                  :disabled="row._deleting">
+                                  <span x-show="row._deleting" class="loading loading-spinner loading-xs"></span>
+                                  <span x-show="!row._deleting">Delete</span>
+                                </button>
                               </td>
                             </tr>
                           </template>

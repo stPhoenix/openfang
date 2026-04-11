@@ -201,7 +201,7 @@ var OpenFangAPI = (function() {
   function post(path, body) { return request('POST', path, body); }
   function put(path, body) { return request('PUT', path, body); }
   function patch(path, body) { return request('PATCH', path, body); }
-  function del(path) { return request('DELETE', path); }
+  function del(path, body) { return request('DELETE', path, body); }
 
   // WebSocket manager with auto-reconnect
   var _ws = null;

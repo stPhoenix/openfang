@@ -60,9 +60,12 @@ impl HandRegistry {
             .filter(|e| e.status == HandStatus::Active)
             .map(|e| {
                 serde_json::json!({
+                    "instance_id": e.instance_id,
                     "hand_id": e.hand_id,
                     "config": e.config,
                     "agent_id": e.agent_id,
+                    "provider": e.provider_override,
+                    "model": e.model_override,
                 })
             })
             .collect();
@@ -74,12 +77,16 @@ impl HandRegistry {
     }
 
     /// Load persisted hand state and re-activate hands.
-    /// Returns list of (hand_id, config, old_agent_id) that should be activated.
+    /// Returns list of (hand_id, instance_id, config, old_agent_id) that should be activated.
+    /// The `instance_id` preserves the original UUID so the deterministic agent ID
+    /// remains stable across restarts.  `None` for state files written before this
+    /// field was added (backwards-compatible).
     /// The `old_agent_id` is the agent UUID from before the restart, used to
     /// reassign cron jobs to the newly spawned agent (issue #402).
+    #[allow(clippy::type_complexity)]
     pub fn load_state(
         path: &std::path::Path,
-    ) -> Vec<(String, HashMap<String, serde_json::Value>, Option<AgentId>)> {
+    ) -> Vec<(String, Option<Uuid>, HashMap<String, serde_json::Value>, Option<AgentId>)> {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             Err(_) => return Vec::new(),
@@ -95,12 +102,16 @@ impl HandRegistry {
             .into_iter()
             .filter_map(|e| {
                 let hand_id = e["hand_id"].as_str()?.to_string();
+                let instance_id: Option<Uuid> = e
+                    .get("instance_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
                 let config: HashMap<String, serde_json::Value> =
                     serde_json::from_value(e["config"].clone()).unwrap_or_default();
                 let old_agent_id: Option<AgentId> = e
                     .get("agent_id")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
-                Some((hand_id, config, old_agent_id))
+                Some((hand_id, instance_id, config, old_agent_id))
             })
             .collect()
     }
@@ -200,24 +211,22 @@ impl HandRegistry {
     }
 
     /// Activate a hand — creates an instance (agent spawning is done by kernel).
+    ///
+    /// Multiple instances of the same hand type are allowed (e.g. two collectors
+    /// with different configs).  Pass `instance_id_override` to restore a
+    /// persisted instance with the same UUID across restarts.
     pub fn activate(
         &self,
         hand_id: &str,
         config: HashMap<String, serde_json::Value>,
+        instance_id_override: Option<Uuid>,
     ) -> HandResult<HandInstance> {
         let def = self
             .definitions
             .get(hand_id)
             .ok_or_else(|| HandError::NotFound(hand_id.to_string()))?;
 
-        // Check if already active
-        for entry in self.instances.iter() {
-            if entry.hand_id == hand_id && entry.status == HandStatus::Active {
-                return Err(HandError::AlreadyActive(hand_id.to_string()));
-            }
-        }
-
-        let instance = HandInstance::new(hand_id, &def.agent.name, config);
+        let instance = HandInstance::new(hand_id, &def.agent.name, config, instance_id_override);
         let id = instance.instance_id;
         self.instances.insert(id, instance.clone());
         info!(hand = %hand_id, instance = %id, "Hand activated");
@@ -673,20 +682,25 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new()).unwrap();
-        assert_eq!(instance.hand_id, "clip");
-        assert_eq!(instance.status, HandStatus::Active);
+        let inst1 = reg.activate("clip", HashMap::new(), None).unwrap();
+        assert_eq!(inst1.hand_id, "clip");
+        assert_eq!(inst1.status, HandStatus::Active);
+
+        // Second activation of same hand succeeds (multi-instance)
+        let inst2 = reg.activate("clip", HashMap::new(), None).unwrap();
+        assert_eq!(inst2.hand_id, "clip");
+        assert_ne!(inst1.instance_id, inst2.instance_id);
 
         let instances = reg.list_instances();
-        assert_eq!(instances.len(), 1);
+        assert_eq!(instances.len(), 2);
 
-        // Can't activate again while active
-        let err = reg.activate("clip", HashMap::new());
-        assert!(err.is_err());
-
-        // Deactivate
-        let removed = reg.deactivate(instance.instance_id).unwrap();
+        // Deactivate first
+        let removed = reg.deactivate(inst1.instance_id).unwrap();
         assert_eq!(removed.hand_id, "clip");
+        assert_eq!(reg.list_instances().len(), 1);
+
+        // Deactivate second
+        reg.deactivate(inst2.instance_id).unwrap();
         assert!(reg.list_instances().is_empty());
     }
 
@@ -695,7 +709,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new()).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None).unwrap();
         let id = instance.instance_id;
 
         reg.pause(id).unwrap();
@@ -714,7 +728,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new()).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None).unwrap();
         let id = instance.instance_id;
         let agent_id = AgentId::new();
 
@@ -745,7 +759,7 @@ mod tests {
     fn not_found_errors() {
         let reg = HandRegistry::new();
         assert!(reg.get_definition("nonexistent").is_none());
-        assert!(reg.activate("nonexistent", HashMap::new()).is_err());
+        assert!(reg.activate("nonexistent", HashMap::new(), None).is_err());
         assert!(reg.check_requirements("nonexistent").is_err());
         assert!(reg.deactivate(Uuid::new_v4()).is_err());
         assert!(reg.pause(Uuid::new_v4()).is_err());
@@ -757,7 +771,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new()).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None).unwrap();
         let id = instance.instance_id;
 
         reg.set_error(id, "something broke".to_string()).unwrap();
@@ -830,7 +844,7 @@ mod tests {
         reg.load_bundled();
 
         // Lead hand has no requirements — activate it
-        let instance = reg.activate("lead", HashMap::new()).unwrap();
+        let instance = reg.activate("lead", HashMap::new(), None).unwrap();
         let r = reg.readiness("lead").unwrap();
         assert!(r.requirements_met);
         assert!(r.active);
@@ -845,7 +859,7 @@ mod tests {
         reg.load_bundled();
 
         // Browser hand requires chromium (non-optional) for native CDP automation.
-        let instance = reg.activate("browser", HashMap::new()).unwrap();
+        let instance = reg.activate("browser", HashMap::new(), None).unwrap();
         let r = reg.readiness("browser").unwrap();
         assert!(r.active);
 
@@ -871,7 +885,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("lead", HashMap::new()).unwrap();
+        let instance = reg.activate("lead", HashMap::new(), None).unwrap();
         reg.pause(instance.instance_id).unwrap();
 
         let r = reg.readiness("lead").unwrap();

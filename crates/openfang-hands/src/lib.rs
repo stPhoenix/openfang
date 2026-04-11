@@ -404,6 +404,12 @@ pub struct HandInstance {
     pub agent_name: String,
     /// User-provided configuration overrides.
     pub config: HashMap<String, serde_json::Value>,
+    /// Provider override chosen at activation time (persisted for restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_override: Option<String>,
+    /// Model override chosen at activation time (persisted for restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
     /// When activated.
     pub activated_at: DateTime<Utc>,
     /// Last status change.
@@ -412,19 +418,25 @@ pub struct HandInstance {
 
 impl HandInstance {
     /// Create a new pending instance.
+    ///
+    /// If `instance_id` is `Some`, the given UUID is reused (for restoring
+    /// persisted instances across restarts).  Otherwise a fresh UUID is generated.
     pub fn new(
         hand_id: &str,
         agent_name: &str,
         config: HashMap<String, serde_json::Value>,
+        instance_id: Option<Uuid>,
     ) -> Self {
         let now = Utc::now();
         Self {
-            instance_id: Uuid::new_v4(),
+            instance_id: instance_id.unwrap_or_else(Uuid::new_v4),
             hand_id: hand_id.to_string(),
             status: HandStatus::Active,
             agent_id: None,
             agent_name: agent_name.to_string(),
             config,
+            provider_override: None,
+            model_override: None,
             activated_at: now,
             updated_at: now,
         }
@@ -468,7 +480,7 @@ mod tests {
 
     #[test]
     fn hand_instance_new() {
-        let instance = HandInstance::new("clip", "clip-hand", HashMap::new());
+        let instance = HandInstance::new("clip", "clip-hand", HashMap::new(), None);
         assert_eq!(instance.hand_id, "clip");
         assert_eq!(instance.agent_name, "clip-hand");
         assert_eq!(instance.status, HandStatus::Active);

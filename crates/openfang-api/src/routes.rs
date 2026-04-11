@@ -4572,7 +4572,7 @@ pub async fn activate_hand(
         .map(|b| (b.0.config, b.0.provider, b.0.model))
         .unwrap_or_default();
 
-    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override) {
+    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override, None) {
         Ok(instance) => {
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
@@ -4785,22 +4785,23 @@ pub async fn hand_stats(
         }
     };
 
-    // Read dashboard metrics from shared structured memory (memory_store uses shared namespace)
+    // Read dashboard metrics — try per-agent memory first (where ScopedKernelHandle writes
+    // for hand agents), then fall back to shared namespace for backwards compatibility
+    // with data written before per-instance memory scoping was added.
     let shared_id = openfang_kernel::kernel::shared_memory_agent_id();
     let mut metrics = serde_json::Map::new();
     for metric in &def.dashboard.metrics {
-        // Try shared memory first (where memory_store tool writes), fall back to agent-specific
         let value = state
             .kernel
             .memory
-            .structured_get(shared_id, &metric.memory_key)
+            .structured_get(agent_id, &metric.memory_key)
             .ok()
             .flatten()
             .or_else(|| {
                 state
                     .kernel
                     .memory
-                    .structured_get(agent_id, &metric.memory_key)
+                    .structured_get(shared_id, &metric.memory_key)
                     .ok()
                     .flatten()
             })
@@ -12311,6 +12312,64 @@ pub async fn evolve_execute_all(
             "results": results,
         })),
     )
+}
+
+/// DELETE /api/evolve/suggestion — Delete a single evolution suggestion.
+pub async fn evolve_delete_suggestion(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let analysis_id = match body["analysis_id"]
+        .as_str()
+        .and_then(|s| s.parse::<openfang_evolve::AnalysisId>().ok())
+    {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "analysis_id is required" })),
+            );
+        }
+    };
+
+    let kind_str = body["kind"].as_str().unwrap_or("fix");
+    let kind = match kind_str {
+        "fix" => openfang_evolve::types::SuggestionKind::Fix,
+        "derived" => openfang_evolve::types::SuggestionKind::Derived,
+        "captured" => openfang_evolve::types::SuggestionKind::Captured,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("unknown kind: {kind_str}") })),
+            );
+        }
+    };
+
+    let description = match body["description"].as_str() {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "description is required" })),
+            );
+        }
+    };
+
+    match state
+        .kernel
+        .evolve_engine
+        .store()
+        .delete_suggestion(&analysis_id, &kind, description)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        ),
+    }
 }
 
 #[cfg(test)]

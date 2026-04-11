@@ -2145,6 +2145,16 @@ impl OpenFangKernel {
         } else {
             message.to_string()
         };
+        // Scope memory for hand agents (same logic as non-streaming path)
+        let is_hand = entry.tags.iter().any(|t| t.starts_with("hand:"));
+        let kernel_handle = if is_hand {
+            kernel_handle.map(|h| {
+                ScopedKernelHandle::new(h, Arc::clone(&memory), agent_id)
+                    as Arc<dyn KernelHandle>
+            })
+        } else {
+            kernel_handle
+        };
         let kernel_clone = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
@@ -2774,6 +2784,18 @@ impl OpenFangKernel {
             format!("{message}{link_ctx}")
         } else {
             message.to_string()
+        };
+
+        // For hand agents, wrap the kernel handle so that memory_store/memory_recall
+        // use the agent's own ID instead of the global shared namespace.  This prevents
+        // multiple instances of the same hand type from clobbering each other's state.
+        let kernel_handle = if entry.tags.iter().any(|t| t.starts_with("hand:")) {
+            kernel_handle.map(|h| {
+                ScopedKernelHandle::new(h, Arc::clone(&self.memory), agent_id)
+                    as Arc<dyn KernelHandle>
+            })
+        } else {
+            kernel_handle
         };
 
         let result = run_agent_loop(
@@ -3673,10 +3695,10 @@ impl OpenFangKernel {
         config: std::collections::HashMap<String, serde_json::Value>,
         provider_override: Option<String>,
         model_override: Option<String>,
+        instance_id_override: Option<uuid::Uuid>,
     ) -> KernelResult<openfang_hands::HandInstance> {
         let provider_override = provider_override.filter(|s| !s.is_empty());
         let model_override = model_override.filter(|s| !s.is_empty());
-        use openfang_hands::HandError;
 
         let def = self
             .hand_registry
@@ -3691,13 +3713,8 @@ impl OpenFangKernel {
         // Create the instance in the registry
         let instance = self
             .hand_registry
-            .activate(hand_id, config)
-            .map_err(|e| match e {
-                HandError::AlreadyActive(id) => KernelError::OpenFang(OpenFangError::Internal(
-                    format!("Hand already active: {id}"),
-                )),
-                other => KernelError::OpenFang(OpenFangError::Internal(other.to_string())),
-            })?;
+            .activate(hand_id, config, instance_id_override)
+            .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e.to_string())))?;
 
         // Build an agent manifest from the hand definition.
         // If the hand declares provider/model as "default", inherit the kernel's configured LLM.
@@ -3716,8 +3733,9 @@ impl OpenFangKernel {
             def.agent.model.clone()
         };
 
+        let instance_suffix = &instance.instance_id.to_string()[..8];
         let mut manifest = AgentManifest {
-            name: def.agent.name.clone(),
+            name: format!("{}-{}", def.agent.name, instance_suffix),
             description: def.agent.description.clone(),
             module: def.agent.module.clone(),
             model: ModelConfig {
@@ -3815,14 +3833,13 @@ impl OpenFangKernel {
             );
         }
 
-        // If an agent with this hand's name already exists, remove it first.
+        // If an agent for THIS instance already exists (reactivation / restart),
+        // remove it first.  We scope by the deterministic agent ID so that other
+        // instances of the same hand type are left untouched.
         // Save triggers before kill so they can be restored under the new ID
         // (issue #519 — triggers were lost on agent restart).
-        let existing = self
-            .registry
-            .list()
-            .into_iter()
-            .find(|e| e.name == def.agent.name);
+        let fixed_agent_id = AgentId::from_string(&format!("{hand_id}:{}", instance.instance_id));
+        let existing = self.registry.get(fixed_agent_id);
         let old_agent_id = existing.as_ref().map(|e| e.id);
         let saved_triggers = old_agent_id
             .map(|id| self.triggers.take_agent_triggers(id))
@@ -3832,9 +3849,8 @@ impl OpenFangKernel {
             let _ = self.kill_agent(old.id);
         }
 
-        // Spawn the agent with a fixed ID based on hand_id for stable identity across restarts.
-        // This ensures triggers and cron jobs continue to work after daemon restart.
-        let fixed_agent_id = AgentId::from_string(hand_id);
+        // Spawn the agent with a fixed ID based on hand_id + instance_id for
+        // stable identity across restarts while allowing multiple instances.
         let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_agent_id))?;
 
         // Restore triggers from the old agent under the new agent ID (#519).
@@ -4245,12 +4261,17 @@ impl OpenFangKernel {
         let saved_hands = openfang_hands::registry::HandRegistry::load_state(&state_path);
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
-            for (hand_id, config, old_agent_id) in saved_hands {
+            for (hand_id, saved_instance_id, config, old_agent_id) in saved_hands {
                 // If the agent was already restored from SQLite (by load_all_agents),
                 // preserve its user-configured model so activate_hand doesn't reset
                 // it to the HAND.toml defaults (which are typically "default"/"default").
                 let existing_model = {
-                    let fixed_id = AgentId::from_string(&hand_id);
+                    let fixed_id = if let Some(inst_id) = saved_instance_id {
+                        AgentId::from_string(&format!("{hand_id}:{inst_id}"))
+                    } else {
+                        // Backwards compat: old state files without instance_id
+                        AgentId::from_string(&hand_id)
+                    };
                     self.registry.get(fixed_id).map(|e| e.manifest.model.clone())
                 };
                 let (provider_override, model_override) = match existing_model {
@@ -4264,7 +4285,7 @@ impl OpenFangKernel {
                     }
                     _ => (None, None),
                 };
-                match self.activate_hand(&hand_id, config, provider_override, model_override) {
+                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart
@@ -6831,7 +6852,8 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
             | "cohere" | "xai" | "ollama" | "together" | "fireworks" | "perplexity"
             | "cerebras" | "sambanova" | "replicate" | "huggingface" | "ai21" | "codex"
             | "claude-code" | "copilot" | "github-copilot" | "qwen" | "zhipu" | "zai"
-            | "moonshot" | "openrouter" | "volcengine" | "doubao" | "dashscope" => {
+            | "moonshot" | "openrouter" | "volcengine" | "doubao" | "dashscope"
+            | "lmstudio" | "vllm" => {
                 return Some(prefix.to_string());
             }
             // "kimi" is a brand alias for moonshot
@@ -6895,6 +6917,282 @@ pub fn shared_memory_agent_id() -> AgentId {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01,
     ]))
+}
+
+/// A kernel handle wrapper that scopes `memory_store`/`memory_recall` to a
+/// specific agent ID instead of the global shared namespace.
+///
+/// Used for hand agents so that multiple instances of the same hand type
+/// each get their own isolated memory (preventing key collisions like two
+/// collectors both writing to `collector_hand_state`).  All other operations
+/// delegate transparently to the inner handle.
+pub struct ScopedKernelHandle {
+    inner: Arc<dyn KernelHandle>,
+    memory: Arc<MemorySubstrate>,
+    agent_id: AgentId,
+}
+
+impl ScopedKernelHandle {
+    pub fn new(
+        inner: Arc<dyn KernelHandle>,
+        memory: Arc<MemorySubstrate>,
+        agent_id: AgentId,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            memory,
+            agent_id,
+        })
+    }
+}
+
+#[async_trait]
+impl KernelHandle for ScopedKernelHandle {
+    async fn spawn_agent(
+        &self,
+        manifest_toml: &str,
+        parent_id: Option<&str>,
+    ) -> Result<(String, String), String> {
+        self.inner.spawn_agent(manifest_toml, parent_id).await
+    }
+
+    async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String> {
+        self.inner.send_to_agent(agent_id, message).await
+    }
+
+    async fn send_to_agent_with_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        self.inner
+            .send_to_agent_with_timeout(agent_id, message, timeout_secs)
+            .await
+    }
+
+    fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
+        self.inner.list_agents()
+    }
+
+    fn kill_agent(&self, agent_id: &str) -> Result<(), String> {
+        self.inner.kill_agent(agent_id)
+    }
+
+    // ── Scoped memory: uses this agent's ID instead of shared ──────────
+    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+        self.memory
+            .structured_set(self.agent_id, key, value)
+            .map_err(|e| format!("Memory store failed: {e}"))
+    }
+
+    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        self.memory
+            .structured_get(self.agent_id, key)
+            .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
+        self.inner.find_agents(query)
+    }
+
+    async fn task_post(
+        &self,
+        title: &str,
+        description: &str,
+        assigned_to: Option<&str>,
+        created_by: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .task_post(title, description, assigned_to, created_by)
+            .await
+    }
+
+    async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.inner.task_claim(agent_id).await
+    }
+
+    async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String> {
+        self.inner.task_complete(task_id, result).await
+    }
+
+    async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+        self.inner.task_list(status).await
+    }
+
+    async fn publish_event(
+        &self,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        self.inner.publish_event(event_type, payload).await
+    }
+
+    async fn knowledge_add_entity(
+        &self,
+        entity: openfang_types::memory::Entity,
+    ) -> Result<String, String> {
+        self.inner.knowledge_add_entity(entity).await
+    }
+
+    async fn knowledge_add_relation(
+        &self,
+        relation: openfang_types::memory::Relation,
+    ) -> Result<String, String> {
+        self.inner.knowledge_add_relation(relation).await
+    }
+
+    async fn knowledge_query(
+        &self,
+        pattern: openfang_types::memory::GraphPattern,
+    ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+        self.inner.knowledge_query(pattern).await
+    }
+
+    async fn cron_create(
+        &self,
+        agent_id: &str,
+        job_json: serde_json::Value,
+    ) -> Result<String, String> {
+        self.inner.cron_create(agent_id, job_json).await
+    }
+
+    async fn cron_list(&self, agent_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        self.inner.cron_list(agent_id).await
+    }
+
+    async fn cron_cancel(&self, job_id: &str) -> Result<(), String> {
+        self.inner.cron_cancel(job_id).await
+    }
+
+    fn get_taint_policy(&self, agent_id: &str) -> openfang_types::taint::TaintPolicy {
+        self.inner.get_taint_policy(agent_id)
+    }
+
+    fn requires_approval(&self, tool_name: &str) -> bool {
+        self.inner.requires_approval(tool_name)
+    }
+
+    async fn request_approval(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        action_summary: &str,
+    ) -> Result<bool, String> {
+        self.inner
+            .request_approval(agent_id, tool_name, action_summary)
+            .await
+    }
+
+    async fn hand_list(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.inner.hand_list().await
+    }
+
+    async fn hand_install(
+        &self,
+        toml_content: &str,
+        skill_content: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.hand_install(toml_content, skill_content).await
+    }
+
+    async fn hand_activate(
+        &self,
+        hand_id: &str,
+        config: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.hand_activate(hand_id, config).await
+    }
+
+    async fn hand_status(&self, hand_id: &str) -> Result<serde_json::Value, String> {
+        self.inner.hand_status(hand_id).await
+    }
+
+    async fn hand_deactivate(&self, instance_id: &str) -> Result<(), String> {
+        self.inner.hand_deactivate(instance_id).await
+    }
+
+    fn list_a2a_agents(&self) -> Vec<(String, String)> {
+        self.inner.list_a2a_agents()
+    }
+
+    fn get_a2a_agent_url(&self, name: &str) -> Option<String> {
+        self.inner.get_a2a_agent_url(name)
+    }
+
+    async fn get_channel_default_recipient(&self, channel: &str) -> Option<String> {
+        self.inner.get_channel_default_recipient(channel).await
+    }
+
+    async fn send_channel_message(
+        &self,
+        channel: &str,
+        recipient: &str,
+        message: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .send_channel_message(channel, recipient, message, thread_id)
+            .await
+    }
+
+    async fn send_channel_media(
+        &self,
+        channel: &str,
+        recipient: &str,
+        media_type: &str,
+        media_url: &str,
+        caption: Option<&str>,
+        filename: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .send_channel_media(channel, recipient, media_type, media_url, caption, filename, thread_id)
+            .await
+    }
+
+    async fn send_channel_file_data(
+        &self,
+        channel: &str,
+        recipient: &str,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .send_channel_file_data(channel, recipient, data, filename, mime_type, thread_id)
+            .await
+    }
+
+    fn get_agent_manifest(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+        self.inner.get_agent_manifest(agent_id)
+    }
+
+    async fn update_agent_manifest(
+        &self,
+        agent_id: &str,
+        changes: serde_json::Value,
+    ) -> Result<String, String> {
+        self.inner.update_agent_manifest(agent_id, changes).await
+    }
+
+    fn touch_agent(&self, agent_id: &str) {
+        self.inner.touch_agent(agent_id)
+    }
+
+    async fn delegate_to_agent(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        timeout_secs: Option<u64>,
+    ) -> Result<String, String> {
+        self.inner
+            .delegate_to_agent(manifest_toml, message, parent_id, parent_caps, timeout_secs)
+            .await
+    }
 }
 
 /// Deliver a cron job's agent response to the configured delivery target.
@@ -7465,7 +7763,7 @@ impl KernelHandle for OpenFangKernel {
         config: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         let instance = self
-            .activate_hand(hand_id, config, None, None)
+            .activate_hand(hand_id, config, None, None, None)
             .map_err(|e| format!("{e}"))?;
 
         Ok(serde_json::json!({
@@ -8242,7 +8540,7 @@ mod tests {
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
         let instance = kernel
-            .activate_hand("browser", HashMap::new(), None, None)
+            .activate_hand("browser", HashMap::new(), None, None, None)
             .expect("browser hand should activate");
         let agent_id = instance.agent_id.expect("browser hand agent id");
         let entry = kernel

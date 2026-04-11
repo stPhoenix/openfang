@@ -2252,7 +2252,7 @@ pub fn spawn_activate_hand(backend: BackendRef, hand_id: String, tx: mpsc::Sende
             }
         }
         BackendRef::InProcess(kernel) => {
-            match kernel.activate_hand(&hand_id, std::collections::HashMap::new(), None, None) {
+            match kernel.activate_hand(&hand_id, std::collections::HashMap::new(), None, None, None) {
                 Ok(instance) => {
                     // Start the background loop for autonomous hands, mirroring the
                     // API handler logic in routes.rs.  Without this, the hand agent

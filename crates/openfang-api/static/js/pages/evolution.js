@@ -120,6 +120,7 @@ function evolutionPage() {
         data.analyses.forEach(function(a) {
           (a.evolution_suggestions || []).forEach(function(s) {
             s._executing = false;
+            s._deleting = false;
           });
         });
         this.analyses = data.analyses;
@@ -174,7 +175,8 @@ function evolutionPage() {
           suggestions.push(Object.assign({}, es[j], {
             _analysis: a,
             _key: a.id + '_' + idx++,
-            _executing: es[j]._executing || false
+            _executing: es[j]._executing || false,
+            _deleting: es[j]._deleting || false
           }));
         }
       }
@@ -229,6 +231,23 @@ function evolutionPage() {
         OpenFangToast.error('Evolution failed: ' + (e.message || e));
       }
       suggestion._executing = false;
+    },
+
+    async deleteSuggestion(analysisId, suggestion) {
+      if (!confirm('Delete this suggestion? This cannot be undone.')) return;
+      suggestion._deleting = true;
+      try {
+        await OpenFangAPI.delete('/api/evolve/suggestion', {
+          analysis_id: analysisId,
+          kind: (suggestion.kind || 'fix').toLowerCase(),
+          description: suggestion.description || ''
+        });
+        OpenFangToast.success('Suggestion deleted');
+        await this.loadAnalyses();
+      } catch (e) {
+        OpenFangToast.error('Delete failed: ' + (e.message || e));
+      }
+      suggestion._deleting = false;
     },
 
     async executeAllSuggestions(analysis) {

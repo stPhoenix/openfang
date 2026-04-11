@@ -678,8 +678,7 @@ function agentsPage() {
       this.modelSaving = true;
       try {
         var model = this.newModelValue || this.detailAgent.model_name;
-        var combined = this.newProviderValue + '/' + model;
-        var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: combined });
+        var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: model, provider: this.newProviderValue });
         OpenFangToast.success('Provider changed to ' + (resp && resp.provider ? resp.provider : this.newProviderValue));
         this.editingProvider = false;
         await Alpine.store('app').refreshAgents();

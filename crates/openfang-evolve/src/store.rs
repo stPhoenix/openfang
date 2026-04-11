@@ -551,6 +551,21 @@ impl EvolveStore {
         Ok(())
     }
 
+    /// Delete a single suggestion by its composite key.
+    pub fn delete_suggestion(
+        &self,
+        analysis_id: &AnalysisId,
+        kind: &SuggestionKind,
+        description: &str,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM evolve_suggestions WHERE analysis_id = ?1 AND kind = ?2 AND description = ?3",
+            rusqlite::params![analysis_id.to_string(), kind.to_string(), description],
+        )?;
+        Ok(())
+    }
+
     /// Deactivate a skill (set is_active = false).
     pub fn deactivate_skill(&self, skill_id: &str) -> Result<(), EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;

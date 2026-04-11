@@ -673,6 +673,10 @@ pub async fn build_router(
             "/api/evolve/execute-all",
             axum::routing::post(routes::evolve_execute_all),
         )
+        .route(
+            "/api/evolve/suggestion",
+            axum::routing::delete(routes::evolve_delete_suggestion),
+        )
         // Webhook trigger endpoints (external event injection)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))
         .route("/hooks/agent", axum::routing::post(routes::webhook_agent))
