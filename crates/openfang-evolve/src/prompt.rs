@@ -312,11 +312,20 @@ description: "One-line description"
 Step-by-step instructions the agent should follow...
 ```
 
-## Output Format
+## Output Requirements
 
-When you are done, output your changes in one of these formats:
+Your output MUST follow this exact sequence — no preamble, no reasoning, no analysis text:
 
-### Format A — Patch (for surgical edits)
+1. `CHANGE_SUMMARY: <one-sentence description>`
+2. Skill content in one of the formats below
+3. `<EVOLUTION_COMPLETE>` (success) or `<EVOLUTION_FAILED>` with a reason (failure)
+
+IMPORTANT:
+- The `*** File:` path MUST be just `SKILL.md` — never use absolute paths or subdirectories
+- Output ONLY the structured format. Do not add explanations, reasoning, or commentary
+- Do not use tools — produce text output only
+
+## Format A — Patch (for surgical edits)
 ```
 *** Begin Patch
 *** Update File: SKILL.md
@@ -328,15 +337,15 @@ When you are done, output your changes in one of these formats:
 *** End Patch
 ```
 
-### Format B — Full content (for major rewrites)
+## Format B — Full content (for major rewrites or new skills)
 ```
 *** Begin Files
 *** File: SKILL.md
-(complete file content)
+(complete file content here)
 *** End Files
 ```
 
-### Format C — Search/Replace (for simple edits)
+## Format C — Search/Replace (for simple edits)
 ```
 <<<<<<< SEARCH
 old content
@@ -345,19 +354,31 @@ new content
 >>>>>>> REPLACE
 ```
 
-## Sentinels
+## Complete Example
 
-You MUST end your final output with one of:
-- `<EVOLUTION_COMPLETE>` — if you successfully produced the skill edit
-- `<EVOLUTION_FAILED>` followed by a reason — if evolution is not feasible
+```
+CHANGE_SUMMARY: Added error-handling step to deployment skill
 
-Before the sentinel, output:
-`CHANGE_SUMMARY: <one-sentence description of what changed>`
+*** Begin Files
+*** File: SKILL.md
+---
+name: "safe-deploy"
+description: "Step-by-step deployment with rollback on failure"
+---
 
-Then the skill content in one of the formats above.
+# Safe Deploy
+
+1. Run pre-deploy checks
+2. Deploy to staging
+3. If staging fails, rollback immediately
+4. Deploy to production only after staging succeeds
+*** End Files
+
+<EVOLUTION_COMPLETE>
+```
 
 ## Rules
-- Preserve YAML frontmatter structure
+- Preserve YAML frontmatter structure (name and description are required)
 - Keep instructions clear, actionable, and agent-followable
 - Make skills self-contained (no references to parent versions needed)
 - Choose meaningful names (not just appending "-enhanced" or "-v2")"#
@@ -466,7 +487,27 @@ The agent solved a task using a novel approach that should be captured as a reus
 3. Make it generalizable (abstract away task-specific details)
 4. Structure as agent-followable steps
 5. Category: {cat}
-6. Output CHANGE_SUMMARY + the full skill content + <EVOLUTION_COMPLETE>
+6. Output using the exact format below — no preamble or reasoning text
+
+## Expected Output Format
+
+```
+CHANGE_SUMMARY: <one sentence describing the new skill>
+
+*** Begin Files
+*** File: SKILL.md
+---
+name: "<skill-name>"
+description: "<one-line description>"
+---
+
+# <Skill Title>
+
+<Step-by-step instructions>
+*** End Files
+
+<EVOLUTION_COMPLETE>
+```
 
 If the pattern is not worth capturing, output <EVOLUTION_FAILED> with a reason."#
     )
@@ -540,7 +581,15 @@ Your previous output could not be applied. The error was:
 {content}
 ```
 
-Please try again. Output your corrected changes using one of the supported formats, followed by the appropriate sentinel token (<EVOLUTION_COMPLETE> or <EVOLUTION_FAILED>)."#,
+## Required Output Format
+
+Output your corrected changes using this exact sequence — no preamble or reasoning:
+
+1. `CHANGE_SUMMARY: <description>`
+2. Skill content using `*** Begin Files` / `*** File: SKILL.md` / `*** End Files`
+3. `<EVOLUTION_COMPLETE>` or `<EVOLUTION_FAILED>`
+
+IMPORTANT: The `*** File:` path MUST be just `SKILL.md` — never use absolute paths."#,
         content = truncate_content(current_content),
     )
 }
@@ -605,7 +654,7 @@ mod tests {
     fn small_context_window_truncates() {
         // 200 messages with ~100 chars each ≈ 20K chars ≈ 5K tokens
         let msgs: Vec<Message> = (0..200)
-            .map(|i| test_msg(&"x".repeat(100)))
+            .map(|_| test_msg(&"x".repeat(100)))
             .collect();
         let large = build_user_message(&msgs, &[], 200_000);
         let small = build_user_message(&msgs, &[], 2_000);

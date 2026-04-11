@@ -194,6 +194,15 @@ pub struct EvolutionSuggestion {
     pub description: String,
     /// Priority 1 (low) to 5 (critical).
     pub priority: u8,
+    /// When this suggestion was successfully executed (ISO 8601 timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_at: Option<String>,
+    /// When this suggestion failed execution (ISO 8601 timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<String>,
+    /// Reason the execution failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 /// Classification of evolution suggestions.
@@ -701,6 +710,9 @@ mod tests {
                 target_skill: Some("docker".into()),
                 description: "Update port mapping instructions".into(),
                 priority: 3,
+                executed_at: None,
+                failed_at: None,
+                failure_reason: None,
             }],
             model_used: "claude-haiku-4-5-20251001".into(),
             input_tokens: 1500,

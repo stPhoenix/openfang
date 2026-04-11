@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 13;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -53,6 +53,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 11 {
         migrate_v11(conn)?;
+    }
+
+    if current_version < 12 {
+        migrate_v12(conn)?;
+    }
+
+    if current_version < 13 {
+        migrate_v13(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -454,6 +462,37 @@ fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (11, datetime('now'), 'Add evolve_config table');
         ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "evolve_suggestions", "executed_at") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN executed_at TEXT;",
+        )?;
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (12, datetime('now'), 'Add executed_at to evolve_suggestions');",
+    )?;
+    Ok(())
+}
+
+fn migrate_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "evolve_suggestions", "failed_at") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN failed_at TEXT;",
+        )?;
+    }
+    if !column_exists(conn, "evolve_suggestions", "failure_reason") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN failure_reason TEXT;",
+        )?;
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (13, datetime('now'), 'Add failed_at and failure_reason to evolve_suggestions');",
     )?;
     Ok(())
 }

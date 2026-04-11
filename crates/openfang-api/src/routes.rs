@@ -12018,6 +12018,126 @@ pub async fn evolve_get_skill(
     }
 }
 
+/// DELETE /api/evolve/skills/:id — Delete an evolved skill record and its files.
+pub async fn evolve_delete_skill(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(skill_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = state.kernel.evolve_engine.store();
+
+    // Look up the skill record.
+    let record = match store.get_skill_record(&skill_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "skill record not found" })),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+        }
+    };
+
+    // Delete the skill directory from disk.
+    let skill_path = std::path::Path::new(&record.path);
+    if skill_path.exists() {
+        let _ = std::fs::remove_dir_all(skill_path);
+    }
+
+    // Delete the DB record.
+    if let Err(e) = store.delete_skill_record(&skill_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to delete record: {e}") })),
+        );
+    }
+
+    // Hot-reload the skill registry.
+    state.kernel.reload_skills();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "deleted",
+            "skill_id": skill_id,
+            "name": record.name
+        })),
+    )
+}
+
+/// POST /api/evolve/skills/:id/rollback — Rollback to parent skill version.
+pub async fn evolve_rollback_skill(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(skill_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = state.kernel.evolve_engine.store();
+
+    // Look up the skill to rollback.
+    let record = match store.get_skill_record(&skill_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "skill record not found" })),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+        }
+    };
+
+    // Verify it has parents to rollback to.
+    if record.lineage.parent_skill_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "skill has no parent versions to rollback to" })),
+        );
+    }
+
+    // Deactivate the evolved skill.
+    if let Err(e) = store.deactivate_skill(&skill_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to deactivate skill: {e}") })),
+        );
+    }
+
+    // Delete the evolved skill directory from disk.
+    let skill_path = std::path::Path::new(&record.path);
+    if skill_path.exists() {
+        let _ = std::fs::remove_dir_all(skill_path);
+    }
+
+    // Reactivate parent skill(s).
+    let mut reactivated = Vec::new();
+    for parent_id in &record.lineage.parent_skill_ids {
+        if let Err(e) = store.reactivate_skill(parent_id) {
+            tracing::warn!(parent_id = %parent_id, error = %e, "failed to reactivate parent skill");
+        } else {
+            reactivated.push(parent_id.clone());
+        }
+    }
+
+    // Hot-reload the skill registry.
+    state.kernel.reload_skills();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "rolled_back",
+            "skill_id": skill_id,
+            "reactivated_parents": reactivated
+        })),
+    )
+}
+
 /// POST /api/evolve/trigger/metrics — Manually trigger skill metric check.
 pub async fn evolve_trigger_metrics(
     State(state): State<Arc<AppState>>,
@@ -12091,15 +12211,26 @@ pub async fn evolve_execute(
         source_analysis: analysis_id,
     };
 
-    match state.kernel.execute_evolution(context).await {
+    match state.kernel.execute_evolution(context.clone()).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::to_value(&result).unwrap_or_default()),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("{e}") })),
-        ),
+        Err(e) => {
+            // Mark the suggestion as failed so the UI shows the status.
+            if let Some(ref aid) = context.source_analysis {
+                let _ = state.kernel.evolve_engine.store().mark_suggestion_failed(
+                    aid,
+                    &context.evolution_type,
+                    &context.direction,
+                    &format!("{e}"),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+        }
     }
 }
 

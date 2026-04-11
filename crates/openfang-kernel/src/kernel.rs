@@ -6280,10 +6280,25 @@ impl OpenFangKernel {
         };
 
         let config = self.evolve_engine.config();
+        // Derive skill name: prefer parent skill name, then SKILL.md frontmatter, then skill ID prefix.
         let skill_name = context
             .target_skills
             .first()
             .map(|s| s.name.clone())
+            .or_else(|| {
+                // For captured/derived skills with no parent, read name from SKILL.md frontmatter
+                result.content_snapshot.get("SKILL.md").and_then(|content| {
+                    content
+                        .strip_prefix("---\n")
+                        .and_then(|after| after.split_once("\n---"))
+                        .and_then(|(frontmatter, _)| {
+                            frontmatter.lines().find_map(|line| {
+                                line.strip_prefix("name:")
+                                    .map(|v| v.trim().trim_matches('"').to_string())
+                            })
+                        })
+                })
+            })
             .unwrap_or_else(|| result.evolved_skill_id.split("__").next().unwrap_or("unknown").to_string());
 
         let new_record = openfang_evolve::SkillRecord {
@@ -6359,6 +6374,17 @@ impl OpenFangKernel {
                 Err(e) => {
                     warn!(error = %e, "failed to reload evolved skill into registry");
                 }
+            }
+        }
+
+        // Mark the suggestion as executed so it won't be re-triggered.
+        if let Some(ref analysis_id) = context.source_analysis {
+            if let Err(e) = self.evolve_engine.store().mark_suggestion_executed(
+                analysis_id,
+                &context.evolution_type,
+                &context.direction,
+            ) {
+                warn!(error = %e, "failed to mark suggestion as executed");
             }
         }
 

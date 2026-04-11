@@ -116,7 +116,14 @@ function evolutionPage() {
     },
     async loadAnalyses() {
       var data = await OpenFangAPI.get('/api/evolve/analyses?limit=50');
-      if (data && data.analyses) this.analyses = data.analyses;
+      if (data && data.analyses) {
+        data.analyses.forEach(function(a) {
+          (a.evolution_suggestions || []).forEach(function(s) {
+            s._executing = false;
+          });
+        });
+        this.analyses = data.analyses;
+      }
     },
     async runAnalysis() {
       this.running = true;
@@ -166,7 +173,8 @@ function evolutionPage() {
         for (var j = 0; j < es.length; j++) {
           suggestions.push(Object.assign({}, es[j], {
             _analysis: a,
-            _key: a.id + '_' + idx++
+            _key: a.id + '_' + idx++,
+            _executing: es[j]._executing || false
           }));
         }
       }
@@ -215,7 +223,7 @@ function evolutionPage() {
           priority: suggestion.priority || 0
         });
         OpenFangToast.success('Evolution complete: ' + (data.change_summary || 'success'));
-        await Promise.all([this.loadSkillRecords(), this.loadStats()]);
+        await Promise.all([this.loadSkillRecords(), this.loadStats(), this.loadAnalyses()]);
         this.buildSkillClasses();
       } catch (e) {
         OpenFangToast.error('Evolution failed: ' + (e.message || e));
@@ -241,6 +249,35 @@ function evolutionPage() {
     },
 
     // ════════════════════════════════════════
+    // Skill delete / rollback
+    // ════════════════════════════════════════
+    async deleteSkill(skillId) {
+      if (!confirm('Delete skill "' + skillId + '"? This cannot be undone.')) return;
+      try {
+        var data = await OpenFangAPI.delete('/api/evolve/skills/' + encodeURIComponent(skillId));
+        OpenFangToast.success('Deleted: ' + (data.name || skillId));
+        await Promise.all([this.loadSkillRecords(), this.loadStats()]);
+        this.buildSkillClasses();
+        this.selectedSkillClass = null;
+      } catch (e) {
+        OpenFangToast.error('Delete failed: ' + (e.message || e));
+      }
+    },
+
+    async rollbackSkill(skillId) {
+      if (!confirm('Rollback "' + skillId + '" to its parent version?')) return;
+      try {
+        var data = await OpenFangAPI.post('/api/evolve/skills/' + encodeURIComponent(skillId) + '/rollback', {});
+        OpenFangToast.success('Rolled back. Reactivated: ' + (data.reactivated_parents || []).join(', '));
+        await Promise.all([this.loadSkillRecords(), this.loadStats()]);
+        this.buildSkillClasses();
+        this.selectedSkillClass = null;
+      } catch (e) {
+        OpenFangToast.error('Rollback failed: ' + (e.message || e));
+      }
+    },
+
+    // ════════════════════════════════════════
     // Skill class grouping
     // ════════════════════════════════════════
     extractBaseName(skillId) {
@@ -259,7 +296,8 @@ function evolutionPage() {
       var groups = {};
       var self = this;
       this.skillRecords.forEach(function(s) {
-        var base = self.extractBaseName(s.skill_id);
+        // Group by skill name (preferred) or fall back to skill_id prefix.
+        var base = s.name || self.extractBaseName(s.skill_id);
         if (!groups[base]) groups[base] = [];
         groups[base].push(s);
       });

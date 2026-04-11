@@ -97,6 +97,10 @@ where
     // Build the initial prompt based on evolution type
     let initial_prompt = build_evolution_prompt(context);
 
+    // Accumulate content from responses that lack sentinels.
+    // LLMs often produce the content in one message and the sentinel in the next.
+    let mut accumulated_content = String::new();
+
     for iteration in 0..MAX_EVOLUTION_ITERATIONS {
         let is_final = iteration == MAX_EVOLUTION_ITERATIONS - 1;
 
@@ -113,8 +117,29 @@ where
         let (response, _input_tokens, _output_tokens) =
             send_message(prompt).await.map_err(EvolveError::LlmError)?;
 
+        // Try parsing the current response alone first.
         match parse_evolver_response(&response) {
             Ok(output) => {
+                // If the sentinel arrived but content is empty/missing file markers,
+                // check if accumulated content from previous iterations has it.
+                let output = if output.raw_content.is_empty()
+                    || (!output.raw_content.contains("*** Begin Files")
+                        && !output.raw_content.contains("<<<<<<< SEARCH")
+                        && !output.raw_content.contains("*** Begin Patch")
+                        && !output.raw_content.contains("---\nname:"))
+                {
+                    if let Ok(from_accumulated) =
+                        parse_evolver_response(&format!("{accumulated_content}\n{response}"))
+                    {
+                        debug!("using accumulated content from previous iterations");
+                        from_accumulated
+                    } else {
+                        output
+                    }
+                } else {
+                    output
+                };
+
                 info!(
                     summary = %output.change_summary,
                     "evolution complete"
@@ -128,13 +153,16 @@ where
                 )));
             }
             Err(None) => {
+                // No sentinel — accumulate content for later.
+                accumulated_content.push_str(&response);
+                accumulated_content.push('\n');
                 if is_final {
                     warn!("evolution exhausted iterations without sentinel");
                     return Err(EvolveError::Other(
                         "evolution exhausted iterations without producing a result".into(),
                     ));
                 }
-                debug!("no sentinel found, continuing...");
+                debug!("no sentinel found, accumulating and continuing...");
             }
         }
     }
@@ -254,9 +282,30 @@ where
     // Generate the skill ID for the result
     let evolved_skill_id = generate_skill_id(context);
 
+    // If change_summary is empty, try to extract description from SKILL.md frontmatter.
+    let change_summary = if output.change_summary.is_empty() {
+        patch_result
+            .content_snapshot
+            .get("SKILL.md")
+            .and_then(|content| {
+                content
+                    .strip_prefix("---\n")
+                    .and_then(|after| after.split_once("\n---"))
+                    .and_then(|(fm, _)| {
+                        fm.lines().find_map(|line| {
+                            line.strip_prefix("description:")
+                                .map(|v| v.trim().trim_matches('"').to_string())
+                        })
+                    })
+            })
+            .unwrap_or_default()
+    } else {
+        output.change_summary
+    };
+
     Ok(EvolutionResult {
         evolved_skill_id,
-        change_summary: output.change_summary,
+        change_summary,
         content_diff: patch_result.content_diff,
         content_snapshot: patch_result.content_snapshot,
         success: true,
@@ -335,10 +384,10 @@ fn strip_sentinels(response: &str) -> String {
     if let Some(pos) = result.find(EVOLUTION_FAILED) {
         result = result[..pos].to_string();
     }
-    // Remove CHANGE_SUMMARY line
+    // Remove CHANGE_SUMMARY line (keep content on both sides)
     if let Some(pos) = result.find("CHANGE_SUMMARY:") {
         let line_end = result[pos..].find('\n').unwrap_or(result.len() - pos);
-        result = result[pos + line_end..].to_string();
+        result = format!("{}{}", &result[..pos], &result[pos + line_end..]);
     }
     result.trim().to_string()
 }
@@ -432,6 +481,18 @@ mod tests {
         assert!(result.contains("actual content"));
         assert!(!result.contains("EVOLUTION_COMPLETE"));
         assert!(!result.contains("CHANGE_SUMMARY"));
+    }
+
+    #[test]
+    fn strip_sentinels_change_summary_after_content() {
+        // LLM sometimes places CHANGE_SUMMARY after the file content
+        let text = "*** Begin Files\n*** File: SKILL.md\n---\nname: \"test\"\ndescription: \"test\"\n---\n# Test\n*** End Files\n\nCHANGE_SUMMARY: Created test skill\n\n<EVOLUTION_COMPLETE>";
+        let result = strip_sentinels(text);
+        assert!(result.contains("*** Begin Files"));
+        assert!(result.contains("*** File: SKILL.md"));
+        assert!(result.contains("name: \"test\""));
+        assert!(!result.contains("CHANGE_SUMMARY"));
+        assert!(!result.contains("EVOLUTION_COMPLETE"));
     }
 
     #[test]

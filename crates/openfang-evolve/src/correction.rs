@@ -200,6 +200,9 @@ mod tests {
                 target_skill: Some("docker__imp_abcd1235".into()), // typo
                 description: "fix it".into(),
                 priority: 3,
+                executed_at: None,
+                failed_at: None,
+                failure_reason: None,
             }],
             model_used: "test".into(),
             input_tokens: 0,

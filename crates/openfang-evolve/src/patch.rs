@@ -427,7 +427,14 @@ fn parse_full_content_files(content: &str) -> Result<Vec<(String, String)>, Stri
                     files.push((file, current_content.join("\n")));
                     current_content.clear();
                 }
-                current_file = Some(path.trim().to_string());
+                // Normalize: extract just the filename to prevent absolute paths
+                // from escaping the skill directory via Path::join()
+                let trimmed = path.trim();
+                let normalized = std::path::Path::new(trimmed)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "SKILL.md".to_string());
+                current_file = Some(normalized);
                 in_files = true;
             } else if in_files {
                 current_content.push(line.to_string());
@@ -561,6 +568,19 @@ mod tests {
                 .unwrap()
                 .contains("Updated")
         );
+    }
+
+    #[test]
+    fn full_content_apply_absolute_path_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+
+        // LLM outputs an absolute path instead of just SKILL.md
+        let content = "*** Begin Files\n*** File: /data/workspaces/evolution-evolver/skills/reference/user-query-priority.md\n---\nname: \"test\"\ndescription: \"test\"\n---\n\n# Test\n*** End Files";
+        let result = apply_full_content(&skill_dir, content).unwrap();
+        // Should normalize to just the filename and write inside skill_dir
+        assert!(result.content_snapshot.contains_key("user-query-priority.md"));
+        assert!(skill_dir.join("user-query-priority.md").exists());
     }
 
     #[test]

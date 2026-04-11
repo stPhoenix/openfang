@@ -654,7 +654,12 @@ pub async fn build_router(
         )
         .route(
             "/api/evolve/skills/{id}",
-            axum::routing::get(routes::evolve_get_skill),
+            axum::routing::get(routes::evolve_get_skill)
+                .delete(routes::evolve_delete_skill),
+        )
+        .route(
+            "/api/evolve/skills/{id}/rollback",
+            axum::routing::post(routes::evolve_rollback_skill),
         )
         .route(
             "/api/evolve/trigger/metrics",

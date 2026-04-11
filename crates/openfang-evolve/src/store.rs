@@ -516,12 +516,67 @@ impl EvolveStore {
         Ok(())
     }
 
+    /// Mark a suggestion as executed after successful evolution.
+    pub fn mark_suggestion_executed(
+        &self,
+        analysis_id: &AnalysisId,
+        kind: &SuggestionKind,
+        description: &str,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE evolve_suggestions SET executed_at = ?1 \
+             WHERE analysis_id = ?2 AND kind = ?3 AND description = ?4 AND executed_at IS NULL",
+            rusqlite::params![now, analysis_id.to_string(), kind.to_string(), description],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a suggestion as failed after unsuccessful evolution.
+    pub fn mark_suggestion_failed(
+        &self,
+        analysis_id: &AnalysisId,
+        kind: &SuggestionKind,
+        description: &str,
+        reason: &str,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE evolve_suggestions SET failed_at = ?1, failure_reason = ?2 \
+             WHERE analysis_id = ?3 AND kind = ?4 AND description = ?5 AND executed_at IS NULL",
+            rusqlite::params![now, reason, analysis_id.to_string(), kind.to_string(), description],
+        )?;
+        Ok(())
+    }
+
     /// Deactivate a skill (set is_active = false).
     pub fn deactivate_skill(&self, skill_id: &str) -> Result<(), EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         conn.execute(
             "UPDATE skill_records SET is_active = 0, last_updated = ?2 WHERE skill_id = ?1",
             rusqlite::params![skill_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Reactivate a skill (set is_active = true).
+    pub fn reactivate_skill(&self, skill_id: &str) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE skill_records SET is_active = 1, last_updated = ?2 WHERE skill_id = ?1",
+            rusqlite::params![skill_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a skill record from the database.
+    pub fn delete_skill_record(&self, skill_id: &str) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM skill_records WHERE skill_id = ?1",
+            rusqlite::params![skill_id],
         )?;
         Ok(())
     }
@@ -631,7 +686,7 @@ impl EvolveStore {
         analysis_id: &str,
     ) -> Result<Vec<EvolutionSuggestion>, EvolveError> {
         let mut stmt = conn.prepare(
-            "SELECT kind, target_skill, description, priority FROM evolve_suggestions WHERE analysis_id = ?1",
+            "SELECT kind, target_skill, description, priority, executed_at, failed_at, failure_reason FROM evolve_suggestions WHERE analysis_id = ?1",
         )?;
         let rows = stmt
             .query_map([analysis_id], |row| {
@@ -643,6 +698,9 @@ impl EvolveStore {
                     target_skill: row.get(1)?,
                     description: row.get(2)?,
                     priority: row.get::<_, i32>(3)? as u8,
+                    executed_at: row.get(4)?,
+                    failed_at: row.get(5)?,
+                    failure_reason: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -739,7 +797,10 @@ mod tests {
                 kind TEXT NOT NULL,
                 target_skill TEXT,
                 description TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 3
+                priority INTEGER NOT NULL DEFAULT 3,
+                executed_at TEXT,
+                failed_at TEXT,
+                failure_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS skill_records (
@@ -792,6 +853,9 @@ mod tests {
                 target_skill: Some("docker".into()),
                 description: "Update port mapping".into(),
                 priority: 3,
+                executed_at: None,
+                failed_at: None,
+                failure_reason: None,
             }],
             model_used: "test-model".into(),
             input_tokens: 100,
