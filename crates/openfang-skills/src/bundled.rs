@@ -197,6 +197,15 @@ pub fn get_bundled_content(name: &str) -> Option<&'static str> {
         .map(|(_, c)| c)
 }
 
+/// Parse a bundled SKILL.md into its full converted form (manifest + declared
+/// config vars). Used by the registry loader so it can resolve/inject config.
+pub fn parse_bundled_full(
+    name: &str,
+    content: &str,
+) -> Result<crate::openclaw_compat::ConvertedSkillMd, crate::SkillError> {
+    convert_skillmd_str(name, content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -184,6 +184,7 @@ impl SetupWizard {
             tool_blocklist: vec![],
             taint_policy: Default::default(),
             prompt_guard: Default::default(),
+            cache_context: false,
         };
 
         let skills_to_install: Vec<String> = intent

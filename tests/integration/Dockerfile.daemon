@@ -1,0 +1,7 @@
+# Minimal runtime for the openfang daemon under live integration tests.
+# Just adds curl + ca-certificates so the compose healthcheck works.
+# The binary is mounted from the host at runtime (see docker-compose.tests.yml).
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*

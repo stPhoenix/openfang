@@ -53,14 +53,23 @@ pub struct AuthState {
     pub auth_enabled: bool,
     pub session_secret: String,
     pub require_auth_for_reads: bool,
+    /// Set from `OPENFANG_ALLOW_NO_AUTH=1` to permit running without an api_key
+    /// on a non-loopback bind. Off by default so empty keys fail closed.
+    pub allow_no_auth: bool,
 }
 
 /// Bearer token authentication middleware.
 ///
 /// When `api_key` is non-empty (after trimming), requests to non-public
 /// endpoints must include `Authorization: Bearer <api_key>`.
-/// If the key is empty or whitespace-only, auth is disabled entirely
-/// (public/local development mode).
+///
+/// When `api_key` is empty (no key configured) the server defaults to
+/// fail-closed for any request that does NOT originate from loopback.
+/// Loopback traffic (127.0.0.1 / ::1) is always allowed through with no
+/// key so single-user local setups keep zero-config UX. To explicitly
+/// run a no-auth server on a LAN/WAN address, set
+/// `OPENFANG_ALLOW_NO_AUTH=1`; this opts out of fail-closed and is
+/// reported loudly at startup.
 ///
 /// When dashboard auth is enabled, session cookies are also accepted.
 pub async fn auth(
@@ -71,17 +80,17 @@ pub async fn auth(
     // SECURITY: Capture method early for method-aware public endpoint checks.
     let method = request.method().clone();
 
-    // Shutdown is loopback-only (CLI on same machine) — skip token auth
+    let is_loopback = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false); // SECURITY: default-deny; unknown origin is NOT loopback
+
+    // Shutdown is loopback-only (CLI on same machine). Skip token auth only
+    // when the request is from loopback.
     let path = request.uri().path();
-    if path == "/api/shutdown" {
-        let is_loopback = request
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.ip().is_loopback())
-            .unwrap_or(false); // SECURITY: default-deny — unknown origin is NOT loopback
-        if is_loopback {
-            return next.run(request).await;
-        }
+    if path == "/api/shutdown" && is_loopback {
+        return next.run(request).await;
     }
 
     // Public endpoints that don't require auth.
@@ -134,6 +143,7 @@ pub async fn auth(
             || path == "/api/hands/active"
             || path.starts_with("/api/hands/")
             || path == "/api/skills"
+            || path.starts_with("/api/skills/") && path.ends_with("/config")
             || path == "/api/sessions"
             || path == "/api/integrations"
             || path == "/api/integrations/available"
@@ -146,12 +156,29 @@ pub async fn auth(
         }
     }
 
-    // If no API key configured (empty, whitespace-only, or missing), skip auth
-    // entirely. Users who don't set api_key accept that all endpoints are open.
-    // To secure the dashboard, set a non-empty api_key in config.toml.
+    // If no API key configured and no dashboard login is active, fail closed
+    // for anything that did not come from loopback. Opting out of this
+    // behavior requires setting `OPENFANG_ALLOW_NO_AUTH=1`, which is logged
+    // loudly at startup.
+    //
+    // See issue #1034 (B1/B2): empty api_key previously bypassed auth for
+    // all origins, exposing agent config, channel tokens, and LLM keys on
+    // any LAN-reachable bind.
     let api_key_trimmed = auth_state.api_key.trim().to_string();
     if api_key_trimmed.is_empty() && !auth_state.auth_enabled {
-        return next.run(request).await;
+        if is_loopback || auth_state.allow_no_auth {
+            return next.run(request).await;
+        }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "API key required for non-loopback requests. Set OPENFANG_API_KEY or bind to 127.0.0.1."
+                })
+                .to_string(),
+            ))
+            .unwrap_or_default();
     }
     let api_key = api_key_trimmed.as_str();
 
@@ -176,13 +203,14 @@ pub async fn auth(
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
     // cannot set custom headers, same approach as WebSocket auth).
-    let query_token = request
+    let query_token_decoded = request
         .uri()
         .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .map(crate::percent_decode);
 
     // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
+    let query_auth = query_token_decoded.as_deref().map(|token| {
         verify_api_token(token, api_key, auth_state.api_key_hash.as_deref())
     });
 
@@ -291,7 +319,12 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Router};
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Method, Request};
+    use axum::routing::get;
+    use axum::Router;
+    use std::net::SocketAddr;
     use tower::ServiceExt;
 
     #[test]
@@ -319,6 +352,7 @@ mod tests {
             auth_enabled: false,
             session_secret: String::new(),
             require_auth_for_reads: true,
+            allow_no_auth: false,
         }
     }
 
@@ -329,7 +363,51 @@ mod tests {
             auth_enabled: false,
             session_secret: String::new(),
             require_auth_for_reads: false,
+            allow_no_auth: false,
         }
+    }
+
+    fn auth_state_empty() -> AuthState {
+        AuthState {
+            api_key: String::new(),
+            api_key_hash: None,
+            auth_enabled: false,
+            session_secret: String::new(),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+        }
+    }
+
+    fn auth_state_with_key(key: &str) -> AuthState {
+        AuthState {
+            api_key: key.to_string(),
+            api_key_hash: None,
+            auth_enabled: false,
+            session_secret: key.to_string(),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+        }
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn router(state: AuthState) -> Router {
+        Router::new()
+            .route("/api/agents/1", get(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(state, auth))
+    }
+
+    fn req_from(ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/agents/1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
     }
 
     #[tokio::test]
@@ -344,6 +422,22 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_key_allows_loopback() {
+        let app = router(auth_state_empty());
+        let resp = app.oneshot(req_from("127.0.0.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn empty_key_blocks_lan_origin() {
+        // Issue #1034 B1: previously 192.168/10/... could hit every non-public
+        // endpoint when api_key was unset. Must now be 401.
+        let app = router(auth_state_empty());
+        let resp = app.oneshot(req_from("192.168.1.50")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -393,6 +487,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_key_blocks_public_origin() {
+        let app = router(auth_state_empty());
+        let resp = app.oneshot(req_from("203.0.113.5")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn strict_mode_allows_with_bearer_token() {
         let app = test_router(strict_auth_state());
         let resp = app
@@ -409,6 +510,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_key_blocks_unknown_connect_info() {
+        // Paranoia: if ConnectInfo is missing for any reason, we must fail
+        // closed, not open.
+        let app = router(auth_state_empty());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/agents/1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_key_with_allow_no_auth_opens_everything() {
+        let mut s = auth_state_empty();
+        s.allow_no_auth = true;
+        let app = router(s);
+        let resp = app.oneshot(req_from("10.0.0.9")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn permissive_mode_allows_dashboard_reads() {
         let app = test_router(permissive_auth_state());
         let resp = app
@@ -420,6 +544,28 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_key_rejects_missing_token_from_loopback() {
+        let app = router(auth_state_with_key("secret"));
+        let resp = app.oneshot(req_from("127.0.0.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn configured_key_accepts_bearer() {
+        let app = router(auth_state_with_key("secret"));
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/agents/1")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -1,0 +1,54 @@
+# Live integration tests (CLAUDE.md "MANDATORY: Live Integration Testing").
+#
+# Drives a daemon container against a host-side LM Studio (no API key needed)
+# and runs pytest against it. Run from repo root:
+#
+#   make build-release
+#   docker compose -f docker-compose.tests.yml up \
+#       --build --abort-on-container-exit --exit-code-from openfang-tests
+#
+# Exit code = pytest exit code, so this is wired for CI.
+
+services:
+  openfang-daemon:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.daemon
+    working_dir: /data
+    ports:
+      - "4200:4200"
+    volumes:
+      # Host-built release binary (pre-build with `make build-release`).
+      - ./target/release/openfang:/usr/local/bin/openfang:ro
+      # Test-only config: provider=lmstudio pointing at host.docker.internal.
+      - ./tests/integration/config.toml:/data/config.toml:ro
+    environment:
+      OPENFANG_HOME: /data
+      OPENFANG_LISTEN: 0.0.0.0:4200
+      # LM Studio doesn't validate the key but the driver expects something.
+      LMSTUDIO_API_KEY: lmstudio-local
+      # Tests run from a sibling container (non-loopback). Without this the
+      # merged empty-key fail-closed behavior (upstream #1034) returns 401 on
+      # POST endpoints. Tests-only — never set this in production.
+      OPENFANG_ALLOW_NO_AUTH: "1"
+      RUST_LOG: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["/usr/local/bin/openfang"]
+    command: ["start"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4200/api/health || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  openfang-tests:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    depends_on:
+      openfang-daemon:
+        condition: service_healthy
+    environment:
+      OPENFANG_BASE_URL: http://openfang-daemon:4200

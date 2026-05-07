@@ -47,3 +47,7 @@ Thumbs.db
 .serena/
 /nohup.out
 /finetune/
+.gitnexus
+
+# Personal deploy scripts
+scripts/deploy-remote.sh

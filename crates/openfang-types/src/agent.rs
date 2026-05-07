@@ -67,7 +67,7 @@ impl Default for ModelRoutingConfig {
 }
 
 /// Autonomous agent configuration — guardrails for 24/7 agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AutonomousConfig {
     /// Cron expression for quiet hours (e.g., "0 22 * * *" to "0 6 * * *").
@@ -224,7 +224,7 @@ impl AgentMode {
 }
 
 /// How an agent is scheduled to run.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleMode {
     /// Agent wakes up when a message/event arrives (default).
@@ -246,7 +246,7 @@ fn default_check_interval() -> u64 {
 }
 
 /// Resource limits for an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ResourceQuota {
     /// Maximum WASM memory in bytes.
@@ -502,6 +502,12 @@ pub struct AgentManifest {
     /// Default: warn mode (scan and log, but allow through).
     #[serde(default)]
     pub prompt_guard: crate::prompt_guard::PromptGuardPolicy,
+    /// If true, the agent's `context.md` is read once at session start and
+    /// reused. Default is `false`: the runtime re-reads `context.md` before
+    /// every turn so external writers (cron jobs, integrations) reach the LLM
+    /// on the next message. See issue #843.
+    #[serde(default)]
+    pub cache_context: bool,
 }
 
 fn default_true() -> bool {
@@ -538,6 +544,7 @@ impl Default for AgentManifest {
             tool_blocklist: Vec::new(),
             taint_policy: crate::taint::TaintPolicy::default(),
             prompt_guard: crate::prompt_guard::PromptGuardPolicy::default(),
+            cache_context: false,
         }
     }
 }
@@ -797,6 +804,7 @@ mod tests {
             tool_blocklist: Vec::new(),
             taint_policy: Default::default(),
             prompt_guard: Default::default(),
+            cache_context: false,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

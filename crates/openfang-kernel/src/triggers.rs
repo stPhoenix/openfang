@@ -458,6 +458,14 @@ fn describe_event(event: &Event) -> String {
                     "Health check failed: agent {agent_id}, unresponsive for {unresponsive_secs}s"
                 )
             }
+            SystemEvent::CronJobExecuted {
+                agent_id,
+                job_id,
+                job_name,
+                ..
+            } => {
+                format!("Cron job executed: {job_name} ({job_id}) for agent {agent_id}")
+            }
         },
         EventPayload::Task(te) => match te {
             TaskEvent::Posted { task_id, title } => {

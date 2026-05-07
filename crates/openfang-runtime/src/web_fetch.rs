@@ -366,7 +366,10 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 }
 
 /// Extract host:port from a URL.
-fn extract_host(url: &str) -> String {
+///
+/// Handles IPv6 bracket notation (`[::1]:8080`), and infers default
+/// ports (80 for HTTP, 443 for HTTPS) when no explicit port is given.
+pub(crate) fn extract_host(url: &str) -> String {
     if let Some(after_scheme) = url.split("://").nth(1) {
         let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
         // Handle IPv6 bracket notation: [::1]:8080
@@ -506,7 +509,11 @@ mod tests {
         assert!(check_ssrf("http://169.254.169.254/latest/meta-data/", &allow).is_err());
         // Also verify hostname-based metadata blocks
         let allow2 = vec!["metadata.google.internal".to_string()];
-        assert!(check_ssrf("http://metadata.google.internal/computeMetadata/v1/", &allow2).is_err());
+        assert!(check_ssrf(
+            "http://metadata.google.internal/computeMetadata/v1/",
+            &allow2
+        )
+        .is_err());
     }
 
     #[test]

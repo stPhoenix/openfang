@@ -264,7 +264,7 @@ fn extract_text_from_blocks(content: &[ContentBlock], limits: &FieldLimits) -> S
                     "[Tool Result{error_tag} for {tool_use_id}]\n{truncated}"
                 ));
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 if limits.thinking == 0 {
                     continue;
                 }

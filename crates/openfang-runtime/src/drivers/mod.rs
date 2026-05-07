@@ -5,6 +5,7 @@
 //! Mistral, Fireworks, Ollama, vLLM, Chutes.ai, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
@@ -18,10 +19,10 @@ use openfang_types::model_catalog::{
     AI21_BASE_URL, ANTHROPIC_BASE_URL, AZURE_OPENAI_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL,
     COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL,
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
+    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NOVITA_BASE_URL, NVIDIA_NIM_BASE_URL,
+    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
+    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL,
+    VLLM_BASE_URL, VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::sync::Arc;
@@ -139,8 +140,8 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         }),
         "github-copilot" | "copilot" => Some(ProviderDefaults {
             base_url: copilot::GITHUB_COPILOT_BASE_URL,
-            api_key_env: "GITHUB_TOKEN",
-            key_required: true,
+            api_key_env: "COPILOT_CLIENT_ID",
+            key_required: false, // Auth handled via OAuth device flow, not simple API key
         }),
         "codex" | "openai-codex" => Some(ProviderDefaults {
             base_url: OPENAI_BASE_URL,
@@ -225,6 +226,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         "nvidia" | "nvidia-nim" => Some(ProviderDefaults {
             base_url: NVIDIA_NIM_BASE_URL,
             api_key_env: "NVIDIA_API_KEY",
+            key_required: true,
+        }),
+        "novita" | "novita-ai" => Some(ProviderDefaults {
+            base_url: NOVITA_BASE_URL,
+            api_key_env: "NOVITA_API_KEY",
             key_required: true,
         }),
         "azure" | "azure-openai" => Some(ProviderDefaults {
@@ -324,10 +330,28 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     // Claude Code CLI — subprocess-based, no API key needed
     if provider == "claude-code" {
         let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(
-            cli_path,
-            config.skip_permissions,
-        )));
+        // Timeout precedence (highest wins):
+        //   1. OPENFANG_SUBPROCESS_TIMEOUT_SECS env var (no-rebuild override for emergencies)
+        //   2. DriverConfig.subprocess_timeout_secs, populated upstream from
+        //      config.toml — `default_model.subprocess_timeout_secs` for the
+        //      primary driver, `[[fallback_providers]].subprocess_timeout_secs`
+        //      for global fallbacks. See kernel.rs::resolve_driver and
+        //      kernel.rs::create_drivers for the wiring.
+        //   3. Driver default (currently 300s, set inside ClaudeCodeDriver::new)
+        // NOTE: The field and env var are scope-named to apply to any subprocess
+        // driver, but today only `provider = "claude-code"` reads them. Other
+        // drivers accept the field silently (forward-compat); future subprocess
+        // drivers (qwen-code, etc.) will opt in here individually.
+        let timeout = std::env::var("OPENFANG_SUBPROCESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or(config.subprocess_timeout_secs);
+        return Ok(Arc::new(match timeout {
+            Some(secs) => {
+                claude_code::ClaudeCodeDriver::with_timeout(cli_path, config.skip_permissions, secs)
+            }
+            None => claude_code::ClaudeCodeDriver::new(cli_path, config.skip_permissions),
+        }));
     }
 
     // Claude Code Direct — Anthropic API with OAuth token from Claude CLI.
@@ -363,27 +387,23 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         )));
     }
 
-    // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
-    // The CopilotDriver exchanges the GitHub PAT for a Copilot API token on demand,
-    // caches it, and refreshes when expired.
+    // GitHub Copilot — OAuth device flow + OpenAI-compatible completions.
+    // Authentication is handled automatically via persisted tokens from the device flow.
+    // Run `openfang config set-key github-copilot` to authenticate.
     if provider == "github-copilot" || provider == "copilot" {
-        let github_token = config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-            .ok_or_else(|| {
-                LlmError::MissingApiKey(
-                    "Set GITHUB_TOKEN environment variable for GitHub Copilot".to_string(),
-                )
-            })?;
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| copilot::GITHUB_COPILOT_BASE_URL.to_string());
-        return Ok(Arc::new(copilot::CopilotDriver::new(
-            github_token,
-            base_url,
-        )));
+        let openfang_dir = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(".openfang"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
+
+        if !copilot::copilot_auth_available(&openfang_dir) {
+            return Err(LlmError::MissingApiKey(
+                "Copilot not authenticated. Run `openfang config set-key github-copilot` to sign in."
+                    .to_string(),
+            ));
+        }
+
+        return Ok(Arc::new(copilot::CopilotDriver::new(openfang_dir)));
     }
 
     // Azure OpenAI — deployment-based URL with `api-key` header
@@ -437,6 +457,18 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .or_else(|_| std::env::var("VERTEX_AI_REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
         return Ok(Arc::new(vertex::VertexAIDriver::new(project_id, region)));
+    }
+
+    // AWS Bedrock — Converse API with Bedrock API Key (Bearer token)
+    if provider == "bedrock" {
+        let bedrock_api_key = config.api_key.clone();
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .ok();
+        return Ok(Arc::new(bedrock::BedrockDriver::new_with_credentials(
+            bedrock_api_key,
+            region,
+        )?));
     }
 
     // Kimi for Code — Anthropic-compatible endpoint
@@ -515,10 +547,11 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     Err(LlmError::Api {
         status: 0,
         message: format!(
-            "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, groq, openrouter, \
-             deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
-             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             chutes, venice, nvidia, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+            "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, bedrock, groq, \
+             openrouter, deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, \
+             perplexity, cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, \
+             github-copilot, chutes, venice, nvidia, codex, claude-code. \
+             Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -560,6 +593,7 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
             "PERPLEXITY_API_KEY",
         ),
         ("cohere", "command-r-plus", "COHERE_API_KEY"),
+        ("novita", "moonshotai/kimi-k2.5", "NOVITA_API_KEY"),
     ];
     for &(provider, model, env_var) in PROBE_ORDER {
         if std::env::var(env_var)
@@ -617,6 +651,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "chutes",
         "venice",
         "nvidia",
+        "novita",
         "codex",
         "claude-code",
         "claude-code-direct",
@@ -628,6 +663,39 @@ pub fn known_providers() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn test_provider_defaults_groq() {
@@ -662,6 +730,7 @@ mod tests {
             api_key: Some("test".to_string()),
             base_url: Some("http://localhost:9999/v1".to_string()),
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -674,6 +743,7 @@ mod tests {
             api_key: None,
             base_url: None,
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -722,11 +792,12 @@ mod tests {
         assert!(providers.contains(&"volcengine"));
         assert!(providers.contains(&"chutes"));
         assert!(providers.contains(&"nvidia"));
+        assert!(providers.contains(&"novita"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
         assert!(providers.contains(&"qwen-code"));
         assert!(providers.contains(&"azure"));
-        assert_eq!(providers.len(), 38);
+        assert_eq!(providers.len(), 39);
     }
 
     #[test]
@@ -768,32 +839,86 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_defaults_novita() {
+        let d = provider_defaults("novita").unwrap();
+        assert_eq!(d.base_url, "https://api.novita.ai/openai/v1");
+        assert_eq!(d.api_key_env, "NOVITA_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_provider_defaults_novita_ai_alias() {
+        let d = provider_defaults("novita-ai").unwrap();
+        assert_eq!(d.base_url, "https://api.novita.ai/openai/v1");
+        assert_eq!(d.api_key_env, "NOVITA_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_novita_provider_with_env_key() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let unique_key = "test-novita-key-12345";
+        let _env = EnvVarGuard::set("NOVITA_API_KEY", unique_key);
+        let config = DriverConfig {
+            provider: "novita".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: None,
+        };
+        let driver = create_driver(&config);
+        assert!(
+            driver.is_ok(),
+            "Novita provider with env var should succeed"
+        );
+    }
+
+    #[test]
+    fn test_novita_provider_no_key_errors() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::remove("NOVITA_API_KEY");
+        let config = DriverConfig {
+            provider: "novita".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: None,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_err());
+    }
+
+    #[test]
     fn test_nvidia_provider_with_env_key() {
         // NVIDIA NIM is a known provider — set API key and verify driver creation succeeds.
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let unique_key = "test-nvidia-key-12345";
-        std::env::set_var("NVIDIA_API_KEY", unique_key);
+        let _env = EnvVarGuard::set("NVIDIA_API_KEY", unique_key);
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None, // picked up from env via provider_defaults
             base_url: None,
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(
             driver.is_ok(),
             "NVIDIA provider with env var should succeed"
         );
-        std::env::remove_var("NVIDIA_API_KEY");
     }
 
     #[test]
     fn test_nvidia_provider_no_key_errors() {
         // NVIDIA NIM provider with no API key should error.
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::remove("NVIDIA_API_KEY");
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None,
             base_url: None,
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -802,13 +927,15 @@ mod tests {
     #[test]
     fn test_custom_provider_key_no_url_helpful_error() {
         // Custom provider with key set (via env) but no base_url should give helpful error.
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let unique_key = "test-custom-key-67890";
-        std::env::set_var("MYCUSTOM_API_KEY", unique_key);
+        let _env = EnvVarGuard::set("MYCUSTOM_API_KEY", unique_key);
         let config = DriverConfig {
             provider: "mycustom".to_string(),
             api_key: None,
             base_url: None,
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let result = create_driver(&config);
         assert!(result.is_err());
@@ -818,7 +945,6 @@ mod tests {
             "Error should mention base_url: {}",
             err
         );
-        std::env::remove_var("MYCUSTOM_API_KEY");
     }
 
     #[test]
@@ -837,6 +963,7 @@ mod tests {
             api_key: Some("explicit-key".to_string()),
             base_url: Some("https://api.example.com/v1".to_string()),
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -864,6 +991,7 @@ mod tests {
             api_key: Some("test-azure-key".to_string()),
             base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok(), "Azure driver with key + URL should succeed");
@@ -876,6 +1004,7 @@ mod tests {
             api_key: None,
             base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let result = create_driver(&config);
         assert!(result.is_err(), "Azure driver without key should error");
@@ -894,6 +1023,7 @@ mod tests {
             api_key: Some("test-azure-key".to_string()),
             base_url: None,
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let result = create_driver(&config);
         assert!(result.is_err(), "Azure driver without URL should error");
@@ -912,11 +1042,111 @@ mod tests {
             api_key: Some("test-azure-key".to_string()),
             base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
+            subprocess_timeout_secs: None,
         };
         let driver = create_driver(&config);
         assert!(
             driver.is_ok(),
             "azure-openai alias should create driver successfully"
+        );
+    }
+
+    #[test]
+    fn test_bedrock_not_in_provider_defaults() {
+        // Bedrock is special-cased in create_driver(), not in provider_defaults()
+        assert!(provider_defaults("bedrock").is_none());
+    }
+
+    #[test]
+    fn test_bedrock_driver_requires_credentials() {
+        // With no credentials in env, bedrock creation should fail gracefully
+        // (We can't easily test this without mucking with env, so just verify
+        // that with an explicit api_key it succeeds at construction)
+        let config = DriverConfig {
+            provider: "bedrock".to_string(),
+            api_key: Some("test-bedrock-api-key".to_string()),
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: None,
+        };
+        // Should succeed because api_key is provided
+        let driver = create_driver(&config);
+        assert!(
+            driver.is_ok(),
+            "Bedrock with explicit api_key should construct successfully"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_driver_constructs_with_default_timeout() {
+        // No timeout in config and no env override → driver uses its built-in default.
+        std::env::remove_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS");
+        let config = DriverConfig {
+            provider: "claude-code".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: None,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_ok(), "claude-code driver should construct");
+    }
+
+    #[test]
+    fn test_claude_code_driver_constructs_with_config_timeout() {
+        // Timeout set via config field → with_timeout path is exercised.
+        std::env::remove_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS");
+        let config = DriverConfig {
+            provider: "claude-code".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: Some(480),
+        };
+        let driver = create_driver(&config);
+        assert!(
+            driver.is_ok(),
+            "claude-code driver should construct with custom timeout"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_driver_constructs_with_env_timeout_override() {
+        // Env var present → wins over config field. We can't read the timeout off the
+        // trait object here, but at minimum the construction path must not panic
+        // when both are set and the env var parses cleanly.
+        std::env::set_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS", "600");
+        let config = DriverConfig {
+            provider: "claude-code".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: Some(120),
+        };
+        let driver = create_driver(&config);
+        std::env::remove_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS");
+        assert!(
+            driver.is_ok(),
+            "claude-code driver should construct when env override is set"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_driver_ignores_unparseable_env_timeout() {
+        // Garbage env var → falls through to config field, doesn't error.
+        std::env::set_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS", "not-a-number");
+        let config = DriverConfig {
+            provider: "claude-code".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+            subprocess_timeout_secs: Some(420),
+        };
+        let driver = create_driver(&config);
+        std::env::remove_var("OPENFANG_SUBPROCESS_TIMEOUT_SECS");
+        assert!(
+            driver.is_ok(),
+            "unparseable env override should fall through to config field"
         );
     }
 }

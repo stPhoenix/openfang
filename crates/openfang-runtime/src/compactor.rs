@@ -98,7 +98,7 @@ fn estimate_block_tokens(block: &ContentBlock) -> usize {
         ContentBlock::Text { text, .. } => rough_token_count_estimation(text, 4),
         ContentBlock::Image { .. } => IMAGE_MAX_TOKEN_SIZE,
         ContentBlock::ToolResult { content, .. } => rough_token_count_estimation(content, 4),
-        ContentBlock::Thinking { thinking } => rough_token_count_estimation(thinking, 4),
+        ContentBlock::Thinking { thinking, .. } => rough_token_count_estimation(thinking, 4),
         ContentBlock::ToolUse { name, input, .. } => {
             let input_str = serde_json::to_string(input).unwrap_or_default();
             rough_token_count_estimation(&format!("{name}{input_str}"), 4)
@@ -1037,10 +1037,9 @@ async fn summarize_messages(
         let safe_start = if conversation_text.is_char_boundary(start) {
             start
         } else {
-            conversation_text[start..]
-                .char_indices()
-                .next()
-                .map(|(i, _)| start + i)
+            // Find the nearest valid character boundary moving upward
+            (start..conversation_text.len())
+                .find(|&i| conversation_text.is_char_boundary(i))
                 .unwrap_or(conversation_text.len())
         };
         conversation_text = conversation_text[safe_start..].to_string();

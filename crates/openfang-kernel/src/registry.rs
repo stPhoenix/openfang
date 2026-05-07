@@ -424,6 +424,7 @@ mod tests {
                 tool_blocklist: vec![],
                 taint_policy: Default::default(),
                 prompt_guard: Default::default(),
+                cache_context: false,
             },
             state: AgentState::Created,
             mode: AgentMode::default(),

@@ -192,6 +192,70 @@ fn apply_prompt_guard_to_result(
     }
 }
 
+/// Build an assistant message that preserves Thinking blocks alongside the
+/// final visible text.
+///
+/// Issue #1098 — thinking-model state preservation.  When the LLM response
+/// contains `ContentBlock::Thinking` (Anthropic extended thinking with
+/// signatures, Gemini 2.5+ thoughts, OpenAI-compat reasoning_content,
+/// MiniMax/Qwen inline `<think>` blocks), the prior code stored only the
+/// final text via `Message::assistant(text)` — discarding all reasoning
+/// state.  On the next turn the model re-derived its answer from scratch
+/// and quality degraded.
+///
+/// This helper preserves the full block list whenever any Thinking block is
+/// present, otherwise returns the legacy `Message::assistant(text)` form so
+/// downstream consumers (channel formatters, JSONL mirrors, embeddings) keep
+/// working without changes.
+///
+/// Note: we deliberately replace any visible Text blocks in `response_blocks`
+/// with `final_text` so that any post-processing the agent loop applied
+/// (phantom-action recovery, accumulated_text fallback, EmptyResponse guard
+/// stub) is reflected in the persisted message.
+fn build_assistant_message_preserving_thinking(
+    response_blocks: &[ContentBlock],
+    final_text: &str,
+) -> Message {
+    let has_thinking = response_blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+    if !has_thinking {
+        return Message::assistant(final_text.to_string());
+    }
+
+    // Preserve order: Thinking blocks first (in original order), then a
+    // single Text block carrying `final_text`.  Tool blocks aren't expected
+    // here (StopReason::EndTurn path), but copy them through if present so
+    // we don't drop information.
+    let mut blocks: Vec<ContentBlock> = Vec::with_capacity(response_blocks.len() + 1);
+    let mut emitted_text = false;
+    for b in response_blocks {
+        match b {
+            ContentBlock::Thinking { .. } => blocks.push(b.clone()),
+            ContentBlock::Text { .. } if !emitted_text => {
+                blocks.push(ContentBlock::Text {
+                    text: final_text.to_string(),
+                    provider_metadata: None,
+                });
+                emitted_text = true;
+            }
+            ContentBlock::Text { .. } => {
+                // Drop additional text blocks — final_text already captures
+                // the canonical visible message.
+            }
+            other => blocks.push(other.clone()),
+        }
+    }
+    if !emitted_text && !final_text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: final_text.to_string(),
+            provider_metadata: None,
+        });
+    }
+
+    Message::assistant_with_blocks(blocks)
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -246,6 +310,30 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+}
+
+/// Build the user-turn message, combining text with any image content blocks.
+///
+/// When the turn has both text and image blocks the text is emitted as the
+/// first block followed by the images so the LLM sees the full multimodal
+/// turn. When only one is present the single-mode representation is used.
+fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>) -> Message {
+    match blocks {
+        Some(blocks) if !blocks.is_empty() => {
+            if user_message.trim().is_empty() {
+                Message::user_with_blocks(blocks)
+            } else {
+                let mut combined = Vec::with_capacity(blocks.len() + 1);
+                combined.push(ContentBlock::Text {
+                    text: user_message.to_string(),
+                    provider_metadata: None,
+                });
+                combined.extend(blocks);
+                Message::user_with_blocks(combined)
+            }
+        }
+        _ => Message::user(user_message),
+    }
 }
 
 /// Run the agent execution loop for a single user message.
@@ -364,12 +452,10 @@ pub async fn run_agent_loop(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field.
@@ -425,6 +511,10 @@ pub async fn run_agent_loop(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    // Accumulate text from intermediate iterations (tool_use turns may include text
+    // alongside tool calls — this text would otherwise be lost when the final
+    // EndTurn iteration has empty text).
+    let mut accumulated_text = String::new();
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
@@ -442,6 +532,10 @@ pub async fn run_agent_loop(
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
         messages = crate::session_repair::validate_and_repair(&messages);
+        // Ensure history starts with a user turn: trimming may have left an
+        // assistant turn at position 0, which strict providers (e.g. Gemini)
+        // reject with INVALID_ARGUMENT on function-call turns.
+        messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -541,6 +635,8 @@ pub async fn run_agent_loop(
         // which may have broken assistant→tool ordering invariants.
         if recovery != RecoveryStage::None {
             messages = crate::session_repair::validate_and_repair(&messages);
+            // Ensure history starts with a user turn after overflow recovery.
+            messages = crate::session_repair::ensure_starts_with_user(messages);
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -686,20 +782,30 @@ pub async fn run_agent_loop(
                     }
                 }
 
-                // Guard against empty response — covers both iteration 0 and post-tool cycles
+                // Guard against empty response — covers both iteration 0 and post-tool cycles.
+                // Use accumulated_text from intermediate tool_use iterations as fallback.
                 let text = if text.trim().is_empty() {
-                    warn!(
-                        agent = %manifest.name,
-                        iteration,
-                        input_tokens = total_usage.input_tokens,
-                        output_tokens = total_usage.output_tokens,
-                        messages_count = messages.len(),
-                        "Empty response from LLM — guard activated"
-                    );
-                    if any_tools_executed {
-                        "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                    if !accumulated_text.is_empty() {
+                        debug!(
+                            agent = %manifest.name,
+                            accumulated_len = accumulated_text.len(),
+                            "Using accumulated text from intermediate tool_use iterations"
+                        );
+                        accumulated_text.clone()
                     } else {
-                        "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = total_usage.input_tokens,
+                            output_tokens = total_usage.output_tokens,
+                            messages_count = messages.len(),
+                            "Empty response from LLM — guard activated"
+                        );
+                        if any_tools_executed {
+                            "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                        } else {
+                            "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        }
                     }
                 } else {
                     text
@@ -725,7 +831,16 @@ pub async fn run_agent_loop(
                 };
 
                 final_response = text.clone();
-                session.messages.push(Message::assistant(text));
+                // Issue #1098: persist Thinking blocks alongside the text so
+                // reasoning models retain state across turns.  When the
+                // response carries any Thinking content (Anthropic extended
+                // thinking, Gemini 2.5 thought signatures, DeepSeek-R1/Qwen3
+                // `reasoning_content`, MiniMax inline `<think>`), save the
+                // full content blocks; otherwise fall back to the legacy
+                // Text shape so existing sessions/snapshots stay readable.
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg);
 
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
@@ -819,6 +934,18 @@ pub async fn run_agent_loop(
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
                 any_tools_executed = true;
+
+                // Capture any text content from this tool_use turn — the LLM may
+                // produce text alongside tool calls (e.g., a message to the user
+                // before calling memory_store). Without this, the text is lost if
+                // the next iteration returns EndTurn with empty text.
+                let intermediate_text = response.text();
+                if !intermediate_text.trim().is_empty() {
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push_str("\n\n");
+                    }
+                    accumulated_text.push_str(intermediate_text.trim());
+                }
 
                 // Execute tool calls
                 let assistant_blocks = response.content.clone();
@@ -1274,6 +1401,7 @@ async fn call_with_retry(
                             api_key,
                             base_url: fb.base_url.clone(),
                             skip_permissions: true,
+                            subprocess_timeout_secs: None,
                         };
                         let fb_driver = match crate::drivers::create_driver(&fb_config) {
                             Ok(d) => d,
@@ -1457,6 +1585,7 @@ async fn stream_with_retry(
                             api_key,
                             base_url: fb.base_url.clone(),
                             skip_permissions: true,
+                            subprocess_timeout_secs: None,
                         };
                         let fb_driver = match crate::drivers::create_driver(&fb_config) {
                             Ok(d) => d,
@@ -1635,12 +1764,10 @@ pub async fn run_agent_loop_streaming(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -1692,6 +1819,7 @@ pub async fn run_agent_loop_streaming(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    let mut accumulated_text = String::new();
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
@@ -1707,6 +1835,10 @@ pub async fn run_agent_loop_streaming(
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
         messages = crate::session_repair::validate_and_repair(&messages);
+        // Ensure history starts with a user turn: trimming may have left an
+        // assistant turn at position 0, which strict providers (e.g. Gemini)
+        // reject with INVALID_ARGUMENT on function-call turns.
+        messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -1828,6 +1960,8 @@ pub async fn run_agent_loop_streaming(
         // be followed by tool messages" errors after context overflow recovery.)
         if recovery != RecoveryStage::None {
             messages = crate::session_repair::validate_and_repair(&messages);
+            // Ensure history starts with a user turn after overflow recovery.
+            messages = crate::session_repair::ensure_starts_with_user(messages);
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -1863,6 +1997,12 @@ pub async fn run_agent_loop_streaming(
             } else {
                 cb(LoopPhase::Thinking);
             }
+        }
+
+        // Stamp last_active before the (potentially long) LLM call so the
+        // heartbeat monitor doesn't flag us as unresponsive mid-iteration.
+        if let Some(k) = &kernel {
+            k.touch_agent(&agent_id_str);
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1970,26 +2110,41 @@ pub async fn run_agent_loop_streaming(
                     }
                 }
 
-                // Guard against empty response — covers both iteration 0 and post-tool cycles
+                // Guard against empty response — use accumulated text as fallback (streaming).
                 let text = if text.trim().is_empty() {
-                    warn!(
-                        agent = %manifest.name,
-                        iteration,
-                        input_tokens = total_usage.input_tokens,
-                        output_tokens = total_usage.output_tokens,
-                        messages_count = messages.len(),
-                        "Empty response from LLM (streaming) — guard activated"
-                    );
-                    if any_tools_executed {
-                        "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                    if !accumulated_text.is_empty() {
+                        debug!(
+                            agent = %manifest.name,
+                            accumulated_len = accumulated_text.len(),
+                            "Using accumulated text from intermediate tool_use iterations (streaming)"
+                        );
+                        accumulated_text.clone()
                     } else {
-                        "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = total_usage.input_tokens,
+                            output_tokens = total_usage.output_tokens,
+                            messages_count = messages.len(),
+                            "Empty response from LLM (streaming) — guard activated"
+                        );
+                        if any_tools_executed {
+                            "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                        } else {
+                            "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        }
                     }
                 } else {
                     text
                 };
                 final_response = text.clone();
-                session.messages.push(Message::assistant(text));
+                // Issue #1098: preserve Thinking blocks (with Anthropic
+                // signatures / Gemini thought signatures / inline-think /
+                // reasoning_content) on the persisted assistant turn.  See
+                // build_assistant_message_preserving_thinking for details.
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg);
 
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
@@ -2082,6 +2237,15 @@ pub async fn run_agent_loop_streaming(
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
                 any_tools_executed = true;
+
+                // Capture text from intermediate tool_use turns (streaming path).
+                let intermediate_text = response.text();
+                if !intermediate_text.trim().is_empty() {
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push_str("\n\n");
+                    }
+                    accumulated_text.push_str(intermediate_text.trim());
+                }
 
                 let assistant_blocks = response.content.clone();
 
@@ -3296,6 +3460,94 @@ mod tests {
         assert_eq!(MAX_ITERATIONS, 50);
     }
 
+    /// Issue #1098: when a response carries Thinking blocks, the persisted
+    /// assistant turn must keep them so the next turn round-trips reasoning
+    /// state to the model.
+    #[test]
+    fn test_build_assistant_message_preserves_thinking() {
+        let response_blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "Let me reason carefully...".to_string(),
+                signature: Some("sig_anthropic_xyz".to_string()),
+                provider_metadata: Some(serde_json::json!({
+                    "format": "anthropic_extended_thinking"
+                })),
+            },
+            ContentBlock::Text {
+                text: "Initial response text".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        // Final text might differ from the original Text block (phantom-action
+        // recovery / synthesis fallback rewrites it). The helper should adopt
+        // final_text into the persisted Text block.
+        let final_text = "Initial response text";
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, final_text);
+        assert_eq!(msg.role, Role::Assistant);
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            other => panic!("expected blocks, got {other:?}"),
+        };
+        assert_eq!(blocks.len(), 2, "must preserve thinking + text");
+        match &blocks[0] {
+            ContentBlock::Thinking {
+                thinking, signature, ..
+            } => {
+                assert_eq!(thinking, "Let me reason carefully...");
+                assert_eq!(signature.as_deref(), Some("sig_anthropic_xyz"));
+            }
+            _ => panic!("expected Thinking first"),
+        }
+        match &blocks[1] {
+            ContentBlock::Text { text, .. } => assert_eq!(text, "Initial response text"),
+            _ => panic!("expected Text second"),
+        }
+    }
+
+    /// Without thinking, fall back to the legacy `Message::assistant(text)`
+    /// shape so existing JSONL mirrors and embeddings keep working.
+    #[test]
+    fn test_build_assistant_message_no_thinking_is_plain_text() {
+        let response_blocks = vec![ContentBlock::Text {
+            text: "Hi.".to_string(),
+            provider_metadata: None,
+        }];
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, "Hi.");
+        match msg.content {
+            MessageContent::Text(t) => assert_eq!(t, "Hi."),
+            _ => panic!("expected plain text content for non-thinking responses"),
+        }
+    }
+
+    /// Final text supplied by the loop (e.g. recovery stub) must replace
+    /// the original text part — the persisted message reflects what was
+    /// actually returned to the user, not the raw LLM output.
+    #[test]
+    fn test_build_assistant_message_final_text_replaces_original_text() {
+        let response_blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "deliberation".to_string(),
+                signature: None,
+                provider_metadata: Some(serde_json::json!({"format": "inline_think"})),
+            },
+            ContentBlock::Text {
+                text: "raw LLM output".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        let final_text = "[Task completed — recovered after empty response.]";
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, final_text);
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            _ => panic!("expected blocks"),
+        };
+        let saved_text = blocks.iter().find_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(saved_text, Some(final_text));
+    }
+
     #[test]
     fn test_retry_constants() {
         assert_eq!(MAX_RETRIES, 3);
@@ -3358,6 +3610,77 @@ mod tests {
     #[test]
     fn test_max_history_messages() {
         assert_eq!(MAX_HISTORY_MESSAGES, 20);
+    }
+
+    fn sample_image_block() -> ContentBlock {
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_only() {
+        let msg = build_user_turn_message("hello", None);
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hello"),
+            MessageContent::Blocks(_) => panic!("expected Text content for text-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_images_only() {
+        let msg = build_user_turn_message("", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for images-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_and_images_combined() {
+        let msg =
+            build_user_turn_message("what is in this image?", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2, "text must be combined with images");
+                match &blocks[0] {
+                    ContentBlock::Text { text, .. } => {
+                        assert_eq!(text, "what is in this image?");
+                    }
+                    _ => panic!("expected first block to be user text"),
+                }
+                assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for multimodal turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_whitespace_text_treated_as_empty() {
+        let msg = build_user_turn_message("   \n", Some(vec![sample_image_block()]));
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_empty_blocks_falls_back_to_text() {
+        let msg = build_user_turn_message("hi", Some(Vec::new()));
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hi"),
+            MessageContent::Blocks(_) => panic!("expected Text content when blocks are empty"),
+        }
     }
 
     // --- Integration tests for empty response guards ---

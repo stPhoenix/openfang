@@ -463,7 +463,7 @@ fn analyze_messages(messages: &[Message]) -> MessageBreakdown {
                     breakdown.attachment_tokens += tokens;
                     *attach_by_type.entry("image".to_string()).or_default() += tokens;
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     let tokens = rough_token_count_estimation(thinking, 4);
                     breakdown.assistant_message_tokens += tokens;
                 }

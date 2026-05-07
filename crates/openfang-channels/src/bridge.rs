@@ -14,7 +14,8 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
 use openfang_types::approval::ApprovalRequest;
-use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
+use openfang_types::commands::{self as slash_commands, Surfaces};
+use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle};
 use openfang_types::message::ContentBlock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -258,6 +259,13 @@ pub trait ChannelBridgeHandle: Send + Sync {
         None
     }
 
+    /// Get channel IDs that respond without requiring @mention (free response mode).
+    ///
+    /// Returns an empty vector if the channel type is not configured or has no free response channels.
+    async fn free_response_channels(&self, _channel_type: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Record a delivery result for tracking (optional — default no-op).
     ///
     /// `thread_id` preserves Telegram forum-topic context so cron/workflow
@@ -272,6 +280,22 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _thread_id: Option<&str>,
     ) {
         // Default: no tracking
+    }
+
+    /// Send a plain text message to a specific recipient via a registered
+    /// channel adapter.
+    ///
+    /// Used by the cron multi-destination delivery engine to fan out job
+    /// output across channels. `channel_type` is the adapter key (e.g.
+    /// `"telegram"`, `"slack"`). Default implementation returns an error so
+    /// test doubles don't accidentally claim success.
+    async fn send_channel_message(
+        &self,
+        _channel_type: &str,
+        _recipient: &str,
+        _message: &str,
+    ) -> Result<(), String> {
+        Err("send_channel_message not implemented on this bridge".to_string())
     }
 
     /// Check if auto-reply is enabled and the message should trigger one.
@@ -435,6 +459,26 @@ impl BridgeManager {
         adapter: Arc<dyn ChannelAdapter>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let stream = adapter.start().await?;
+
+        // Migration note for Discord/Slack: prior versions keyed `/agent <name>`
+        // selections on the channel ID rather than the user. `user_defaults` is
+        // in-memory only, so the daemon restart that loads this binary already
+        // wipes any stale entries — but log a one-line nudge so users know to
+        // re-run `/agent <name>` if their previous selection appears to have
+        // gone away. See `set_user_default` call sites in `dispatch_message`
+        // and `handle_command` for the keying fix.
+        match adapter.name() {
+            "discord" | "slack" => {
+                info!(
+                    adapter = adapter.name(),
+                    "Channel adapter starting: per-user `/agent <name>` defaults are \
+                     in-memory and reset on daemon restart. If a previous selection \
+                     no longer takes effect, re-run `/agent <name>` once."
+                );
+            }
+            _ => {}
+        }
+
         let handle = self.handle.clone();
         let router = self.router.clone();
         let rate_limiter = self.rate_limiter.clone();
@@ -524,6 +568,69 @@ fn channel_type_str(channel: &crate::types::ChannelType) -> &str {
     }
 }
 
+/// Wrap an outbound message with the responding agent's name according to
+/// `style`.
+///
+/// Applied once at the top of the final response text (never per streaming
+/// chunk). If the text already starts with the exact bracketed agent label
+/// (e.g. the agent echoed its own name, or an inner agent already prefixed a
+/// delegated reply), the wrap is skipped to keep things idempotent.
+///
+/// Per-platform native identity features (Slack `username` override, Discord
+/// embed `author`, Telegram `From:` in rich messages) are intentionally not
+/// handled here — that is a follow-up.
+pub(crate) fn apply_agent_prefix(style: PrefixStyle, agent_name: &str, text: &str) -> String {
+    if matches!(style, PrefixStyle::Off) || agent_name.is_empty() {
+        return text.to_string();
+    }
+    let bracket = format!("[{agent_name}]");
+    let bold = format!("**[{agent_name}]**");
+    if text.starts_with(&bracket) || text.starts_with(&bold) {
+        return text.to_string();
+    }
+    match style {
+        PrefixStyle::Off => text.to_string(),
+        PrefixStyle::Bracket => format!("{bracket} {text}"),
+        PrefixStyle::BoldBracket => format!("{bold} {text}"),
+    }
+}
+
+/// Look up an agent's display name by id.
+///
+/// Returns `None` if the kernel can't list agents or the id is not currently
+/// known. Only called when `prefix_agent_name` is enabled, so the extra
+/// `list_agents()` round-trip is pay-per-use.
+async fn resolve_agent_name(handle: &Arc<dyn ChannelBridgeHandle>, id: AgentId) -> Option<String> {
+    handle
+        .list_agents()
+        .await
+        .ok()?
+        .into_iter()
+        .find_map(|(aid, name)| (aid == id).then_some(name))
+}
+
+/// Apply `prefix_agent_name` to an outbound agent response if configured.
+///
+/// Safe to call on every success path: resolves the agent name lazily and
+/// returns the original text unchanged when the style is `Off`.
+async fn maybe_prefix_response(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    overrides: Option<&ChannelOverrides>,
+    agent_id: AgentId,
+    text: String,
+) -> String {
+    let style = overrides
+        .map(|o| o.prefix_agent_name)
+        .unwrap_or(PrefixStyle::Off);
+    if matches!(style, PrefixStyle::Off) {
+        return text;
+    }
+    match resolve_agent_name(handle, agent_id).await {
+        Some(name) => apply_agent_prefix(style, &name, &text),
+        None => text,
+    }
+}
+
 /// Send a response, applying output formatting and optional threading.
 async fn send_response(
     adapter: &dyn ChannelAdapter,
@@ -555,6 +662,7 @@ fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
         "telegram" => OutputFormat::TelegramHtml,
         "slack" => OutputFormat::SlackMrkdwn,
         "wecom" => OutputFormat::PlainText,
+        "signal" => OutputFormat::PlainText,
         _ => OutputFormat::Markdown,
     }
 }
@@ -607,6 +715,34 @@ fn sender_user_id(message: &ChannelMessage) -> &str {
         .get("sender_user_id")
         .and_then(|v| v.as_str())
         .unwrap_or(&message.sender.platform_id)
+}
+
+/// Extract the channel/conversation ID from a message, for bindings whose
+/// `match_rule.channel_id` is set.
+///
+/// On Discord and Slack, `sender.platform_id` already holds the channel/
+/// conversation ID (per `discord.rs` and `slack.rs`, where the user ID lives
+/// in metadata under `sender_user_id`). On other adapters where the platform
+/// ID is the user, callers can opt-in by stashing the channel ID under the
+/// `sender_channel_id` metadata key.
+fn sender_channel_id(message: &ChannelMessage) -> Option<&str> {
+    if let Some(v) = message
+        .metadata
+        .get("sender_channel_id")
+        .and_then(|v| v.as_str())
+    {
+        return Some(v);
+    }
+    // On Discord/Slack, the metadata `sender_user_id` is set and differs from
+    // `sender.platform_id` — in that case, platform_id IS the channel ID.
+    let user_in_meta = message
+        .metadata
+        .get("sender_user_id")
+        .and_then(|v| v.as_str());
+    match user_in_meta {
+        Some(uid) if uid != message.sender.platform_id => Some(&message.sender.platform_id),
+        _ => None,
+    }
 }
 
 /// If an error contains "Agent not found", try to re-resolve the channel's default agent
@@ -697,16 +833,23 @@ async fn dispatch_message(
                     }
                 }
                 GroupPolicy::MentionOnly => {
-                    // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message
-                        .metadata
-                        .get("was_mentioned")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let is_command = matches!(&message.content, ChannelContent::Command { .. });
-                    if !was_mentioned && !is_command {
-                        debug!("Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)");
-                        return;
+                    // Check if this channel is in the free_response list - if so, allow all messages
+                    let free_channels = handle.free_response_channels(ct_str).await;
+                    let channel_id = &message.sender.platform_id;
+                    let is_free_channel = free_channels.iter().any(|id| id == channel_id);
+
+                    if !is_free_channel {
+                        // Only allow messages where the bot was @mentioned or commands.
+                        let was_mentioned = message
+                            .metadata
+                            .get("was_mentioned")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let is_command = matches!(&message.content, ChannelContent::Command { .. });
+                        if !was_mentioned && !is_command {
+                            debug!("Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)");
+                            return;
+                        }
                     }
                 }
                 GroupPolicy::All => {}
@@ -740,7 +883,15 @@ async fn dispatch_message(
 
     // Handle commands first (early return)
     if let ChannelContent::Command { ref name, ref args } = message.content {
-        let result = handle_command(name, args, handle, router, &message.sender).await;
+        let result = handle_command(
+            name,
+            args,
+            handle,
+            router,
+            &message.sender,
+            sender_user_id(message),
+        )
+        .await;
         send_response(adapter, &message.sender, result, thread_id, output_format).await;
         return;
     }
@@ -756,6 +907,10 @@ async fn dispatch_message(
             .iter()
             .any(|b| matches!(b, ContentBlock::Image { .. }))
         {
+            let prefix_style = overrides
+                .as_ref()
+                .map(|o| o.prefix_agent_name)
+                .unwrap_or(PrefixStyle::Off);
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
@@ -769,6 +924,7 @@ async fn dispatch_message(
                 output_format,
                 lifecycle_reactions,
                 &overrides,
+                prefix_style,
             )
             .await;
             return;
@@ -820,7 +976,15 @@ async fn dispatch_message(
         };
 
         if is_channel_command(cmd) {
-            let result = handle_command(cmd, &args, handle, router, &message.sender).await;
+            let result = handle_command(
+                cmd,
+                &args,
+                handle,
+                router,
+                &message.sender,
+                sender_user_id(message),
+            )
+            .await;
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
@@ -889,8 +1053,12 @@ async fn dispatch_message(
     }
 
     // Check broadcast routing first
-    if router.has_broadcast(&message.sender.platform_id) {
-        let targets = router.resolve_broadcast(&message.sender.platform_id);
+    // Broadcast lookup is keyed on the user, matching the read path's
+    // sender_user_id() resolution. On Discord/Slack `sender.platform_id` is the
+    // channel ID, so keying on it would collide with channel routing — see the
+    // companion fix on `set_user_default` writes below.
+    if router.has_broadcast(sender_user_id(message)) {
+        let targets = router.resolve_broadcast(sender_user_id(message));
         if !targets.is_empty() {
             // RBAC check applies to broadcast too
             if let Err(denied) = handle
@@ -958,11 +1126,16 @@ async fn dispatch_message(
         }
     }
 
-    // Route to agent (standard path)
-    let agent_id = router.resolve(
+    // Route to agent (standard path).
+    // Use sender_user_id() so user-keyed bindings (peer_id) match for adapters like
+    // Discord/Slack where sender.platform_id is the channel ID, not the user ID.
+    // Pass the channel/conversation ID separately so bindings with `channel_id`
+    // can match (e.g. "messages in Discord channel X → agent Y").
+    let agent_id = router.resolve_with_channel_id(
         &message.channel,
-        &message.sender.platform_id,
+        sender_user_id(message),
         message.sender.openfang_user.as_deref(),
+        sender_channel_id(message),
     );
 
     let agent_id = match agent_id {
@@ -980,8 +1153,10 @@ async fn dispatch_message(
             };
             match fallback {
                 Some(id) => {
-                    // Auto-set this as the user's default so future messages route directly
-                    router.set_user_default(message.sender.platform_id.clone(), id);
+                    // Auto-set this as the user's default so future messages route directly.
+                    // Key on sender_user_id() (not platform_id) so Discord/Slack — where
+                    // platform_id is the channel — store per-user, matching the read path.
+                    router.set_user_default(sender_user_id(message).to_string(), id);
                     id
                 }
                 None => {
@@ -1026,6 +1201,7 @@ async fn dispatch_message(
     // Auto-reply check — if enabled, the engine decides whether to process this message.
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
+        let reply = maybe_prefix_response(handle, overrides.as_ref(), agent_id, reply).await;
         send_response(adapter, &message.sender, reply, thread_id, output_format).await;
         handle
             .record_delivery(
@@ -1083,6 +1259,8 @@ async fn dispatch_message(
             if lifecycle_reactions {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
             }
+            let response =
+                maybe_prefix_response(handle, overrides.as_ref(), agent_id, response).await;
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(
@@ -1114,6 +1292,9 @@ async fn dispatch_message(
                             )
                             .await;
                         }
+                        let response =
+                            maybe_prefix_response(handle, overrides.as_ref(), new_id, response)
+                                .await;
                         send_response(adapter, &message.sender, response, thread_id, output_format)
                             .await;
                         handle
@@ -1402,12 +1583,16 @@ async fn dispatch_with_blocks(
     output_format: OutputFormat,
     lifecycle_reactions: bool,
     overrides: &Option<openfang_types::config::ChannelOverrides>,
+    prefix_style: PrefixStyle,
 ) {
-    // Route to agent (same logic as text path)
-    let agent_id = router.resolve(
+    // Route to agent (same logic as text path).
+    // Use sender_user_id() so user-keyed bindings match for Discord/Slack;
+    // pass channel_id so per-room bindings match too.
+    let agent_id = router.resolve_with_channel_id(
         &message.channel,
-        &message.sender.platform_id,
+        sender_user_id(message),
         message.sender.openfang_user.as_deref(),
+        sender_channel_id(message),
     );
 
     let agent_id = match agent_id {
@@ -1424,7 +1609,9 @@ async fn dispatch_with_blocks(
             };
             match fallback {
                 Some(id) => {
-                    router.set_user_default(message.sender.platform_id.clone(), id);
+                    // Key on sender_user_id() (not platform_id) so Discord/Slack — where
+                    // platform_id is the channel — store per-user, matching the read path.
+                    router.set_user_default(sender_user_id(message).to_string(), id);
                     id
                 }
                 None => {
@@ -1531,11 +1718,23 @@ async fn dispatch_with_blocks(
 
     typing_task.abort();
 
+    // Resolve agent name once (only if the prefix feature is on) and reuse for
+    // both the first response and any re-resolved retry.
+    let prefix_name = if matches!(prefix_style, PrefixStyle::Off) {
+        None
+    } else {
+        resolve_agent_name(handle, agent_id).await
+    };
+
     match result {
         Ok(response) => {
             if lifecycle_reactions {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
             }
+            let response = match &prefix_name {
+                Some(name) => apply_agent_prefix(prefix_style, name, &response),
+                None => response,
+            };
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(
@@ -1567,6 +1766,15 @@ async fn dispatch_with_blocks(
                             )
                             .await;
                         }
+                        let retry_name = if matches!(prefix_style, PrefixStyle::Off) {
+                            None
+                        } else {
+                            resolve_agent_name(handle, new_id).await
+                        };
+                        let response = match &retry_name {
+                            Some(name) => apply_agent_prefix(prefix_style, name, &response),
+                            None => response,
+                        };
                         send_response(adapter, &message.sender, response, thread_id, output_format)
                             .await;
                         handle
@@ -1647,14 +1855,29 @@ async fn dispatch_with_blocks(
 }
 
 /// Handle a bot command (returns the response text).
+///
+/// `user_id` is the platform user ID (e.g. Discord author ID, Slack user ID).
+/// For adapters that set `sender.platform_id` to the channel/conversation ID
+/// (Discord, Slack), callers must pass `sender_user_id(message)` here so that
+/// per-user agent routing works correctly. For adapters where platform_id is
+/// already the user (CLI, Telegram DM), the two are equivalent.
 async fn handle_command(
     name: &str,
     args: &[String],
     handle: &Arc<dyn ChannelBridgeHandle>,
     router: &Arc<AgentRouter>,
     sender: &ChannelUser,
+    user_id: &str,
 ) -> String {
-    match name {
+    // Canonicalise through the unified command registry: aliases resolve to
+    // their canonical name and matching is case-insensitive. If the command
+    // is not registered on CHANNEL the original string is passed through so
+    // any legacy / channel-specific names continue to work unchanged.
+    let canonical: &str = slash_commands::resolve(name)
+        .filter(|def| def.surfaces.contains(Surfaces::CHANNEL))
+        .map(|def| def.name)
+        .unwrap_or(name);
+    match canonical {
         "start" => {
             let agents = handle.list_agents().await.unwrap_or_default();
             let mut msg = "Welcome to OpenFang! I connect you to AI agents.\n\nAvailable agents:\n"
@@ -1698,14 +1921,17 @@ async fn handle_command(
             let agent_name = &args[0];
             match handle.find_agent_by_name(agent_name).await {
                 Ok(Some(agent_id)) => {
-                    router.set_user_default(sender.platform_id.clone(), agent_id);
+                    // Key on user_id (the param wired in by the Discord/Slack call sites
+                    // via sender_user_id(message)) — not sender.platform_id, which is the
+                    // channel ID on those adapters. Matches the read-path resolution.
+                    router.set_user_default(user_id.to_string(), agent_id);
                     format!("Now talking to agent: {agent_name}")
                 }
                 Ok(None) => {
                     // Try to spawn it
                     match handle.spawn_agent_by_name(agent_name).await {
                         Ok(agent_id) => {
-                            router.set_user_default(sender.platform_id.clone(), agent_id);
+                            router.set_user_default(user_id.to_string(), agent_id);
                             format!("Spawned and connected to agent: {agent_name}")
                         }
                         Err(e) => {
@@ -1720,7 +1946,7 @@ async fn handle_command(
             // Need to resolve the user's current agent
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1734,7 +1960,7 @@ async fn handle_command(
         "compact" => {
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1748,7 +1974,7 @@ async fn handle_command(
         "model" => {
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1772,7 +1998,7 @@ async fn handle_command(
         "stop" => {
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1786,7 +2012,7 @@ async fn handle_command(
         "usage" => {
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1800,7 +2026,7 @@ async fn handle_command(
         "think" => {
             let agent_id = router.resolve(
                 &crate::types::ChannelType::CLI,
-                &sender.platform_id,
+                user_id,
                 sender.openfang_user.as_deref(),
             );
             match agent_id {
@@ -1884,7 +2110,10 @@ async fn handle_command(
         "peers" => handle.peers_text().await,
         "a2a" => handle.a2a_agents_text().await,
 
-        _ => format!("Unknown command: /{name}"),
+        _ => format!(
+            "Unknown command: /{name}\n\n{}",
+            slash_commands::render_help(Surfaces::CHANNEL)
+        ),
     }
 }
 
@@ -1966,10 +2195,10 @@ mod tests {
             openfang_user: None,
         };
 
-        let result = handle_command("agents", &[], &handle, &router, &sender).await;
+        let result = handle_command("agents", &[], &handle, &router, &sender, "user1").await;
         assert!(result.contains("coder"));
 
-        let result = handle_command("help", &[], &handle, &router, &sender).await;
+        let result = handle_command("help", &[], &handle, &router, &sender, "user1").await;
         assert!(result.contains("/agents"));
     }
 
@@ -1987,13 +2216,62 @@ mod tests {
         };
 
         // Select existing agent
-        let result =
-            handle_command("agent", &["coder".to_string()], &handle, &router, &sender).await;
+        let result = handle_command(
+            "agent",
+            &["coder".to_string()],
+            &handle,
+            &router,
+            &sender,
+            "user1",
+        )
+        .await;
         assert!(result.contains("Now talking to agent: coder"));
 
         // Verify router was updated
         let resolved = router.resolve(&ChannelType::Telegram, "user1", None);
         assert_eq!(resolved, Some(agent_id));
+    }
+
+    /// Discord/Slack-shaped: sender.platform_id is the *channel* id, user_id is
+    /// the actual user. After /agent <name>, the default must be stored under
+    /// user_id and resolvable by user_id — NOT by the channel id. This is the
+    /// "split-keying" fix the read path has and the write path now matches.
+    #[tokio::test]
+    async fn test_handle_command_agent_select_keys_on_user_id_not_platform_id() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+        });
+        let router = Arc::new(AgentRouter::new());
+        // Discord-shape: platform_id is the channel, the real user is in user_id.
+        let sender = ChannelUser {
+            platform_id: "channel-123".to_string(),
+            display_name: "Test".to_string(),
+            openfang_user: None,
+        };
+        let user_id = "user-789";
+
+        let result = handle_command(
+            "agent",
+            &["coder".to_string()],
+            &handle,
+            &router,
+            &sender,
+            user_id,
+        )
+        .await;
+        assert!(result.contains("Now talking to agent: coder"));
+
+        // Resolves under the user's id (correct).
+        let by_user = router.resolve(&ChannelType::Discord, user_id, None);
+        assert_eq!(by_user, Some(agent_id), "should resolve by user_id");
+
+        // Does NOT resolve under the channel id (the bug we just fixed).
+        let by_channel = router.resolve(&ChannelType::Discord, "channel-123", None);
+        assert_eq!(
+            by_channel, None,
+            "must NOT resolve by sender.platform_id (channel id)"
+        );
     }
 
     #[tokio::test]
@@ -2009,7 +2287,7 @@ mod tests {
             openfang_user: None,
         };
 
-        let result = handle_command("agent", &[], &handle, &router, &sender).await;
+        let result = handle_command("agent", &[], &handle, &router, &sender, "user1").await;
         assert!(result.contains("Usage: /agent <name>"));
         assert!(result.contains("coder"));
     }
@@ -2098,6 +2376,10 @@ mod tests {
             default_output_format_for_channel("discord"),
             OutputFormat::Markdown
         );
+        assert_eq!(
+            default_output_format_for_channel("signal"),
+            OutputFormat::PlainText
+        )
     }
 
     #[tokio::test]
@@ -2186,6 +2468,136 @@ mod tests {
     #[test]
     fn test_detect_image_magic_empty() {
         assert_eq!(detect_image_magic(&[]), None);
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_off_is_identity() {
+        let text = "hello world";
+        let out = apply_agent_prefix(PrefixStyle::Off, "coder", text);
+        assert_eq!(out, text);
+        // Ensure no reallocation surprise: the output must equal the input byte-for-byte.
+        assert_eq!(out.as_bytes(), text.as_bytes());
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_bracket() {
+        let out = apply_agent_prefix(
+            PrefixStyle::Bracket,
+            "platform-architect",
+            "Here's my take.",
+        );
+        assert_eq!(out, "[platform-architect] Here's my take.");
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_bold_bracket() {
+        let out = apply_agent_prefix(PrefixStyle::BoldBracket, "coder", "All green.");
+        assert_eq!(out, "**[coder]** All green.");
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_idempotent_bracket() {
+        // If the response already carries our bracket label, don't double-wrap.
+        let already = "[coder] already prefixed";
+        let out = apply_agent_prefix(PrefixStyle::Bracket, "coder", already);
+        assert_eq!(out, already);
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_idempotent_bold_bracket() {
+        let already = "**[coder]** already bold";
+        let out = apply_agent_prefix(PrefixStyle::BoldBracket, "coder", already);
+        assert_eq!(out, already);
+        // Bracket style also detects the bolded form and leaves it alone.
+        let out2 = apply_agent_prefix(PrefixStyle::Bracket, "coder", already);
+        assert_eq!(out2, already);
+    }
+
+    #[test]
+    fn test_apply_agent_prefix_empty_name_is_noop() {
+        let text = "no author";
+        let out = apply_agent_prefix(PrefixStyle::Bracket, "", text);
+        assert_eq!(out, text);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_prefix_response_off_is_byte_identical() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+        });
+        let overrides = ChannelOverrides::default();
+        let input = "Hello from the agent.".to_string();
+        let original_bytes = input.clone();
+        let out = maybe_prefix_response(&handle, Some(&overrides), agent_id, input).await;
+        assert_eq!(out.as_bytes(), original_bytes.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_prefix_response_bracket_wraps() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+        });
+        let overrides = ChannelOverrides {
+            prefix_agent_name: PrefixStyle::Bracket,
+            ..Default::default()
+        };
+        let out =
+            maybe_prefix_response(&handle, Some(&overrides), agent_id, "Hi".to_string()).await;
+        assert_eq!(out, "[coder] Hi");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_prefix_response_bold_bracket_wraps() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+        });
+        let overrides = ChannelOverrides {
+            prefix_agent_name: PrefixStyle::BoldBracket,
+            ..Default::default()
+        };
+        let out =
+            maybe_prefix_response(&handle, Some(&overrides), agent_id, "Hi".to_string()).await;
+        assert_eq!(out, "**[coder]** Hi");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_prefix_response_unknown_agent_falls_back() {
+        // When the agent id isn't in list_agents, we leave the text alone
+        // rather than fabricating a label.
+        let known = AgentId::new();
+        let unknown = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(known, "coder".to_string())]),
+        });
+        let overrides = ChannelOverrides {
+            prefix_agent_name: PrefixStyle::Bracket,
+            ..Default::default()
+        };
+        let out = maybe_prefix_response(&handle, Some(&overrides), unknown, "Hi".to_string()).await;
+        assert_eq!(out, "Hi");
+    }
+
+    #[test]
+    fn test_prefix_style_default_is_off_and_serde_snake_case() {
+        assert_eq!(PrefixStyle::default(), PrefixStyle::Off);
+        // Round-trip: the serialized representation is snake_case and
+        // an unspecified config field deserializes to Off so existing TOML
+        // keeps working.
+        let v: PrefixStyle = serde_json::from_str("\"bracket\"").unwrap();
+        assert_eq!(v, PrefixStyle::Bracket);
+        let v: PrefixStyle = serde_json::from_str("\"bold_bracket\"").unwrap();
+        assert_eq!(v, PrefixStyle::BoldBracket);
+        let v: PrefixStyle = serde_json::from_str("\"off\"").unwrap();
+        assert_eq!(v, PrefixStyle::Off);
+    }
+
+    #[test]
+    fn test_channel_overrides_default_prefix_off() {
+        let o = ChannelOverrides::default();
+        assert_eq!(o.prefix_agent_name, PrefixStyle::Off);
     }
 
     #[test]
