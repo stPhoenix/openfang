@@ -6190,10 +6190,25 @@ pub async fn list_models(
         .map(|m| (m.id.to_lowercase(), m.provider.to_lowercase()))
         .collect();
 
+    // Set of (id, provider) keys for Custom shadow rows. A non-Custom row whose key
+    // is in this set is masked by a Custom override and must be skipped to keep the
+    // response unique by (id, provider) — Alpine x-for crashes on duplicate keys.
+    let custom_keys: std::collections::HashSet<(String, String)> = catalog
+        .list_models()
+        .iter()
+        .filter(|m| m.tier == openfang_types::model_catalog::ModelTier::Custom)
+        .map(|m| (m.id.to_lowercase(), m.provider.to_lowercase()))
+        .collect();
+
     let models: Vec<serde_json::Value> = catalog
         .list_models()
         .iter()
         .filter(|m| {
+            if m.tier != openfang_types::model_catalog::ModelTier::Custom
+                && custom_keys.contains(&(m.id.to_lowercase(), m.provider.to_lowercase()))
+            {
+                return false;
+            }
             if let Some(ref p) = provider_filter {
                 if m.provider.to_lowercase() != *p {
                     return false;
