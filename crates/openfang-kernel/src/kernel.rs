@@ -4537,7 +4537,7 @@ impl OpenFangKernel {
         let saved_hands = openfang_hands::registry::HandRegistry::load_state(&state_path);
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
-            for (hand_id, saved_instance_id, config, old_agent_id) in saved_hands {
+            for (hand_id, saved_instance_id, saved_instance_name, config, old_agent_id) in saved_hands {
                 // If the agent was already restored from SQLite (by load_all_agents),
                 // preserve its user-configured model so activate_hand doesn't reset
                 // it to the HAND.toml defaults (which are typically "default"/"default").
@@ -4561,7 +4561,7 @@ impl OpenFangKernel {
                     }
                     _ => (None, None),
                 };
-                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, None) {
+                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, saved_instance_name) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart

@@ -822,10 +822,17 @@
                     </div>
                   </div>
                   <span class="text-xs text-dim" x-text="tokenCount > 0 ? '~' + tokenCount + ' tokens' : (attachments.length ? attachments.length + ' file(s)' : '')"></span>
-                  <!-- Context pressure indicator -->
-                  <span style="display:inline-flex;align-items:center;gap:4px;cursor:pointer" @click="if(currentAgent && OpenFangAPI.isWsConnected()) OpenFangAPI.wsSend({type:'command',command:'context',args:''})" title="Context pressure — click for details">
-                    <span style="width:7px;height:7px;border-radius:50%;display:inline-block" :style="'background:' + contextDotColor"></span>
-                    <span class="text-xs" :style="'color:' + contextDotColor" x-text="contextPressure === 'critical' ? 'Context full' : contextPressure === 'high' ? 'Context high' : contextPressure === 'medium' ? 'Context medium' : 'Context OK'"></span>
+                  <!-- Context pressure indicator: 4-segment battery + percent -->
+                  <span style="display:inline-flex;align-items:center;gap:6px;cursor:pointer"
+                        @click="if(currentAgent && OpenFangAPI.isWsConnected()) OpenFangAPI.wsSend({type:'command',command:'context',args:''})"
+                        :title="'Context ' + Math.round(contextPercent) + '% — click for details'">
+                    <span style="display:inline-flex;gap:2px;align-items:center">
+                      <template x-for="box in contextBoxes()" :key="box.idx">
+                        <span :style="{ width: '10px', height: '8px', border: '1px solid var(--border)', borderRadius: '1px', background: box.color }"></span>
+                      </template>
+                    </span>
+                    <span class="text-xs" :style="'color:' + contextDotColor"
+                          x-text="Math.round(contextPercent) + '%'"></span>
                   </span>
                   <span class="queue-badge" x-show="messageQueue.length > 0" x-text="messageQueue.length + ' queued'"></span>
                 </div>

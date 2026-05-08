@@ -17,6 +17,7 @@ function chatPage() {
     attachments: [],
     dragOver: false,
     contextPressure: 'low', // green/yellow/orange/red indicator
+    contextPercent: 0, // 0..100 numeric usage
     _typingTimeout: null,
     // Multi-session state
     sessions: [],
@@ -88,6 +89,16 @@ function chatPage() {
         case 'medium': return '#eab308';
         default: return '#22c55e';
       }
+    },
+
+    // 4-segment battery: each box lit if percent > i*25
+    contextBoxes() {
+      var p = this.contextPercent || 0;
+      return [0, 1, 2, 3].map(function(i) {
+        var lit = p > i * 25;
+        var color = i < 2 ? '#22c55e' : i === 2 ? '#eab308' : '#ef4444';
+        return { idx: i, lit: lit, color: lit ? color : 'transparent' };
+      });
     },
 
     get modelDisplayName() {
@@ -623,6 +634,11 @@ function chatPage() {
           });
           self.$nextTick(function() { self.scrollToBottom(); });
         }
+        // Seed context indicator from /api/agents/:id/context
+        OpenFangAPI.get('/api/agents/' + agentId + '/context').then(function(ctx) {
+          if (typeof ctx.usage_percent === 'number') self.contextPercent = ctx.usage_percent;
+          if (typeof ctx.pressure === 'string') self.contextPressure = ctx.pressure.toLowerCase();
+        }).catch(function() {});
       } catch(e) { /* silent */ }
     },
 
@@ -743,6 +759,12 @@ function chatPage() {
           break;
 
         case 'phase':
+          // Auto-compact: persistent system bubble regardless of in-flight message state
+          if (data.phase === 'autocompact') {
+            var acDetail = data.detail || 'Auto-compacted.';
+            this.messages.push({ id: ++msgId, role: 'system', text: acDetail, meta: '', tools: [] });
+            break;
+          }
           // Show tool/phase progress so the user sees the agent is working
           var phaseIdx = this.messages.length - 1;
           var phaseMsg = phaseIdx >= 0 ? this.messages[phaseIdx] : null;
@@ -890,6 +912,9 @@ function chatPage() {
           if (data.context_pressure) {
             this.contextPressure = data.context_pressure;
           }
+          if (typeof data.context_percent === 'number') {
+            this.contextPercent = data.context_percent;
+          }
           // Collect streamed text before removing streaming messages
           var streamedText = '';
           var streamedTools = [];
@@ -967,6 +992,9 @@ function chatPage() {
           // Update context pressure if included in command result
           if (data.context_pressure) {
             this.contextPressure = data.context_pressure;
+          }
+          if (typeof data.context_percent === 'number') {
+            this.contextPercent = data.context_percent;
           }
           this.messages.push({ id: ++msgId, role: 'system', text: data.message || 'Command executed.', meta: '', tools: [] });
           this.scrollToBottom();

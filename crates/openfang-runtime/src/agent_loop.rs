@@ -31,6 +31,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+fn format_tokens_short(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", (n as f64) / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Maximum iterations in the agent loop before giving up.
 const MAX_ITERATIONS: u32 = 50;
 
@@ -1912,7 +1920,11 @@ pub async fn run_agent_loop_streaming(
                     auto_compact_state.turn_counter = 0;
                     let _ = stream_tx.send(StreamEvent::PhaseChange {
                         phase: "autocompact".to_string(),
-                        detail: Some("Context compacted to stay within limits.".to_string()),
+                        detail: Some(format!(
+                            "Auto-compacted. {} → {} tokens",
+                            format_tokens_short(result.pre_compact_token_count.unwrap_or(0)),
+                            format_tokens_short(result.true_post_compact_token_count.unwrap_or(0)),
+                        )),
                     }).await;
                     info!(
                         pre = result.pre_compact_token_count,

@@ -62,6 +62,7 @@ impl HandRegistry {
                 serde_json::json!({
                     "instance_id": e.instance_id,
                     "hand_id": e.hand_id,
+                    "instance_name": e.instance_name,
                     "config": e.config,
                     "agent_id": e.agent_id,
                     "provider": e.provider_override,
@@ -77,16 +78,24 @@ impl HandRegistry {
     }
 
     /// Load persisted hand state and re-activate hands.
-    /// Returns list of (hand_id, instance_id, config, old_agent_id) that should be activated.
+    /// Returns list of (hand_id, instance_id, instance_name, config, old_agent_id) that should be activated.
     /// The `instance_id` preserves the original UUID so the deterministic agent ID
     /// remains stable across restarts.  `None` for state files written before this
     /// field was added (backwards-compatible).
+    /// The `instance_name` preserves the user-supplied agent name across restarts;
+    /// `None` for state files written before this field was added.
     /// The `old_agent_id` is the agent UUID from before the restart, used to
     /// reassign cron jobs to the newly spawned agent (issue #402).
     #[allow(clippy::type_complexity)]
     pub fn load_state(
         path: &std::path::Path,
-    ) -> Vec<(String, Option<Uuid>, HashMap<String, serde_json::Value>, Option<AgentId>)> {
+    ) -> Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        HashMap<String, serde_json::Value>,
+        Option<AgentId>,
+    )> {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             Err(_) => return Vec::new(),
@@ -106,12 +115,16 @@ impl HandRegistry {
                     .get("instance_id")
                     .and_then(|v| v.as_str())
                     .and_then(|s| Uuid::parse_str(s).ok());
+                let instance_name: Option<String> = e
+                    .get("instance_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let config: HashMap<String, serde_json::Value> =
                     serde_json::from_value(e["config"].clone()).unwrap_or_default();
                 let old_agent_id: Option<AgentId> = e
                     .get("agent_id")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
-                Some((hand_id, instance_id, config, old_agent_id))
+                Some((hand_id, instance_id, instance_name, config, old_agent_id))
             })
             .collect()
     }
@@ -1224,11 +1237,59 @@ metrics = []
         reg.persist_state(&state_file).unwrap();
         let reloaded = HandRegistry::load_state(&state_file);
         assert_eq!(reloaded.len(), 1);
-        let (hand_id, _instance_id, config, _agent_id) = &reloaded[0];
+        let (hand_id, _instance_id, _instance_name, config, _agent_id) = &reloaded[0];
         assert_eq!(hand_id, "browser");
         assert_eq!(
             config.get("headless"),
             Some(&serde_json::Value::String("true".into()))
         );
+    }
+
+    /// Regression test: `instance_name` must survive the persist/load round-trip
+    /// so named hands keep their user-chosen agent name across daemon restarts.
+    /// Without this the kernel's restore loop falls back to the auto-generated
+    /// `{hand_name}-{suffix}` and silently renames the agent on every restart.
+    #[test]
+    fn test_named_instance_round_trip_via_registry() {
+        let reg = test_registry_with_dummy_hand("researcher");
+        reg.activate(
+            "researcher",
+            HashMap::new(),
+            None,
+            Some("test".to_string()),
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("hands.json");
+        reg.persist_state(&state_file).unwrap();
+
+        let reloaded = HandRegistry::load_state(&state_file);
+        assert_eq!(reloaded.len(), 1);
+        let (hand_id, _instance_id, instance_name, _config, _agent_id) = &reloaded[0];
+        assert_eq!(hand_id, "researcher");
+        assert_eq!(instance_name.as_deref(), Some("test"));
+    }
+
+    /// Backward-compat: state files written before `instance_name` was persisted
+    /// must still load cleanly, returning `None` for the missing field.
+    #[test]
+    fn test_load_state_legacy_without_instance_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("hands.json");
+        let legacy = serde_json::json!([{
+            "instance_id": "76fc0a3f-542f-4c9c-80de-244effde893b",
+            "hand_id": "researcher",
+            "config": {},
+            "agent_id": null,
+            "provider": null,
+            "model": null,
+        }]);
+        std::fs::write(&state_file, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let reloaded = HandRegistry::load_state(&state_file);
+        assert_eq!(reloaded.len(), 1);
+        let (_hand_id, _instance_id, instance_name, _config, _agent_id) = &reloaded[0];
+        assert!(instance_name.is_none());
     }
 }

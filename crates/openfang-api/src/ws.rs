@@ -855,6 +855,7 @@ async fn handle_text_message(
                                     "iterations": 0, // Not available from stream; handle updates later if needed
                                     "cost_usd": null,
                                     "context_pressure": pressure,
+                                    "context_percent": ctx_pct,
                                 }),
                             )
                             .await;
@@ -1032,6 +1033,7 @@ async fn handle_command(
                     "command": cmd,
                     "message": formatted,
                     "context_pressure": pressure,
+                    "context_percent": data.percentage,
                     "data": data,
                 })
             }
@@ -1504,6 +1506,7 @@ pub fn start_ws_cron_broadcaster(kernel: Arc<OpenFangKernel>) {
                             "type": "response",
                             "content": response,
                             "context_pressure": "low",
+                            "context_percent": 0.0,
                             "cost_usd": null,
                             "input_tokens": 0,
                             "iterations": 0,
