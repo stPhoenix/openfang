@@ -146,3 +146,89 @@ def test_dashboard_has_evolution_nav(client: httpx.Client) -> None:
 def test_dashboard_has_tools_nav(client: httpx.Client) -> None:
     html = client.get("/").text
     assert "navigate('tools')" in html, "Tools nav item missing from dashboard"
+
+
+# ── Editable per-model overrides (PUT /api/models/{id}) ───────────────────────
+
+
+def _pick_model_for_edit_test(client: httpx.Client) -> tuple[str, dict] | None:
+    """Pick a stable builtin model to edit-and-revert; returns (id, original entry)."""
+    r = client.get("/api/models")
+    if r.status_code != 200:
+        return None
+    models = r.json().get("models", [])
+    # Anthropic Sonnet is in every build; lets the test work without provider keys.
+    for m in models:
+        if m.get("id") == "claude-sonnet-4-20250514":
+            return m["id"], m
+    return None
+
+
+def test_models_response_exposes_max_output_and_overridden(
+    client: httpx.Client,
+) -> None:
+    """list_models must surface max_output_tokens and an overridden flag per row."""
+    r = client.get("/api/models")
+    assert r.status_code == 200
+    models = r.json().get("models", [])
+    assert models, "expected at least one model in catalog"
+    sample = models[0]
+    assert "max_output_tokens" in sample, sample
+    assert "overridden" in sample, sample
+    assert isinstance(sample["overridden"], bool)
+
+
+def test_update_model_creates_then_updates_then_resets(client: httpx.Client) -> None:
+    """PUT /api/models/{id} adds a Custom shadow; second PUT reports 'updated';
+    DELETE /api/models/custom/{id} unmasks the original entry."""
+    picked = _pick_model_for_edit_test(client)
+    if picked is None:
+        pytest.skip("no stable builtin model available")
+    model_id, original = picked
+    original_ctx = original["context_window"]
+    original_max = original["max_output_tokens"]
+
+    # 1st PUT — should create a Custom shadow.
+    r = client.put(
+        f"/api/models/{model_id}",
+        json={"context_window": 12345, "max_output_tokens": 6789},
+    )
+    assert r.status_code == 200, f"first PUT failed: {r.status_code} {r.text[:300]}"
+    assert r.json().get("status") == "added", r.json()
+
+    # GET reflects new values + overridden=true.
+    r = client.get(f"/api/models/{model_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["context_window"] == 12345, body
+    assert body["max_output_tokens"] == 6789, body
+    assert body["overridden"] is True, body
+    assert body["tier"] == "custom", body
+
+    # 2nd PUT (sparse — only context_window) — should report 'updated' and
+    # preserve max_output_tokens from the prior shadow.
+    r = client.put(f"/api/models/{model_id}", json={"context_window": 16384})
+    assert r.status_code == 200
+    assert r.json().get("status") == "updated", r.json()
+    body = client.get(f"/api/models/{model_id}").json()
+    assert body["context_window"] == 16384
+    assert body["max_output_tokens"] == 6789, "sparse PUT must keep prior value"
+
+    # Reset via existing DELETE — original values must reappear.
+    r = client.delete(f"/api/models/custom/{model_id}")
+    assert r.status_code == 200
+    body = client.get(f"/api/models/{model_id}").json()
+    assert body["context_window"] == original_ctx
+    assert body["max_output_tokens"] == original_max
+    assert body["overridden"] is False
+    assert body["tier"] != "custom"
+
+
+def test_update_model_unknown_id_returns_404(client: httpx.Client) -> None:
+    r = client.put("/api/models/this-model-does-not-exist", json={"context_window": 1})
+    assert r.status_code == 404
+
+
+def test_dashboard_has_max_output_column(client: httpx.Client) -> None:
+    html = client.get("/").text
+    assert "Max Output" in html, "Max Output column missing from dashboard models table"

@@ -20,6 +20,9 @@ function settingsPage() {
     customModelContext: 128000,
     customModelMaxOutput: 8192,
     customModelStatus: '',
+    editingModelId: '',
+    editForm: {},
+    editModelStatus: '',
     providerKeyInputs: {},
     providerUrlInputs: {},
     providerUrlSaving: {},
@@ -271,6 +274,48 @@ function settingsPage() {
         await this.loadModels();
       } catch(e) {
         OpenFangToast.error('Failed to delete: ' + (e.message || 'Unknown error'));
+      }
+    },
+
+    openEditModel(m) {
+      this.editingModelId = m.id;
+      this.editForm = {
+        context_window: m.context_window,
+        max_output_tokens: m.max_output_tokens,
+        input_cost_per_m: m.input_cost_per_m,
+        output_cost_per_m: m.output_cost_per_m,
+        supports_tools: !!m.supports_tools,
+        supports_vision: !!m.supports_vision,
+        supports_streaming: !!m.supports_streaming,
+      };
+      this.editModelStatus = '';
+    },
+
+    async saveEditModel() {
+      if (!this.editingModelId) return;
+      this.editModelStatus = 'Saving...';
+      try {
+        await OpenFangAPI.put(
+          '/api/models/' + encodeURIComponent(this.editingModelId),
+          this.editForm
+        );
+        OpenFangToast.success('Model updated');
+        this.editingModelId = '';
+        await this.loadModels();
+      } catch(e) {
+        this.editModelStatus = 'Error: ' + (e.message || 'Failed');
+        OpenFangToast.error('Failed to save: ' + (e.message || 'Unknown error'));
+      }
+    },
+
+    async resetModel(modelId) {
+      if (!confirm('Reset "' + modelId + '" to catalog defaults?')) return;
+      try {
+        await OpenFangAPI.del('/api/models/custom/' + encodeURIComponent(modelId));
+        OpenFangToast.success('Model reset to defaults');
+        await this.loadModels();
+      } catch(e) {
+        OpenFangToast.error('Failed to reset: ' + (e.message || 'Unknown error'));
       }
     },
 

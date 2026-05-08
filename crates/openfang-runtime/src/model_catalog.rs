@@ -445,6 +445,39 @@ impl ModelCatalog {
         true
     }
 
+    /// Insert or update a `Custom`-tier entry, keyed by `(id, provider)` case-insensitively.
+    ///
+    /// If an existing `Custom`-tier entry matches, replace it in place and return `"updated"`.
+    /// Otherwise push a new entry and return `"added"`.
+    ///
+    /// The entry's tier is forced to [`ModelTier::Custom`] regardless of input, so the
+    /// resulting row always shadows builtins/locals with the same id via `find_model`'s
+    /// priority logic. Use this from the PUT /api/models/{id} handler — non-Custom rows
+    /// are untouched (unmasked again by `remove_custom_model`).
+    pub fn upsert_custom_model(&mut self, mut entry: ModelCatalogEntry) -> &'static str {
+        entry.tier = ModelTier::Custom;
+        let lower_id = entry.id.to_lowercase();
+        let lower_provider = entry.provider.to_lowercase();
+        if let Some(existing) = self.models.iter_mut().find(|m| {
+            m.tier == ModelTier::Custom
+                && m.id.to_lowercase() == lower_id
+                && m.provider.to_lowercase() == lower_provider
+        }) {
+            *existing = entry;
+            return "updated";
+        }
+        let provider = entry.provider.clone();
+        self.models.push(entry);
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider) {
+            p.model_count = self
+                .models
+                .iter()
+                .filter(|m| m.provider == provider)
+                .count();
+        }
+        "added"
+    }
+
     /// Remove a custom model by ID.
     ///
     /// Only removes models with `Custom` tier to prevent accidental deletion
@@ -459,7 +492,10 @@ impl ModelCatalog {
 
     /// Load custom models from a JSON file.
     ///
-    /// Merges them into the catalog. Skips models that already exist.
+    /// Routes through `upsert_custom_model` so a saved override that shadows a
+    /// builtin (same id+provider, but builtin tier) is restored as a Custom row
+    /// alongside the builtin — `add_custom_model` would have rejected it as a
+    /// duplicate, silently losing the user's saved override across restarts.
     pub fn load_custom_models(&mut self, path: &std::path::Path) {
         if !path.exists() {
             return;
@@ -471,7 +507,7 @@ impl ModelCatalog {
             return;
         };
         for entry in entries {
-            self.add_custom_model(entry);
+            self.upsert_custom_model(entry);
         }
     }
 
@@ -4766,5 +4802,124 @@ mod tests {
             !qwen7b.supports_tools,
             "qwen-2.5-7b-instruct:free has no tool-supporting free endpoint"
         );
+    }
+
+    fn sample_entry(id: &str, provider: &str, ctx: u64) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            id: id.into(),
+            display_name: id.into(),
+            provider: provider.into(),
+            tier: ModelTier::Frontier, // intentionally non-Custom; upsert must force it
+            context_window: ctx,
+            max_output_tokens: 4096,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_upsert_custom_model_inserts_new() {
+        let mut catalog = ModelCatalog::new();
+        let outcome = catalog.upsert_custom_model(sample_entry("brand-new-model", "openrouter", 8192));
+        assert_eq!(outcome, "added");
+        let found = catalog.find_model("brand-new-model").unwrap();
+        assert_eq!(found.tier, ModelTier::Custom);
+        assert_eq!(found.context_window, 8192);
+    }
+
+    #[test]
+    fn test_upsert_custom_model_replaces_existing() {
+        let mut catalog = ModelCatalog::new();
+        assert_eq!(
+            catalog.upsert_custom_model(sample_entry("dup-model", "openrouter", 4096)),
+            "added"
+        );
+        let outcome =
+            catalog.upsert_custom_model(sample_entry("dup-model", "openrouter", 32768));
+        assert_eq!(outcome, "updated");
+        let found = catalog.find_model("dup-model").unwrap();
+        assert_eq!(found.context_window, 32768);
+        // Only one entry should exist for this id+provider
+        let count = catalog
+            .list_models()
+            .iter()
+            .filter(|m| m.id == "dup-model" && m.provider == "openrouter")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_upsert_custom_model_forces_custom_tier() {
+        let mut catalog = ModelCatalog::new();
+        let mut entry = sample_entry("tier-test", "openrouter", 8192);
+        entry.tier = ModelTier::Frontier;
+        catalog.upsert_custom_model(entry);
+        let found = catalog.find_model("tier-test").unwrap();
+        assert_eq!(found.tier, ModelTier::Custom);
+    }
+
+    #[test]
+    fn test_load_custom_models_restores_shadow_over_builtin() {
+        // Reproduces the persistence-restart bug: a saved override of a builtin id
+        // must come back as a Custom row that shadows the builtin, not be silently
+        // dropped because the builtin entry already exists.
+        let tmp = std::env::temp_dir().join(format!(
+            "openfang-test-custom-models-{}.json",
+            std::process::id()
+        ));
+        let json = r#"[
+            {
+                "id": "claude-sonnet-4-20250514",
+                "display_name": "Claude Sonnet 4 (overridden)",
+                "provider": "anthropic",
+                "tier": "custom",
+                "context_window": 16384,
+                "max_output_tokens": 6789,
+                "input_cost_per_m": 3.0,
+                "output_cost_per_m": 15.0,
+                "supports_tools": true,
+                "supports_vision": true,
+                "supports_streaming": true,
+                "aliases": []
+            }
+        ]"#;
+        std::fs::write(&tmp, json).unwrap();
+
+        let mut catalog = ModelCatalog::new();
+        catalog.load_custom_models(&tmp);
+
+        let resolved = catalog.find_model("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(resolved.tier, ModelTier::Custom);
+        assert_eq!(resolved.context_window, 16384);
+        assert_eq!(resolved.max_output_tokens, 6789);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_upsert_custom_then_remove_unmasks_builtin() {
+        let mut catalog = ModelCatalog::new();
+        // Pre-flight: confirm builtin exists with non-Custom tier
+        let builtin = catalog.find_model("claude-sonnet-4-20250514").unwrap().clone();
+        assert_ne!(builtin.tier, ModelTier::Custom);
+
+        // Shadow it with a Custom override
+        let mut shadow = builtin.clone();
+        shadow.context_window = 12345;
+        catalog.upsert_custom_model(shadow);
+        let found = catalog.find_model("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(found.tier, ModelTier::Custom);
+        assert_eq!(found.context_window, 12345);
+
+        // Reset: remove Custom shadow → builtin re-emerges
+        assert!(catalog.remove_custom_model("claude-sonnet-4-20250514"));
+        let found = catalog.find_model("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(found.tier, builtin.tier);
+        assert_eq!(found.context_window, builtin.context_window);
     }
 }

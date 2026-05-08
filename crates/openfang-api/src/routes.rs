@@ -6181,6 +6181,15 @@ pub async fn list_models(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Set of (id, provider) keys for non-Custom rows. A Custom row whose key is in
+    // this set is shadowing a builtin/local — surface that to the UI as `overridden`.
+    let shadowed: std::collections::HashSet<(String, String)> = catalog
+        .list_models()
+        .iter()
+        .filter(|m| m.tier != openfang_types::model_catalog::ModelTier::Custom)
+        .map(|m| (m.id.to_lowercase(), m.provider.to_lowercase()))
+        .collect();
+
     let models: Vec<serde_json::Value> = catalog
         .list_models()
         .iter()
@@ -6211,6 +6220,8 @@ pub async fn list_models(
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
                 .unwrap_or(m.tier == openfang_types::model_catalog::ModelTier::Custom);
+            let overridden = m.tier == openfang_types::model_catalog::ModelTier::Custom
+                && shadowed.contains(&(m.id.to_lowercase(), m.provider.to_lowercase()));
             serde_json::json!({
                 "id": m.id,
                 "display_name": m.display_name,
@@ -6224,6 +6235,7 @@ pub async fn list_models(
                 "supports_vision": m.supports_vision,
                 "supports_streaming": m.supports_streaming,
                 "available": available,
+                "overridden": overridden,
             })
         })
         .collect();
@@ -6285,6 +6297,19 @@ pub async fn get_model(
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
                 .unwrap_or(m.tier == openfang_types::model_catalog::ModelTier::Custom);
+            // Overridden = this is a Custom entry AND a non-Custom entry with the same
+            // (id, provider) also exists in the catalog (the original it shadows).
+            let overridden = if m.tier == openfang_types::model_catalog::ModelTier::Custom {
+                let lid = m.id.to_lowercase();
+                let lprov = m.provider.to_lowercase();
+                catalog.list_models().iter().any(|other| {
+                    other.tier != openfang_types::model_catalog::ModelTier::Custom
+                        && other.id.to_lowercase() == lid
+                        && other.provider.to_lowercase() == lprov
+                })
+            } else {
+                false
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -6301,6 +6326,7 @@ pub async fn get_model(
                     "supports_streaming": m.supports_streaming,
                     "aliases": m.aliases,
                     "available": available,
+                    "overridden": overridden,
                 })),
             )
         }
@@ -6497,6 +6523,97 @@ pub async fn add_custom_model(
             "id": id,
             "provider": provider,
             "status": "added"
+        })),
+    )
+}
+
+/// PUT /api/models/{id} — Upsert per-model values as a Custom-tier shadow.
+///
+/// Accepts a sparse JSON patch — any field omitted is filled from the model's
+/// current resolved entry (so `find_model` semantics are honoured: builtin →
+/// local → previous Custom override). Persists to `~/.openfang/custom_models.json`.
+///
+/// Use `DELETE /api/models/custom/{id}` to remove the override (Reset action).
+pub async fn update_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Resolve the current entry to fill any fields the client didn't provide.
+    let base = {
+        let cat = state
+            .kernel
+            .model_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        cat.find_model(&model_id).cloned()
+    };
+    let Some(base) = base else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Model '{}' not found", model_id)})),
+        );
+    };
+
+    let entry = openfang_types::model_catalog::ModelCatalogEntry {
+        id: base.id.clone(),
+        display_name: body
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or(base.display_name),
+        provider: base.provider.clone(),
+        tier: openfang_types::model_catalog::ModelTier::Custom,
+        context_window: body
+            .get("context_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(base.context_window),
+        max_output_tokens: body
+            .get("max_output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(base.max_output_tokens),
+        input_cost_per_m: body
+            .get("input_cost_per_m")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(base.input_cost_per_m),
+        output_cost_per_m: body
+            .get("output_cost_per_m")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(base.output_cost_per_m),
+        supports_tools: body
+            .get("supports_tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(base.supports_tools),
+        supports_vision: body
+            .get("supports_vision")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(base.supports_vision),
+        supports_streaming: body
+            .get("supports_streaming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(base.supports_streaming),
+        aliases: base.aliases.clone(),
+    };
+
+    let outcome = {
+        let mut catalog = state
+            .kernel
+            .model_catalog
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let outcome = catalog.upsert_custom_model(entry);
+        let custom_path = state.kernel.config.home_dir.join("custom_models.json");
+        if let Err(e) = catalog.save_custom_models(&custom_path) {
+            tracing::warn!("Failed to persist custom models: {e}");
+        }
+        outcome
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": model_id,
+            "status": outcome,
         })),
     )
 }
