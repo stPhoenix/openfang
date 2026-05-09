@@ -18,6 +18,8 @@ pub const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 pub const TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 pub const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+/// Ollama Cloud — hosted, OpenAI-compatible. Auth: `Authorization: Bearer $OLLAMA_CLOUD_API_KEY`.
+pub const OLLAMA_CLOUD_BASE_URL: &str = "https://ollama.com/v1";
 pub const VLLM_BASE_URL: &str = "http://localhost:8000/v1";
 pub const LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 pub const LEMONADE_BASE_URL: &str = "http://localhost:8888/api/v1";

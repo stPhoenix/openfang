@@ -90,16 +90,27 @@ function evolutionPage() {
           OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
           OpenFangAPI.get('/api/models?available=true').catch(function() { return { models: [] }; })
         ]);
-        this.providers = results[0].providers || [];
+          this.providers = (results[0].providers || []).slice().sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
+          });
         this.allModels = results[1].models || [];
       } catch(e) { /* ignore */ }
       this.providersLoading = false;
       this.modelsLoading = false;
     },
     get filteredModels() {
-      if (!this.config.provider) return this.allModels;
+        var sortByLabel = function (a, b) {
+            var la = (a.display_name || a.id).toLowerCase();
+            var lb = (b.display_name || b.id).toLowerCase();
+            return la < lb ? -1 : la > lb ? 1 : 0;
+        };
+        if (!this.config.provider) return this.allModels.slice().sort(sortByLabel);
       var prov = this.config.provider;
-      return this.allModels.filter(function(m) { return m.provider === prov; });
+        return this.allModels.filter(function (m) {
+            return m.provider === prov;
+        }).sort(sortByLabel);
     },
     onProviderChange() {
       var filtered = this.filteredModels;

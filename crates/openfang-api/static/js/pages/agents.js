@@ -428,7 +428,11 @@ function agentsPage() {
         var provData = results[1];
         if (status.default_provider) this.spawnForm.provider = status.default_provider;
         if (status.default_model) this.spawnForm.model = status.default_model;
-        this.spawnProviders = provData.providers || [];
+          this.spawnProviders = (provData.providers || []).slice().sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
+          });
       } catch(e) {
         this.spawnProviders = [];
       }
@@ -644,9 +648,16 @@ function agentsPage() {
 
     // ── Model/Provider dropdown helpers ──
     get agentFilteredModels() {
-      if (!this.newProviderValue) return this.agentModels;
+        var sortByLabel = function (a, b) {
+            var la = (a.display_name || a.id).toLowerCase();
+            var lb = (b.display_name || b.id).toLowerCase();
+            return la < lb ? -1 : la > lb ? 1 : 0;
+        };
+        if (!this.newProviderValue) return this.agentModels.slice().sort(sortByLabel);
       var prov = this.newProviderValue;
-      return this.agentModels.filter(function(m) { return m.provider === prov; });
+        return this.agentModels.filter(function (m) {
+            return m.provider === prov;
+        }).sort(sortByLabel);
     },
 
     async loadAgentModelOptions() {
@@ -657,7 +668,11 @@ function agentsPage() {
           OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
           OpenFangAPI.get('/api/models?available=true').catch(function() { return { models: [] }; })
         ]);
-        this.agentProviders = results[0].providers || [];
+          this.agentProviders = (results[0].providers || []).slice().sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
+          });
         this.agentModels = results[1].models || [];
       } catch(e) { /* ignore */ }
       this.agentProvidersLoading = false;

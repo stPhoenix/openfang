@@ -229,6 +229,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         hint: "local",
     },
     ProviderInfo {
+        name: "ollama_cloud",
+        display: "Ollama Cloud",
+        env_var: "OLLAMA_CLOUD_API_KEY",
+        default_model: "gpt-oss:120b:cloud",
+        needs_key: true,
+        hint: "hosted",
+    },
+    ProviderInfo {
         name: "lmstudio",
         display: "LM Studio",
         env_var: "LMSTUDIO_API_KEY",

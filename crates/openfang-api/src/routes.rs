@@ -6370,17 +6370,22 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         catalog.list_providers().to_vec()
     };
 
-    // Collect local providers that need probing
-    let local_providers: Vec<(usize, String, String)> = provider_list
+    // Collect providers that need probing: local (no key, localhost) plus
+    // remote providers that publish their model list dynamically (e.g. ollama_cloud).
+    let probe_targets: Vec<(usize, String, String)> = provider_list
         .iter()
         .enumerate()
-        .filter(|(_, p)| !p.key_required && !p.base_url.is_empty())
+        .filter(|(_, p)| {
+            !p.base_url.is_empty()
+                && (!p.key_required
+                || openfang_runtime::provider_health::is_dynamic_remote_provider(&p.id))
+        })
         .map(|(i, p)| (i, p.id.clone(), p.base_url.clone()))
         .collect();
 
     // Fire all probes concurrently (cached results return instantly)
     let cache = &state.provider_probe_cache;
-    let probe_futures: Vec<_> = local_providers
+    let probe_futures: Vec<_> = probe_targets
         .iter()
         .map(|(_, id, url)| {
             openfang_runtime::provider_health::probe_provider_cached(id, url, cache)
@@ -6390,8 +6395,8 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     // Index probe results by provider list position for O(1) lookup
     let mut probe_map: HashMap<usize, openfang_runtime::provider_health::ProbeResult> =
-        HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
+        HashMap::with_capacity(probe_targets.len());
+    for ((idx, _, _), result) in probe_targets.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -6408,9 +6413,10 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "base_url": p.base_url,
         });
 
-        // For local providers, attach the probe result
+        // Attach probe result if one was collected (local or dynamic remote).
         if let Some(probe) = probe_map.remove(&i) {
-            entry["is_local"] = serde_json::json!(true);
+            entry["is_local"] =
+                serde_json::json!(openfang_runtime::provider_health::is_local_provider(&p.id));
             entry["reachable"] = serde_json::json!(probe.reachable);
             entry["latency_ms"] = serde_json::json!(probe.latency_ms);
             if !probe.discovered_models.is_empty() {

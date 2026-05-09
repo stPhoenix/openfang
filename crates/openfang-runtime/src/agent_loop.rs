@@ -55,13 +55,20 @@ const TOOL_TIMEOUT_SECS: u64 = 120;
 /// Timeout for inter-agent tool calls (seconds).
 /// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
 /// target, so these need a significantly longer timeout than regular tools.
-const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
+/// Sized to fit the pro-researcher per-retry escalation ceiling (3 × 20m = 3600s)
+/// plus a small buffer for spawn/teardown. Acts as a hard outer cap on the inner
+/// `timeout_seconds` argument to `agent_delegate*`: any larger inner value is
+/// silently truncated to this constant by the wrapping `tokio::time::timeout`.
+const AGENT_TOOL_TIMEOUT_SECS: u64 = 3700;
 
 /// Returns the appropriate timeout duration for a given tool name.
-/// Inter-agent calls get a longer timeout since they may trigger full agent loops.
+/// Inter-agent calls get a longer timeout since they may trigger full agent loops
+/// (and in the case of `agent_delegate*`, may include grandchild delegations).
 fn tool_timeout_for(tool_name: &str) -> Duration {
     match tool_name {
-        "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
+        "agent_send" | "agent_spawn" | "agent_delegate" | "agent_delegate_async" => {
+            Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS)
+        }
         _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
     }
 }
@@ -3608,13 +3615,18 @@ mod tests {
     #[test]
     fn test_tool_timeout_constant() {
         assert_eq!(TOOL_TIMEOUT_SECS, 120);
-        assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
+        assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 3700);
     }
 
     #[test]
     fn test_tool_timeout_for_agent_tools() {
-        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(600));
-        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(3700));
+        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(3700));
+        assert_eq!(tool_timeout_for("agent_delegate"), Duration::from_secs(3700));
+        assert_eq!(
+            tool_timeout_for("agent_delegate_async"),
+            Duration::from_secs(3700)
+        );
         assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
         assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
     }

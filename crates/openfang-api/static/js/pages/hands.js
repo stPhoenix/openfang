@@ -144,7 +144,11 @@ function handsPage() {
           OpenFangAPI.get('/api/status').catch(function() { return {}; }),
           OpenFangAPI.get('/api/models?available=true').catch(function() { return { models: [] }; })
         ]).then(function(results) {
-          self.handProviders = results[0].providers || [];
+            self.handProviders = (results[0].providers || []).slice().sort(function (a, b) {
+                var la = (a.display_name || a.id).toLowerCase();
+                var lb = (b.display_name || b.id).toLowerCase();
+                return la < lb ? -1 : la > lb ? 1 : 0;
+            });
           self.handModels = results[2].models || [];
           // If hand uses 'default', resolve to kernel default
           if (!self.handProvider || self.handProvider === 'default') {
@@ -348,9 +352,16 @@ function handsPage() {
     },
 
     get handFilteredModels() {
-      if (!this.handProvider) return this.handModels;
+        var sortByLabel = function (a, b) {
+            var la = (a.display_name || a.id).toLowerCase();
+            var lb = (b.display_name || b.id).toLowerCase();
+            return la < lb ? -1 : la > lb ? 1 : 0;
+        };
+        if (!this.handProvider) return this.handModels.slice().sort(sortByLabel);
       var prov = this.handProvider;
-      return this.handModels.filter(function(m) { return m.provider === prov; });
+        return this.handModels.filter(function (m) {
+            return m.provider === prov;
+        }).sort(sortByLabel);
     },
 
     onHandProviderChange() {

@@ -9,6 +9,7 @@ use openfang_types::model_catalog::{
     DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
+    OLLAMA_CLOUD_BASE_URL,
     OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
@@ -366,8 +367,14 @@ impl ModelCatalog {
     /// Merge dynamically discovered models from a local provider.
     ///
     /// Adds models not already in the catalog with `Local` tier and zero cost.
+    /// Discovered models default to a 256K context window (newer cloud and
+    /// local checkpoints exceed the older 128K assumption); users can override
+    /// per model via the custom-model editor.
     /// Also updates the provider's `model_count`.
     pub fn merge_discovered_models(&mut self, provider: &str, model_ids: &[String]) {
+        const DISCOVERED_CONTEXT_WINDOW: u64 = 256_000;
+        const DISCOVERED_MAX_OUTPUT: u64 = 16_384;
+
         let existing_ids: std::collections::HashSet<String> = self
             .models
             .iter()
@@ -387,8 +394,8 @@ impl ModelCatalog {
                 display_name: display,
                 provider: provider.to_string(),
                 tier: ModelTier::Local,
-                context_window: 131_072,
-                max_output_tokens: 16_384,
+                context_window: DISCOVERED_CONTEXT_WINDOW,
+                max_output_tokens: DISCOVERED_MAX_OUTPUT,
                 input_cost_per_m: 0.0,
                 output_cost_per_m: 0.0,
                 supports_tools: true,
@@ -674,6 +681,15 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             base_url: OLLAMA_BASE_URL.into(),
             key_required: false,
             auth_status: AuthStatus::NotRequired,
+            model_count: 0,
+        },
+        ProviderInfo {
+            id: "ollama_cloud".into(),
+            display_name: "Ollama Cloud".into(),
+            api_key_env: "OLLAMA_CLOUD_API_KEY".into(),
+            base_url: OLLAMA_CLOUD_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
             model_count: 0,
         },
         ProviderInfo {
@@ -4083,7 +4099,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 42);
+        assert_eq!(catalog.list_providers().len(), 43);
     }
 
     #[test]

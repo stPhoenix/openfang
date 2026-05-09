@@ -118,7 +118,12 @@ function chatPage() {
       var models = this._modelCache || [];
       var provFilter = this.modelSwitcherProviderFilter;
       var textFilter = this.modelSwitcherFilter ? this.modelSwitcherFilter.toLowerCase() : '';
-      if (!provFilter && !textFilter) return models;
+        var sortByLabel = function (a, b) {
+            var la = (a.display_name || a.id).toLowerCase();
+            var lb = (b.display_name || b.id).toLowerCase();
+            return la < lb ? -1 : la > lb ? 1 : 0;
+        };
+        if (!provFilter && !textFilter) return models.slice().sort(sortByLabel);
       return models.filter(function(m) {
         if (provFilter && m.provider !== provFilter) return false;
         if (textFilter) {
@@ -127,7 +132,7 @@ function chatPage() {
                  m.provider.toLowerCase().indexOf(textFilter) !== -1;
         }
         return true;
-      });
+      }).sort(sortByLabel);
     },
 
     get groupedSwitcherModels() {
@@ -224,11 +229,16 @@ function chatPage() {
     },
 
     get filteredModelPicker() {
-      if (!this.modelPickerFilter) return this.modelPickerList.slice(0, 15);
+        var sortByLabel = function (a, b) {
+            var la = (a.display_name || a.id).toLowerCase();
+            var lb = (b.display_name || b.id).toLowerCase();
+            return la < lb ? -1 : la > lb ? 1 : 0;
+        };
+        if (!this.modelPickerFilter) return this.modelPickerList.slice().sort(sortByLabel).slice(0, 15);
       var f = this.modelPickerFilter;
       return this.modelPickerList.filter(function(m) {
         return m.id.toLowerCase().indexOf(f) !== -1 || (m.display_name || '').toLowerCase().indexOf(f) !== -1 || m.provider.toLowerCase().indexOf(f) !== -1;
-      }).slice(0, 15);
+      }).sort(sortByLabel).slice(0, 15);
     },
 
     pickModel(modelId) {
@@ -806,22 +816,29 @@ function chatPage() {
           var lastIdx = this.messages.length - 1;
           var last = lastIdx >= 0 ? this.messages[lastIdx] : null;
           if (last && last.streaming) {
-            if (last.thinking) { last.text = ''; last.thinking = false; }
+              if (last.thinking) {
+                  last.text = '';
+                  last.parts = [];
+                  last.thinking = false;
+              }
             // If we already detected a text-based tool call, skip further text
             if (last._toolTextDetected) break;
-            last.text += data.content;
+              this._appendText(last, data.content);
             // Detect function-call patterns streamed as text and convert to tool cards
             var fcIdx = last.text.search(/\w+<\/function[=,>]/);
             if (fcIdx === -1) fcIdx = last.text.search(/<function=\w+>/);
             if (fcIdx !== -1) {
               var fcPart = last.text.substring(fcIdx);
               var toolMatch = fcPart.match(/^(\w+)<\/function/) || fcPart.match(/^<function=(\w+)>/);
-              last.text = last.text.substring(0, fcIdx).trim();
+                var truncated = last.text.substring(0, fcIdx).trim();
+                last.text = truncated;
+                // Mirror truncation into the trailing text part so the bubble matches
+                var lp = last.parts[last.parts.length - 1];
+                if (lp && lp.type === 'text') lp.text = truncated;
               last._toolTextDetected = true;
               if (toolMatch) {
-                if (!last.tools) last.tools = [];
                 var inputMatch = fcPart.match(/[=,>]\s*(\{[\s\S]*)/);
-                last.tools.push({
+                  this._appendTool(last, {
                   id: toolMatch[1] + '-txt-' + Date.now(),
                   name: toolMatch[1],
                   running: true,
@@ -838,7 +855,9 @@ function chatPage() {
             // trigger DOM updates from async WebSocket callbacks.
             this.messages.splice(lastIdx, 1, last);
           } else {
-            this.messages.push({ id: ++msgId, role: 'agent', text: data.content, meta: '', streaming: true, tools: [] });
+              var newMsg = {id: ++msgId, role: 'agent', text: '', meta: '', streaming: true, tools: [], parts: []};
+              this._appendText(newMsg, data.content);
+              this.messages.push(newMsg);
           }
           this.scrollToBottom();
           break;
@@ -847,8 +866,15 @@ function chatPage() {
           var tsIdx = this.messages.length - 1;
           var lastMsg = tsIdx >= 0 ? this.messages[tsIdx] : null;
           if (lastMsg && lastMsg.streaming) {
-            if (!lastMsg.tools) lastMsg.tools = [];
-            lastMsg.tools.push({ id: data.tool + '-' + Date.now(), name: data.tool, running: true, expanded: true, input: '', result: '', is_error: false });
+              this._appendTool(lastMsg, {
+                  id: data.tool + '-' + Date.now(),
+                  name: data.tool,
+                  running: true,
+                  expanded: true,
+                  input: '',
+                  result: '',
+                  is_error: false
+              });
             this.messages.splice(tsIdx, 1, lastMsg);
           }
           this.scrollToBottom();
@@ -918,10 +944,12 @@ function chatPage() {
           // Collect streamed text before removing streaming messages
           var streamedText = '';
           var streamedTools = [];
+            var streamedParts = [];
           this.messages.forEach(function(m) {
             if (m.streaming && !m.thinking && m.role === 'agent') {
               streamedText += m.text || '';
               streamedTools = streamedTools.concat(m.tools || []);
+                streamedParts = streamedParts.concat(m.parts || []);
             }
           });
           streamedTools.forEach(function(t) {
@@ -945,7 +973,35 @@ function chatPage() {
           if (!finalText.trim() && streamedTools.length) {
             finalText = '';
           }
-          this.messages.push({ id: ++msgId, role: 'agent', text: finalText, meta: meta, tools: streamedTools, ts: Date.now() });
+            // Build final parts preserving text/tool interleave order from streaming.
+            // Fall back to "text-then-tools" only when nothing was streamed (e.g. non-streaming HTTP).
+            var finalParts;
+            var self_resp = this;
+            if (streamedParts.length) {
+                finalParts = streamedParts.map(function (p) {
+                    if (p.type === 'text') return {
+                        type: 'text',
+                        id: p.id,
+                        text: self_resp.sanitizeToolText(p.text || '')
+                    };
+                    return p;
+                });
+            } else {
+                finalParts = [];
+                if (finalText.trim()) finalParts.push({type: 'text', id: this._partKey(), text: finalText});
+                streamedTools.forEach(function (t) {
+                    finalParts.push({type: 'tool', id: 'tp-' + t.id, tool: t});
+                });
+            }
+            this.messages.push({
+                id: ++msgId,
+                role: 'agent',
+                text: finalText,
+                meta: meta,
+                tools: streamedTools,
+                parts: finalParts,
+                ts: Date.now()
+            });
           this.sending = false;
           this.tokenCount = 0;
           this.scrollToBottom();
@@ -1036,7 +1092,34 @@ function chatPage() {
       }).catch(function() {});
     },
 
-    // Process queued messages after current response completes
+      // Build a unique id for a rendering part (text or tool card).
+      _partKey: function () {
+          return 'p' + (++msgId) + Math.random().toString(36).slice(2, 6);
+      },
+
+      // Append streamed text to a message, merging with the trailing text part if present.
+      // Keeps msg.text in sync as a flat aggregate (used by copy / sanitize / x-show toggles).
+      _appendText: function (msg, content) {
+          if (!content) return;
+          if (!msg.parts) msg.parts = [];
+          var last = msg.parts[msg.parts.length - 1];
+          if (last && last.type === 'text') {
+              last.text += content;
+          } else {
+              msg.parts.push({type: 'text', id: this._partKey(), text: content});
+          }
+          msg.text = (msg.text || '') + content;
+      },
+
+      // Push a tool card as a part, in the order it arrives between text deltas.
+      _appendTool: function (msg, tool) {
+          if (!msg.parts) msg.parts = [];
+          if (!msg.tools) msg.tools = [];
+          msg.tools.push(tool);
+          msg.parts.push({type: 'tool', id: 'tp-' + tool.id, tool: tool});
+      },
+
+      // Process queued messages after current response completes
     _processQueue: function() {
       if (!this.messageQueue.length || this.sending) return;
       var next = this.messageQueue.shift();

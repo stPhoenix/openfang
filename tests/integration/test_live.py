@@ -90,6 +90,37 @@ def test_budget_reflects_llm_usage(
     assert r.json() not in (None, {}, [])
 
 
+# ── Pro-Researcher hand discovery ─────────────────────────────────────────────
+
+
+def test_pro_researcher_hand_registered(client: httpx.Client) -> None:
+    """pro-researcher must be in the bundled-hands list with delegation +
+    workspace tools. web_search/web_fetch are whitelisted for the kernel's
+    privilege-subset rule (so the orchestrator can delegate children that
+    use them); the system prompt forbids the orchestrator from calling them
+    directly. shell_exec must stay absent."""
+    r = client.get("/api/hands")
+    assert r.status_code == 200
+    data = r.json()
+    items = data if isinstance(data, list) else data.get("hands", [])
+    pro = next((h for h in items if h.get("id") == "pro-researcher"), None)
+    assert pro is not None, f"pro-researcher hand missing from /api/hands; got {[h.get('id') for h in items]}"
+    tools = pro.get("tools") or []
+    for needed in (
+        "agent_delegate",
+        "file_read",
+        "file_write",
+        "file_list",
+        "memory_store",
+        "web_search",
+        "web_fetch",
+    ):
+        assert needed in tools, f"pro-researcher missing required tool {needed}; tools={tools}"
+    assert "shell_exec" not in tools, (
+        f"pro-researcher must NOT have shell_exec; tools={tools}"
+    )
+
+
 # ── Hand lifecycle (multi-instance + named uniqueness) ────────────────────────
 
 

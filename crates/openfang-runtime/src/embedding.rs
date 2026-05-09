@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use openfang_types::model_catalog::{
     FIREWORKS_BASE_URL, GROQ_BASE_URL, LMSTUDIO_BASE_URL, MISTRAL_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    OLLAMA_CLOUD_BASE_URL, OPENAI_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -202,6 +202,7 @@ pub fn create_embedding_driver(
                     | "fireworks"
                     | "mistral"
                     | "ollama"
+                    | "ollama_cloud"
                     | "vllm"
                     | "lmstudio"
             );
@@ -218,6 +219,7 @@ pub fn create_embedding_driver(
             "fireworks" => FIREWORKS_BASE_URL.to_string(),
             "mistral" => MISTRAL_BASE_URL.to_string(),
             "ollama" => OLLAMA_BASE_URL.to_string(),
+            "ollama_cloud" => OLLAMA_CLOUD_BASE_URL.to_string(),
             "vllm" => VLLM_BASE_URL.to_string(),
             "lmstudio" => LMSTUDIO_BASE_URL.to_string(),
             other => {

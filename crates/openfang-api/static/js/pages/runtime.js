@@ -48,6 +48,10 @@ document.addEventListener('alpine:init', function() {
 
           this.providers = (prov.providers || []).filter(function(p) {
             return p.auth_status === 'Configured' || p.reachable || p.is_local;
+          }).sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
           });
         } catch(e) {
           console.error('Runtime load error:', e);

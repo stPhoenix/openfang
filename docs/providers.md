@@ -310,6 +310,34 @@ For Gemini specifically, either `GEMINI_API_KEY` or `GOOGLE_API_KEY` will work.
 
 ---
 
+### 10b. Ollama Cloud
+
+|                  |                                               |
+|------------------|-----------------------------------------------|
+| **Display Name** | Ollama Cloud                                  |
+| **Driver**       | OpenAI-compatible                             |
+| **Env Var**      | `OLLAMA_CLOUD_API_KEY`                        |
+| **Base URL**     | `https://ollama.com/v1`                       |
+| **Key Required** | **Yes**                                       |
+| **Auth**         | `Authorization: Bearer $OLLAMA_CLOUD_API_KEY` |
+| **Models**       | 0 builtin — fully dynamic                     |
+
+**Setup:**
+
+1. Create an API key at [ollama.com/settings/keys](https://ollama.com/settings/keys)
+2. Export it: `export OLLAMA_CLOUD_API_KEY=...`
+3. Start `openfang start` — the daemon probes `GET https://ollama.com/v1/models` at boot and merges every cloud model
+   the key can access (e.g. `gpt-oss:20b:cloud`, `gpt-oss:120b:cloud`, `deepseek-v3.1:671b:cloud`, `qwen3-coder:cloud`,
+   `glm-4.x:cloud`, …) into the catalog. The `:cloud` suffix is required by Ollama Cloud's chat endpoint and is appended
+   automatically during discovery.
+4. The catalog also refreshes whenever the dashboard hits `GET /api/providers` (cached 60s).
+
+**Notes:** Distinct from the local `ollama` provider — both can be configured side by side without env-var collision. If
+`OLLAMA_CLOUD_API_KEY` is unset, the provider appears in the catalog with `auth_status = Missing` and zero discovered
+models (no panic, no auto-fallback).
+
+---
+
 ### 11. vLLM
 
 | | |

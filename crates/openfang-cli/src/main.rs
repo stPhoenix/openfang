@@ -1477,6 +1477,12 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
             "OpenRouter",
         ),
         ("minimax", "MINIMAX_API_KEY", "MiniMax-M2.7", "MiniMax"),
+        (
+            "ollama_cloud",
+            "OLLAMA_CLOUD_API_KEY",
+            "gpt-oss:120b:cloud",
+            "Ollama Cloud",
+        ),
     ]
 }
 

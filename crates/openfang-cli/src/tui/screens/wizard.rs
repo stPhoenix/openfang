@@ -152,6 +152,12 @@ const PROVIDERS: &[ProviderInfo] = &[
         needs_key: false,
     },
     ProviderInfo {
+        name: "ollama_cloud",
+        env_var: "OLLAMA_CLOUD_API_KEY",
+        default_model: "gpt-oss:120b:cloud",
+        needs_key: true,
+    },
+    ProviderInfo {
         name: "vllm",
         env_var: "VLLM_API_KEY",
         default_model: "local-model",

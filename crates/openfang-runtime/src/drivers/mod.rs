@@ -20,8 +20,9 @@ use openfang_types::model_catalog::{
     COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL,
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NOVITA_BASE_URL, NVIDIA_NIM_BASE_URL,
-    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
-    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL,
+    OLLAMA_BASE_URL, OLLAMA_CLOUD_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL,
+    PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL,
+    TOGETHER_BASE_URL, VENICE_BASE_URL,
     VLLM_BASE_URL, VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
@@ -82,6 +83,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             base_url: OLLAMA_BASE_URL,
             api_key_env: "OLLAMA_API_KEY",
             key_required: false,
+        }),
+        "ollama_cloud" => Some(ProviderDefaults {
+            base_url: OLLAMA_CLOUD_BASE_URL,
+            api_key_env: "OLLAMA_CLOUD_API_KEY",
+            key_required: true,
         }),
         "vllm" => Some(ProviderDefaults {
             base_url: VLLM_BASE_URL,
@@ -260,6 +266,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
 /// - `mistral` — Mistral AI
 /// - `fireworks` — Fireworks AI
 /// - `ollama` — Ollama (local)
+/// - `ollama_cloud` — Ollama Cloud (hosted, OpenAI-compatible)
 /// - `vllm` — vLLM (local)
 /// - `lmstudio` — LM Studio (local)
 /// - `perplexity` — Perplexity AI (search-augmented)
@@ -548,7 +555,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         status: 0,
         message: format!(
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, bedrock, groq, \
-             openrouter, deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, \
+             openrouter, deepseek, together, mistral, fireworks, ollama, ollama_cloud, vllm, lmstudio, \
              perplexity, cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, \
              github-copilot, chutes, venice, nvidia, codex, claude-code. \
              Or set base_url for a custom OpenAI-compatible endpoint.",
@@ -628,6 +635,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "mistral",
         "fireworks",
         "ollama",
+        "ollama_cloud",
         "vllm",
         "lmstudio",
         "perplexity",
@@ -719,6 +727,14 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_defaults_ollama_cloud() {
+        let d = provider_defaults("ollama_cloud").unwrap();
+        assert_eq!(d.base_url, "https://ollama.com/v1");
+        assert_eq!(d.api_key_env, "OLLAMA_CLOUD_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
     fn test_unknown_provider_returns_none() {
         assert!(provider_defaults("nonexistent").is_none());
     }
@@ -797,7 +813,8 @@ mod tests {
         assert!(providers.contains(&"claude-code"));
         assert!(providers.contains(&"qwen-code"));
         assert!(providers.contains(&"azure"));
-        assert_eq!(providers.len(), 39);
+        assert!(providers.contains(&"ollama_cloud"));
+        assert_eq!(providers.len(), 40);
     }
 
     #[test]

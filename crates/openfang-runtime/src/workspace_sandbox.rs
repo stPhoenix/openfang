@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 /// - Rejects `..` components outright.
 /// - Relative paths are joined with `workspace_root`.
 /// - Absolute paths are checked against the workspace root after canonicalization.
-/// - For new files: canonicalizes the parent directory and appends the filename.
+/// - For new files in not-yet-existing directories: walks up to the deepest
+///   existing ancestor, canonicalizes that, then re-appends the missing tail
+///   so callers (e.g. `tool_file_write`) can `create_dir_all` afterwards.
 /// - The final canonical path must start with the canonical workspace root.
 pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<PathBuf, String> {
     let path = Path::new(user_path);
@@ -34,23 +36,26 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
         .canonicalize()
         .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
 
-    // Canonicalize the candidate (or its parent for new files)
+    // Canonicalize the candidate (or its deepest existing ancestor for new paths)
     let canon_candidate = if candidate.exists() {
         candidate
             .canonicalize()
             .map_err(|e| format!("Failed to resolve path: {e}"))?
     } else {
-        // For new files: canonicalize the parent and append the filename
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| "Invalid path: no parent directory".to_string())?;
-        let filename = candidate
-            .file_name()
-            .ok_or_else(|| "Invalid path: no filename".to_string())?;
-        let canon_parent = parent
+        // Walk up to the deepest existing ancestor. This lets callers create
+        // a file in a not-yet-existing nested directory (the caller is
+        // responsible for `create_dir_all` after sandbox approval).
+        let existing = candidate
+            .ancestors()
+            .find(|p| p.exists())
+            .ok_or_else(|| "Invalid path: no existing ancestor".to_string())?;
+        let canon_existing = existing
             .canonicalize()
-            .map_err(|e| format!("Failed to resolve parent directory: {e}"))?;
-        canon_parent.join(filename)
+            .map_err(|e| format!("Failed to resolve ancestor: {e}"))?;
+        let tail = candidate
+            .strip_prefix(existing)
+            .map_err(|_| "Failed to compute path tail".to_string())?;
+        canon_existing.join(tail)
     };
 
     // Verify the canonical path is inside the workspace
@@ -128,6 +133,45 @@ mod tests {
         let resolved = result.unwrap();
         assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
         assert!(resolved.ends_with("new_file.txt"));
+    }
+
+    #[test]
+    fn test_nonexistent_nested_dir_resolves() {
+        // file_write to a/b/c/d.md where only the workspace root exists
+        let dir = TempDir::new().unwrap();
+        let result = resolve_sandbox_path("a/b/c/d.md", dir.path());
+        assert!(result.is_ok(), "got error: {:?}", result.err());
+        let resolved = result.unwrap();
+        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
+        assert!(resolved.ends_with("a/b/c/d.md"));
+    }
+
+    #[test]
+    fn test_partial_existing_ancestor_resolves() {
+        // data/ exists, data/x/y/z.md does not — must still resolve under root
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let result = resolve_sandbox_path("data/x/y/z.md", dir.path());
+        assert!(result.is_ok(), "got error: {:?}", result.err());
+        let resolved = result.unwrap();
+        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
+        assert!(resolved.ends_with("data/x/y/z.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nonexistent_path_with_symlinked_existing_ancestor_blocked() {
+        // workspace contains a symlink `escape` → /tmp/<somewhere outside>.
+        // Asking to write to escape/foo/bar.md must reject because the
+        // deepest existing ancestor (escape) canonicalizes outside root.
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let link_path = dir.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        let result = resolve_sandbox_path("escape/foo/bar.md", dir.path());
+        assert!(result.is_err(), "should reject; got: {:?}", result);
+        assert!(result.unwrap_err().contains("Access denied"));
     }
 
     #[cfg(unix)]

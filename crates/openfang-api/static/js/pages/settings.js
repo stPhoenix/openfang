@@ -224,9 +224,19 @@ function settingsPage() {
     async loadProviders() {
       try {
         var data = await OpenFangAPI.get('/api/providers');
-        this.providers = data.providers || [];
+          this.providers = (data.providers || []).slice().sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
+          });
         for (var i = 0; i < this.providers.length; i++) {
           var p = this.providers[i];
+            // Pre-init reactive keys so :disabled bindings track them.
+            // Without this, Alpine reads `undefined` from a missing key and
+            // never re-evaluates when the key is added later.
+            if (this.providerTesting[p.id] === undefined) {
+                this.providerTesting[p.id] = false;
+            }
           if (p.is_local) {
             if (!this.providerUrlInputs[p.id]) {
               this.providerUrlInputs[p.id] = p.base_url || '';
@@ -374,6 +384,10 @@ function settingsPage() {
               (m.display_name || '').toLowerCase().indexOf(q) === -1) return false;
         }
         return true;
+      }).sort(function (a, b) {
+          var la = (a.display_name || a.id).toLowerCase();
+          var lb = (b.display_name || b.id).toLowerCase();
+          return la < lb ? -1 : la > lb ? 1 : 0;
       });
     },
 

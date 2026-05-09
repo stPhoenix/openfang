@@ -1574,31 +1574,66 @@ impl OpenFangKernel {
         // This allows bundled agents to defer to the user's configured provider/model,
         // even if the agent manifest specifies an api_key_env (which is just a hint
         // about which env var to check, not a hard lock on provider/model).
+        //
+        // For child agents (delegation), prefer inheriting the parent's resolved
+        // provider/model over the kernel default — otherwise a parent that the
+        // user explicitly switched to a different provider would spawn children
+        // pointing at a default they may not have credentials for.
         {
             let is_default_provider =
                 manifest.model.provider.is_empty() || manifest.model.provider == "default";
             let is_default_model =
                 manifest.model.model.is_empty() || manifest.model.model == "default";
             if is_default_provider && is_default_model {
-                // Check hot-reloaded override first, fall back to boot-time config
-                let override_guard = self
-                    .default_model_override
-                    .read()
-                    .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                let dm = override_guard
-                    .as_ref()
-                    .unwrap_or(&self.config.default_model);
-                if !dm.provider.is_empty() {
-                    manifest.model.provider = dm.provider.clone();
+                let mut inherited_from_parent = false;
+                if let Some(pid) = parent {
+                    if let Some(parent_entry) = self.registry.get(pid) {
+                        let pm = &parent_entry.manifest.model;
+                        let parent_provider_set =
+                            !pm.provider.is_empty() && pm.provider != "default";
+                        let parent_model_set = !pm.model.is_empty() && pm.model != "default";
+                        if parent_provider_set && parent_model_set {
+                            manifest.model.provider = pm.provider.clone();
+                            manifest.model.model = pm.model.clone();
+                            if pm.api_key_env.is_some() && manifest.model.api_key_env.is_none() {
+                                manifest.model.api_key_env.clone_from(&pm.api_key_env);
+                            }
+                            if pm.base_url.is_some() && manifest.model.base_url.is_none() {
+                                manifest.model.base_url.clone_from(&pm.base_url);
+                            }
+                            info!(
+                                child = %name,
+                                parent = %pid,
+                                provider = %manifest.model.provider,
+                                model = %manifest.model.model,
+                                "Child manifest used 'default' — inherited parent's provider/model"
+                            );
+                            inherited_from_parent = true;
+                        }
+                    }
                 }
-                if !dm.model.is_empty() {
-                    manifest.model.model = dm.model.clone();
-                }
-                if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
-                    manifest.model.api_key_env = Some(dm.api_key_env.clone());
-                }
-                if dm.base_url.is_some() && manifest.model.base_url.is_none() {
-                    manifest.model.base_url.clone_from(&dm.base_url);
+
+                if !inherited_from_parent {
+                    // Check hot-reloaded override first, fall back to boot-time config
+                    let override_guard = self
+                        .default_model_override
+                        .read()
+                        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                    let dm = override_guard
+                        .as_ref()
+                        .unwrap_or(&self.config.default_model);
+                    if !dm.provider.is_empty() {
+                        manifest.model.provider = dm.provider.clone();
+                    }
+                    if !dm.model.is_empty() {
+                        manifest.model.model = dm.model.clone();
+                    }
+                    if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
+                        manifest.model.api_key_env = Some(dm.api_key_env.clone());
+                    }
+                    if dm.base_url.is_some() && manifest.model.base_url.is_none() {
+                        manifest.model.base_url.clone_from(&dm.base_url);
+                    }
                 }
             }
         }
@@ -3746,7 +3781,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         terminal_width: Option<u16>,
     ) -> KernelResult<openfang_runtime::context_analysis::ContextData> {
-        use openfang_runtime::context_analysis::{AnalysisInput, analyze_context_usage};
+        use openfang_runtime::context_analysis::{analyze_context_usage, AnalysisInput};
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -4651,11 +4686,12 @@ impl OpenFangKernel {
             });
         }
 
-        // Probe local providers for reachability and model discovery
+        // Probe local providers + dynamic-remote providers (e.g. ollama_cloud)
+        // for reachability and model discovery.
         {
             let kernel = Arc::clone(self);
             tokio::spawn(async move {
-                let local_providers: Vec<(String, String)> = {
+                let probe_targets: Vec<(String, String)> = {
                     let catalog = kernel
                         .model_catalog
                         .read()
@@ -4663,12 +4699,18 @@ impl OpenFangKernel {
                     catalog
                         .list_providers()
                         .iter()
-                        .filter(|p| !p.key_required)
+                        .filter(|p| {
+                            !p.base_url.is_empty()
+                                && (!p.key_required
+                                || openfang_runtime::provider_health::is_dynamic_remote_provider(
+                                &p.id,
+                            ))
+                        })
                         .map(|p| (p.id.clone(), p.base_url.clone()))
                         .collect()
                 };
 
-                for (provider_id, base_url) in &local_providers {
+                for (provider_id, base_url) in &probe_targets {
                     let result =
                         openfang_runtime::provider_health::probe_provider(provider_id, base_url)
                             .await;
@@ -4677,7 +4719,7 @@ impl OpenFangKernel {
                             provider = %provider_id,
                             models = result.discovered_models.len(),
                             latency_ms = result.latency_ms,
-                            "Local provider online"
+                            "Provider online"
                         );
                         if !result.discovered_models.is_empty() {
                             if let Ok(mut catalog) = kernel.model_catalog.write() {
@@ -4691,7 +4733,7 @@ impl OpenFangKernel {
                         warn!(
                             provider = %provider_id,
                             error = result.error.as_deref().unwrap_or("unknown"),
-                            "Local provider offline"
+                            "Provider offline"
                         );
                     }
                 }
@@ -8910,6 +8952,26 @@ impl KernelHandle for OpenFangKernel {
             .parse()
             .map_err(|e| format!("Invalid agent ID: {e}"))?;
 
+        // RAII cleanup: kill the spawned child on every exit path, including
+        // when the outer agent_loop tool-timeout wrapper drops this future.
+        // Without this guard, an outer drop would leak the child in the
+        // registry — blocking later dispatches with the same name.
+        struct CleanupGuard<'a> {
+            kernel: &'a OpenFangKernel,
+            id: AgentId,
+        }
+        impl Drop for CleanupGuard<'_> {
+            fn drop(&mut self) {
+                if let Err(e) = self.kernel.kill_agent(self.id) {
+                    tracing::debug!(agent = %self.id, "agent_delegate cleanup (drop): {e}");
+                }
+            }
+        }
+        let _cleanup = CleanupGuard {
+            kernel: self,
+            id: agent_id,
+        };
+
         tracing::info!(
             agent = %agent_name,
             id = %agent_id,
@@ -8920,17 +8982,13 @@ impl KernelHandle for OpenFangKernel {
         // Phase 2: Send message with timeout
         let result = tokio::time::timeout(timeout, self.send_message(agent_id, message)).await;
 
-        // Phase 3: Always clean up the specialist agent
-        if let Err(e) = self.kill_agent(agent_id) {
-            tracing::warn!(agent = %agent_id, "agent_delegate cleanup failed: {e}");
-        }
-
-        // Phase 4: Return result or error
+        // Phase 3: Read progress (if any) BEFORE the guard drops and wipes
+        // the agent's memory. Then return — guard kills the child on the
+        // way out.
         match result {
             Ok(Ok(loop_result)) => Ok(loop_result.response),
             Ok(Err(e)) => Err(format!("Delegate to '{agent_name}' failed: {e}")),
             Err(_) => {
-                // Check for progress updates from the agent
                 let progress = self
                     .memory_recall(&format!("progress/{agent_id}"))
                     .ok()

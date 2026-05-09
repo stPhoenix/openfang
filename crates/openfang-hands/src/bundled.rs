@@ -31,6 +31,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/researcher/SKILL.md"),
         ),
         (
+            "pro-researcher",
+            include_str!("../bundled/pro-researcher/HAND.toml"),
+            include_str!("../bundled/pro-researcher/SKILL.md"),
+        ),
+        (
             "twitter",
             include_str!("../bundled/twitter/HAND.toml"),
             include_str!("../bundled/twitter/SKILL.md"),
@@ -81,7 +86,55 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 9);
+        assert_eq!(hands.len(), 10);
+    }
+
+    #[test]
+    fn parse_pro_researcher_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "pro-researcher")
+            .unwrap();
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "pro-researcher");
+        assert_eq!(def.name, "Pro Researcher Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+        assert!(def.requires.is_empty());
+        // Orchestrator: shell_exec must stay out — there is no reason for it
+        // and subagents don't need it either. web_search and web_fetch ARE
+        // declared on the parent (kernel privilege-subset rule requires it
+        // for delegation), but the system prompt forbids the orchestrator
+        // from calling them directly.
+        assert!(!def.tools.contains(&"shell_exec".to_string()));
+        assert!(def.tools.contains(&"web_search".to_string()));
+        assert!(def.tools.contains(&"web_fetch".to_string()));
+        // Must have delegation + workspace tools.
+        assert!(def.tools.contains(&"agent_delegate".to_string()));
+        assert!(def.tools.contains(&"file_read".to_string()));
+        assert!(def.tools.contains(&"file_write".to_string()));
+        assert!(def.tools.contains(&"file_list".to_string()));
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        assert!(def.tools.contains(&"event_publish".to_string()));
+        // Settings present.
+        assert!(!def.settings.is_empty());
+        assert!(def.settings.iter().any(|s| s.key == "plan_approval"));
+        assert!(def.settings.iter().any(|s| s.key == "research_depth"));
+        assert!(def.settings.iter().any(|s| s.key == "max_subagent_calls"));
+        // Dashboard wired.
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"pro_researcher_subagent_calls"));
+        assert!(metric_keys.contains(&"pro_researcher_active_slug"));
+        // Higher iteration budget than classical researcher (orchestration cost).
+        assert_eq!(def.agent.max_iterations, Some(60));
+        assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]

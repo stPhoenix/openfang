@@ -120,7 +120,11 @@ function overviewPage() {
     async loadProviders() {
       try {
         var data = await OpenFangAPI.get('/api/providers');
-        this.providers = data.providers || [];
+          this.providers = (data.providers || []).slice().sort(function (a, b) {
+              var la = (a.display_name || a.id).toLowerCase();
+              var lb = (b.display_name || b.id).toLowerCase();
+              return la < lb ? -1 : la > lb ? 1 : 0;
+          });
       } catch(e) { this.providers = []; }
     },
 

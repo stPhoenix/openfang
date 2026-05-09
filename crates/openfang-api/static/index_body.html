@@ -629,9 +629,14 @@
                         <div class="message-bubble" x-show="msg.thinking" style="background:transparent;border:none;padding:4px 0">
                           <div class="typing-dots"><span></span><span></span><span></span></div>
                         </div>
-                        <!-- Normal message content -->
-                        <div class="message-bubble" :class="{ 'markdown-body': (msg.role === 'agent' || msg.role === 'system') && !msg.thinking && !msg.isHtml }" x-show="msg.text && msg.text.trim() && !msg.thinking" x-html="highlightSearch(msg.isHtml ? msg.text : ((msg.role === 'agent' || msg.role === 'system') && !msg.thinking ? renderMarkdown(msg.text) : escapeHtml(msg.text)))"></div>
-                        <!-- Inline images from uploads (shown above tool cards) -->
+                          <!-- Plain text bubble: messages without parts (user, system, fallback) -->
+                          <template x-if="!msg.parts || !msg.parts.length">
+                              <div :class="{ 'markdown-body': (msg.role === 'agent' || msg.role === 'system') && !msg.thinking && !msg.isHtml }"
+                                   class="message-bubble"
+                                   x-html="highlightSearch(msg.isHtml ? msg.text : ((msg.role === 'agent' || msg.role === 'system') && !msg.thinking ? renderMarkdown(msg.text) : escapeHtml(msg.text)))"
+                                   x-show="msg.text && msg.text.trim() && !msg.thinking"></div>
+                          </template>
+                          <!-- Inline images from uploads (shown above interleaved parts) -->
                         <template x-if="msg.images && msg.images.length">
                           <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0">
                             <template x-for="img in msg.images" :key="img.file_id">
@@ -641,41 +646,79 @@
                             </template>
                           </div>
                         </template>
-                        <template x-for="tool in (msg.tools || [])" :key="tool.id">
-                          <div class="tool-card" :class="{ 'tool-card-error': tool.is_error }" :data-tool="tool.name">
-                            <div class="tool-card-header" @click="tool.expanded = !tool.expanded">
-                              <template x-if="tool.running"><div class="tool-card-spinner"></div></template>
-                              <template x-if="!tool.running && !tool.is_error"><span class="tool-icon-ok">&#10003;</span></template>
-                              <template x-if="!tool.running && tool.is_error"><span class="tool-icon-err">&#10007;</span></template>
-                              <span class="tool-card-icon" x-html="toolIcon(tool.name)"></span>
-                              <span class="tool-card-name" x-text="tool.name"></span>
-                              <span class="text-xs text-dim" x-text="tool.running ? 'running...' : (tool.is_error ? 'error' : (tool.result ? (tool.result.length > 500 ? Math.round(tool.result.length/1024) + 'KB' : 'done') : 'done'))" style="margin-left:auto"></span>
-                              <span class="tool-expand-chevron" :style="tool.expanded ? 'transform:rotate(90deg)' : ''" style="transition:transform 0.15s">&#9654;</span>
-                            </div>
-                            <!-- Render generated images above the raw result -->
-                            <div x-show="tool._imageUrls && tool._imageUrls.length" style="padding:8px 12px;display:flex;flex-wrap:wrap;gap:8px">
-                              <template x-for="iurl in (tool._imageUrls || [])" :key="iurl">
-                                <a :href="iurl" target="_blank" style="display:block">
-                                  <img :src="iurl" alt="Generated image" style="max-width:320px;max-height:320px;border-radius:8px;border:1px solid var(--border);cursor:pointer" loading="lazy">
-                                </a>
-                              </template>
-                            </div>
-                            <!-- Audio player for TTS results -->
-                            <div x-show="tool._audioFile" style="padding:8px 12px">
-                              <div class="audio-player">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-                                <span class="text-xs" x-text="'Audio: ' + tool._audioFile.split('/').pop()"></span>
-                                <span class="text-xs text-dim" x-show="tool._audioDuration" x-text="'~' + Math.round((tool._audioDuration || 0) / 1000) + 's'"></span>
-                              </div>
-                            </div>
-                            <div class="tool-card-body" x-show="tool.expanded" x-transition:enter="transition ease-out duration-150" x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100">
-                              <div x-show="tool.input" style="margin-bottom:6px">
-                                <div class="tool-section-label">Input</div>
-                                <pre class="tool-pre" x-text="formatToolJson(tool.input)"></pre>
-                              </div>
-                              <div x-show="tool.result">
-                                <div class="tool-section-label">Result <span class="text-xs text-muted" x-show="tool.result && tool.result.length > 200" x-text="'(' + tool.result.length + ' chars)'"></span></div>
-                                <pre class="tool-pre" :class="{ 'tool-pre-error': tool.is_error, 'tool-pre-short': !tool.is_error && tool.result && tool.result.length < 100, 'tool-pre-medium': !tool.is_error && tool.result && tool.result.length >= 100 && tool.result.length < 500 }" x-text="formatToolJson(tool.result)"></pre>
+                          <!-- Interleaved text + tool parts (preserves arrival order from streaming) -->
+                          <template :key="part.id" x-for="part in (msg.parts || [])">
+                              <div style="display:contents">
+                                  <div class="message-bubble markdown-body"
+                                       x-html="highlightSearch(renderMarkdown(part.text || ''))"
+                                       x-show="part.type === 'text' && part.text && part.text.trim()"></div>
+                                  <div :class="{ 'tool-card-error': part.tool && part.tool.is_error }" :data-tool="part.tool && part.tool.name"
+                                       class="tool-card"
+                                       x-show="part.type === 'tool'">
+                                      <div @click="part.tool.expanded = !part.tool.expanded" class="tool-card-header">
+                                          <template x-if="part.tool && part.tool.running">
+                                              <div class="tool-card-spinner"></div>
+                                          </template>
+                                          <template x-if="part.tool && !part.tool.running && !part.tool.is_error"><span
+                                                  class="tool-icon-ok">&#10003;</span></template>
+                                          <template x-if="part.tool && !part.tool.running && part.tool.is_error"><span
+                                                  class="tool-icon-err">&#10007;</span></template>
+                                          <span class="tool-card-icon"
+                                                x-html="toolIcon(part.tool && part.tool.name)"></span>
+                                          <span class="tool-card-name" x-text="part.tool && part.tool.name"></span>
+                                          <span class="text-xs text-dim"
+                                                style="margin-left:auto"
+                                                x-text="part.tool && (part.tool.running ? 'running...' : (part.tool.is_error ? 'error' : (part.tool.result ? (part.tool.result.length > 500 ? Math.round(part.tool.result.length/1024) + 'KB' : 'done') : 'done')))"></span>
+                                          <span :style="part.tool && part.tool.expanded ? 'transform:rotate(90deg)' : ''"
+                                                class="tool-expand-chevron"
+                                                style="transition:transform 0.15s">&#9654;</span>
+                                      </div>
+                                      <!-- Render generated images above the raw result -->
+                                      <div style="padding:8px 12px;display:flex;flex-wrap:wrap;gap:8px"
+                                           x-show="part.tool && part.tool._imageUrls && part.tool._imageUrls.length">
+                                          <template :key="iurl"
+                                                    x-for="iurl in ((part.tool && part.tool._imageUrls) || [])">
+                                              <a :href="iurl" style="display:block" target="_blank">
+                                                  <img :src="iurl" alt="Generated image"
+                                                       loading="lazy"
+                                                       style="max-width:320px;max-height:320px;border-radius:8px;border:1px solid var(--border);cursor:pointer">
+                                              </a>
+                                          </template>
+                                      </div>
+                                      <!-- Audio player for TTS results -->
+                                      <div style="padding:8px 12px" x-show="part.tool && part.tool._audioFile">
+                                          <div class="audio-player">
+                                              <svg fill="none" height="14" stroke="var(--accent)" stroke-linecap="round"
+                                                   stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"
+                                                   width="14">
+                                                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                                                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                                                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+                                              </svg>
+                                              <span class="text-xs"
+                                                    x-text="part.tool && part.tool._audioFile ? 'Audio: ' + part.tool._audioFile.split('/').pop() : ''"></span>
+                                              <span class="text-xs text-dim"
+                                                    x-show="part.tool && part.tool._audioDuration"
+                                                    x-text="part.tool && part.tool._audioDuration ? '~' + Math.round(part.tool._audioDuration / 1000) + 's' : ''"></span>
+                                          </div>
+                                      </div>
+                                      <div class="tool-card-body" x-show="part.tool && part.tool.expanded"
+                                           x-transition:enter="transition ease-out duration-150"
+                                           x-transition:enter-end="opacity-100" x-transition:enter-start="opacity-0">
+                                          <div style="margin-bottom:6px" x-show="part.tool && part.tool.input">
+                                              <div class="tool-section-label">Input</div>
+                                              <pre class="tool-pre"
+                                                   x-text="formatToolJson(part.tool && part.tool.input)"></pre>
+                                          </div>
+                                          <div x-show="part.tool && part.tool.result">
+                                              <div class="tool-section-label">Result <span class="text-xs text-muted"
+                                                                                           x-show="part.tool && part.tool.result && part.tool.result.length > 200"
+                                                                                           x-text="part.tool ? '(' + part.tool.result.length + ' chars)' : ''"></span>
+                                              </div>
+                                              <pre :class="{ 'tool-pre-error': part.tool && part.tool.is_error, 'tool-pre-short': part.tool && !part.tool.is_error && part.tool.result && part.tool.result.length < 100, 'tool-pre-medium': part.tool && !part.tool.is_error && part.tool.result && part.tool.result.length >= 100 && part.tool.result.length < 500 }"
+                                                   class="tool-pre"
+                                                   x-text="formatToolJson(part.tool && part.tool.result)"></pre>
+                                          </div>
                               </div>
                             </div>
                           </div>

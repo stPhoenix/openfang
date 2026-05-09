@@ -25,12 +25,21 @@ pub struct ProbeResult {
 
 /// Check if a provider is a local provider (no key required, localhost URL).
 ///
-/// Returns true for `"ollama"`, `"vllm"`, `"lmstudio"`.
+/// Returns true for `"ollama"`, `"vllm"`, `"lmstudio"`. Note `"ollama_cloud"` is
+/// **remote** (hosted OpenAI-compatible) and returns false.
 pub fn is_local_provider(provider: &str) -> bool {
     matches!(
         provider.to_lowercase().as_str(),
         "ollama" | "vllm" | "lmstudio"
     )
+}
+
+/// Returns true for remote providers whose model catalog should be fetched at
+/// runtime via an authenticated `GET /v1/models` (rather than seeded statically).
+/// Currently: `"ollama_cloud"`. The `list_providers` HTTP handler probes these
+/// in addition to local providers.
+pub fn is_dynamic_remote_provider(provider: &str) -> bool {
+    matches!(provider.to_lowercase().as_str(), "ollama_cloud")
 }
 
 /// Overall request timeout for local provider health probes (connect + response).
@@ -91,17 +100,34 @@ impl Default for ProbeCache {
 
 /// Probe a provider's health by hitting its model listing endpoint.
 ///
-/// - **Ollama**: `GET {base_url_root}/api/tags` → parses `.models[].name`
+/// - **Ollama** (local): `GET {base_url_root}/api/tags` → parses `.models[].name`
+/// - **Ollama Cloud**: `GET {base_url}/models` with `Authorization: Bearer $OLLAMA_CLOUD_API_KEY`
+///   → parses `.data[].id`. Returns an error result (no panic) if the env var is unset.
 /// - **OpenAI-compat** (vLLM, LM Studio): `GET {base_url}/models` → parses `.data[].id`
 ///
 /// `base_url` should be the provider's base URL from the catalog (e.g.,
-/// `http://localhost:11434/v1` for Ollama, `http://localhost:8000/v1` for vLLM).
+/// `http://localhost:11434/v1` for Ollama, `https://ollama.com/v1` for Ollama Cloud,
+/// `http://localhost:8000/v1` for vLLM).
 pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
     let start = Instant::now();
 
+    let lower = provider.to_lowercase();
+
+    // Remote providers need a longer timeout than the 2s local default and may
+    // require an API key. Detect early so we can build a tuned client + headers.
+    let is_remote = is_dynamic_remote_provider(&lower);
+    let (connect_to, total_to) = if is_remote {
+        (Duration::from_secs(5), Duration::from_secs(15))
+    } else {
+        (
+            Duration::from_secs(PROBE_CONNECT_TIMEOUT_SECS),
+            Duration::from_secs(PROBE_TIMEOUT_SECS),
+        )
+    };
+
     let client = match reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(PROBE_CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
+        .connect_timeout(connect_to)
+        .timeout(total_to)
         .build()
     {
         Ok(c) => c,
@@ -112,8 +138,6 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
             };
         }
     };
-
-    let lower = provider.to_lowercase();
 
     // Skip providers whose base_url is empty (CLI-only providers like claude-code)
     if base_url.is_empty() {
@@ -152,7 +176,24 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
         (format!("{trimmed}/models"), false)
     };
 
-    let resp = match client.get(&url).send().await {
+    // Build the request, attaching auth for remote providers that require it.
+    let mut req = client.get(&url);
+    if lower == "ollama_cloud" {
+        match std::env::var("OLLAMA_CLOUD_API_KEY") {
+            Ok(key) if !key.is_empty() => {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+            _ => {
+                return ProbeResult {
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: Some("missing OLLAMA_CLOUD_API_KEY".into()),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             return ProbeResult {
@@ -186,7 +227,7 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
     let latency_ms = start.elapsed().as_millis() as u64;
 
     // Parse model names
-    let models = if is_ollama {
+    let models: Vec<String> = if is_ollama {
         // Ollama: { "models": [ { "name": "llama3.2:latest", ... }, ... ] }
         body.get("models")
             .and_then(|v| v.as_array())
@@ -210,6 +251,24 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
                     .collect()
             })
             .unwrap_or_default()
+    };
+
+    // Ollama Cloud lists bare names (e.g. "kimi-k2.6") via /v1/models, but the
+    // chat-completions endpoint requires the `:cloud` tag (e.g. "kimi-k2.6:cloud").
+    // Append the tag during discovery so catalog IDs match what callers must send.
+    let models: Vec<String> = if lower == "ollama_cloud" {
+        models
+            .into_iter()
+            .map(|id| {
+                if id.ends_with(":cloud") {
+                    id
+                } else {
+                    format!("{id}:cloud")
+                }
+            })
+            .collect()
+    } else {
+        models
     };
 
     ProbeResult {
@@ -311,6 +370,32 @@ mod tests {
         assert!(!is_local_provider("anthropic"));
         assert!(!is_local_provider("gemini"));
         assert!(!is_local_provider("groq"));
+    }
+
+    #[test]
+    fn test_is_local_provider_false_for_ollama_cloud() {
+        assert!(!is_local_provider("ollama_cloud"));
+        assert!(!is_local_provider("Ollama_Cloud"));
+    }
+
+    #[test]
+    fn test_is_dynamic_remote_provider_ollama_cloud() {
+        assert!(is_dynamic_remote_provider("ollama_cloud"));
+        assert!(is_dynamic_remote_provider("Ollama_Cloud"));
+        assert!(!is_dynamic_remote_provider("ollama"));
+        assert!(!is_dynamic_remote_provider("openai"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ollama_cloud_missing_key_returns_error() {
+        std::env::remove_var("OLLAMA_CLOUD_API_KEY");
+        let result = probe_provider("ollama_cloud", "https://ollama.com/v1").await;
+        assert!(!result.reachable);
+        assert!(result.discovered_models.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some("missing OLLAMA_CLOUD_API_KEY")
+        );
     }
 
     #[test]
