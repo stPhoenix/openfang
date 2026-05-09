@@ -4095,6 +4095,19 @@ impl OpenFangKernel {
         let fixed_agent_id = AgentId::from_string(&format!("{hand_id}:{}", instance.instance_id));
         let existing = self.registry.get(fixed_agent_id);
         let old_agent_id = existing.as_ref().map(|e| e.id);
+        // Preserve the prior active session across kill+respawn so chat history
+        // survives daemon restart. spawn_agent_with_parent always creates a
+        // fresh empty session, AND kill_agent → memory.remove_agent
+        // cascade-deletes every session row for the agent
+        // (substrate.rs::remove_agent), so the populated session blob has to
+        // be captured here before kill and re-inserted after spawn.
+        let preserved_session = existing.as_ref().and_then(|e| {
+            self.memory
+                .get_session(e.session_id)
+                .ok()
+                .flatten()
+                .filter(|s| !s.messages.is_empty())
+        });
         let saved_triggers = old_agent_id
             .map(|id| self.triggers.take_agent_triggers(id))
             .unwrap_or_default();
@@ -4115,6 +4128,42 @@ impl OpenFangKernel {
         // Spawn the agent with a fixed ID based on hand_id + instance_id for
         // stable identity across restarts while allowing multiple instances.
         let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_agent_id))?;
+
+        // Re-insert the prior session blob (kill_agent cascade-deleted it) and
+        // re-point the registry at it. Without this the conversation history
+        // vanishes from the chat UI on every daemon restart for hand agents.
+        if let Some(session) = preserved_session {
+            let prior_session_id = session.id;
+            let new_empty_session_id = self.registry.get(agent_id).map(|e| e.session_id);
+            if let Err(e) = self.memory.save_session(&session) {
+                warn!(
+                    agent = %agent_id,
+                    session = %prior_session_id.0,
+                    "Failed to restore session blob after hand reactivation: {e}"
+                );
+            } else if let Err(e) = self.registry.update_session_id(agent_id, prior_session_id) {
+                warn!(
+                    agent = %agent_id,
+                    session = %prior_session_id.0,
+                    "Failed to restore session_id after hand reactivation: {e}"
+                );
+            } else {
+                if let Some(entry) = self.registry.get(agent_id) {
+                    let _ = self.memory.save_agent(&entry);
+                }
+                if let Some(empty_id) = new_empty_session_id {
+                    if empty_id != prior_session_id {
+                        let _ = self.memory.delete_session(empty_id);
+                    }
+                }
+                info!(
+                    agent = %agent_id,
+                    session = %prior_session_id.0,
+                    messages = session.messages.len(),
+                    "Restored prior session after hand reactivation"
+                );
+            }
+        }
 
         // Restore triggers from the old agent under the new agent ID (#519).
         if !saved_triggers.is_empty() {

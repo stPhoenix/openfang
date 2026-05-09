@@ -155,6 +155,264 @@ pub async fn broadcast_to_ws(agent_id: AgentId, msg: serde_json::Value) -> usize
     success_count
 }
 
+// ---------------------------------------------------------------------------
+// Resumable Stream State
+// ---------------------------------------------------------------------------
+//
+// Each in-flight LLM stream gets a `LiveStream` keyed by AgentId. Stream
+// events broadcast to all connected sockets and update this snapshot under
+// the same lock, so a freshly-connected socket can catch up to events that
+// fired before it joined.
+
+/// Cap on `accumulated_text` size in the snapshot (truncated from front).
+const ACCUMULATED_TEXT_CAP: usize = 256 * 1024;
+/// Marker prepended when accumulated_text is truncated.
+const TRUNCATION_MARKER: &str = "[earlier output truncated]\n";
+/// How long to retain a completed stream's snapshot for late reconnects.
+const COMPLETED_SNAPSHOT_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct ToolState {
+    name: String,
+    input: Option<serde_json::Value>,
+    result_preview: Option<String>,
+    is_error: bool,
+    finished: bool,
+}
+
+#[derive(Clone)]
+struct CompletedSnapshot {
+    payload: serde_json::Value,
+    completed_at: tokio::time::Instant,
+}
+
+struct LiveStream {
+    stream_id: uuid::Uuid,
+    started_at_ms: i64,
+    next_seq: u64,
+    accumulated_text: String,
+    tools: Vec<(String, ToolState)>,
+    last_phase: Option<(String, Option<String>)>,
+    completed: Option<CompletedSnapshot>,
+}
+
+impl LiveStream {
+    fn new() -> Self {
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Self {
+            stream_id: uuid::Uuid::new_v4(),
+            started_at_ms,
+            next_seq: 0,
+            accumulated_text: String::new(),
+            tools: Vec::new(),
+            last_phase: None,
+            completed: None,
+        }
+    }
+}
+
+/// Global registry of in-flight (and recently-completed) LLM streams.
+fn ws_agent_streams() -> &'static DashMap<AgentId, RwLock<LiveStream>> {
+    static REGISTRY: std::sync::OnceLock<DashMap<AgentId, RwLock<LiveStream>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Append text to the snapshot's accumulated buffer; truncate from the
+/// front if the cap is exceeded so memory stays bounded for long runs.
+fn append_text_capped(buf: &mut String, delta: &str) {
+    buf.push_str(delta);
+    if buf.len() <= ACCUMULATED_TEXT_CAP {
+        return;
+    }
+    let target = ACCUMULATED_TEXT_CAP.saturating_sub(TRUNCATION_MARKER.len());
+    let drop_n = buf.len().saturating_sub(target);
+    let mut split_at = drop_n;
+    while split_at < buf.len() && !buf.is_char_boundary(split_at) {
+        split_at += 1;
+    }
+    let kept = buf.split_off(split_at);
+    *buf = format!("{TRUNCATION_MARKER}{kept}");
+}
+
+/// Build the snapshot JSON sent to a freshly-connected socket.
+fn build_snapshot_json(s: &LiveStream) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = s
+        .tools
+        .iter()
+        .map(|(id, t)| {
+            serde_json::json!({
+                "id": id,
+                "name": t.name,
+                "input": t.input,
+                "result": t.result_preview,
+                "is_error": t.is_error,
+                "finished": t.finished,
+            })
+        })
+        .collect();
+    let last_phase = s.last_phase.as_ref().map(|(phase, detail)| {
+        serde_json::json!({"phase": phase, "detail": detail})
+    });
+    serde_json::json!({
+        "type": "stream_snapshot",
+        "stream_id": s.stream_id.to_string(),
+        "seq": s.next_seq.saturating_sub(1),
+        "started_at": s.started_at_ms,
+        "accumulated_text": s.accumulated_text,
+        "tools": tools,
+        "last_phase": last_phase,
+        "completed": s.completed.as_ref().map(|c| c.payload.clone()),
+    })
+}
+
+/// Mutate the LiveStream snapshot for a given event payload (text_delta,
+/// tool_start/end/result, phase). Other event types pass through unchanged.
+fn apply_event_to_snapshot(s: &mut LiveStream, payload: &serde_json::Value) {
+    let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "text_delta" => {
+            if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
+                append_text_capped(&mut s.accumulated_text, content);
+            }
+        }
+        "tool_start" => {
+            if let (Some(id), Some(name)) = (
+                payload.get("id").and_then(|v| v.as_str()),
+                payload.get("tool").and_then(|v| v.as_str()),
+            ) {
+                if !s.tools.iter().any(|(k, _)| k == id) {
+                    s.tools.push((
+                        id.to_string(),
+                        ToolState {
+                            name: name.to_string(),
+                            input: None,
+                            result_preview: None,
+                            is_error: false,
+                            finished: false,
+                        },
+                    ));
+                }
+            }
+        }
+        "tool_end" => {
+            if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                if let Some(t) = s.tools.iter_mut().find(|(k, _)| k == id) {
+                    if let Some(input) = payload.get("input") {
+                        t.1.input = Some(input.clone());
+                    }
+                }
+            }
+        }
+        "tool_result" => {
+            if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                if let Some(t) = s.tools.iter_mut().find(|(k, _)| k == id) {
+                    t.1.result_preview = payload
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    t.1.is_error = payload
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    t.1.finished = true;
+                }
+            }
+        }
+        "phase" => {
+            let phase = payload
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let detail = payload
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            s.last_phase = Some((phase, detail));
+        }
+        _ => {}
+    }
+}
+
+/// Emit a stream event: stamp seq + stream_id, mutate the per-agent
+/// snapshot, then broadcast to all connected sockets.
+async fn emit_stream_event(agent_id: AgentId, mut payload: serde_json::Value) -> usize {
+    if let Some(entry) = ws_agent_streams().get(&agent_id) {
+        let mut s = entry.value().write().await;
+        let seq = s.next_seq;
+        s.next_seq += 1;
+        apply_event_to_snapshot(&mut s, &payload);
+        let stream_id = s.stream_id.to_string();
+        drop(s);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("seq".to_string(), serde_json::Value::from(seq));
+            obj.insert("stream_id".to_string(), serde_json::Value::from(stream_id));
+        }
+    }
+    broadcast_to_ws(agent_id, payload).await
+}
+
+/// Mark the current stream as completed, broadcast the terminal payload
+/// (response / silent_complete / error), and schedule GC after TTL.
+async fn complete_stream(agent_id: AgentId, mut payload: serde_json::Value) -> usize {
+    let stamped_payload = if let Some(entry) = ws_agent_streams().get(&agent_id) {
+        let mut s = entry.value().write().await;
+        let seq = s.next_seq;
+        s.next_seq += 1;
+        let stream_id = s.stream_id.to_string();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("seq".to_string(), serde_json::Value::from(seq));
+            obj.insert("stream_id".to_string(), serde_json::Value::from(stream_id));
+        }
+        s.completed = Some(CompletedSnapshot {
+            payload: payload.clone(),
+            completed_at: tokio::time::Instant::now(),
+        });
+        payload
+    } else {
+        payload
+    };
+
+    let count = broadcast_to_ws(agent_id, stamped_payload).await;
+
+    // Schedule GC after TTL. Guard against removing a newer stream that
+    // overwrote this slot in the meantime — only remove if completed and
+    // the TTL has actually elapsed for the current snapshot.
+    tokio::spawn(async move {
+        tokio::time::sleep(COMPLETED_SNAPSHOT_TTL).await;
+        let should_remove = if let Some(entry) = ws_agent_streams().get(&agent_id) {
+            let s = entry.value().read().await;
+            s.completed
+                .as_ref()
+                .is_some_and(|c| c.completed_at.elapsed() >= COMPLETED_SNAPSHOT_TTL)
+        } else {
+            false
+        };
+        if should_remove {
+            ws_agent_streams().remove(&agent_id);
+        }
+    });
+    count
+}
+
+/// Flush an accumulated text buffer as a single text_delta event via
+/// the broadcast pipeline.
+async fn flush_text_buffer_broadcast(agent_id: AgentId, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "type": "text_delta",
+        "content": buffer.as_str(),
+    });
+    buffer.clear();
+    let _ = emit_stream_event(agent_id, payload).await;
+}
+
 /// RAII guard that decrements the connection count on drop.
 struct WsConnectionGuard {
     ip: IpAddr,
@@ -336,6 +594,13 @@ async fn handle_agent_ws(
         }),
     )
     .await;
+
+    // If a stream is in flight (or recently completed) for this agent,
+    // unicast the snapshot to the new socket so the UI can resume.
+    if let Some(entry) = ws_agent_streams().get(&agent_id) {
+        let snapshot = build_snapshot_json(&*entry.value().read().await);
+        let _ = send_json(&sender, &snapshot).await;
+    }
 
     // Spawn background task: periodic agent list updates with change detection
     let sender_clone = Arc::clone(&sender);
@@ -536,6 +801,20 @@ async fn handle_text_message(
                 return;
             }
 
+            // Echo the user message to every socket for this agent so other
+            // tabs see what was just asked. The originating socket already
+            // pushed a local bubble in sendMessage(); the client dedupes by
+            // recent-content match.
+            let _ = broadcast_to_ws(
+                agent_id,
+                serde_json::json!({
+                    "type": "message",
+                    "source": "user",
+                    "content": content.clone(),
+                }),
+            )
+                .await;
+
             // Resolve file attachments into image content blocks
             let mut has_images = false;
             let mut ws_content_blocks: Option<Vec<openfang_types::message::ContentBlock>> = None;
@@ -585,16 +864,6 @@ async fn handle_text_message(
                 }
             }
 
-            // Send typing lifecycle: start
-            let _ = send_json(
-                sender,
-                &serde_json::json!({
-                    "type": "typing",
-                    "state": "start",
-                }),
-            )
-            .await;
-
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
@@ -628,15 +897,22 @@ async fn handle_text_message(
                 ws_content_blocks,
             ) {
                 Ok((mut rx, handle)) => {
-                    // Forward stream events to WebSocket with debouncing.
-                    //
-                    // The stream_task also accumulates the full response text and
-                    // captures ContentComplete usage data. This lets us send the
-                    // `response` event immediately when the stream channel closes
-                    // (after `drop(phase_cb)` in the kernel), WITHOUT waiting for
-                    // post-processing (canonical session writes, JSONL, compaction)
-                    // that happens in the kernel task after the loop.
-                    let sender_stream = Arc::clone(sender);
+                    // Establish a fresh LiveStream for this generation. All
+                    // stream events broadcast to every socket registered for
+                    // the agent and update this snapshot under the same lock,
+                    // so a freshly-connected socket can replay the in-flight
+                    // state.
+                    ws_agent_streams()
+                        .insert(agent_id, RwLock::new(LiveStream::new()));
+
+                    // Send typing lifecycle: start (broadcast — every socket
+                    // for this agent should see the indicator).
+                    let _ = emit_stream_event(
+                        agent_id,
+                        serde_json::json!({"type": "typing", "state": "start"}),
+                    )
+                        .await;
+
                     let verbose_clone = Arc::clone(verbose);
                     let stream_task = tokio::spawn(async move {
                         let mut text_buffer = String::new();
@@ -658,8 +934,8 @@ async fn handle_text_message(
                                     match event {
                                         None => {
                                             // Stream ended — flush remaining text
-                                            let _ = flush_text_buffer(
-                                                &sender_stream,
+                                            flush_text_buffer_broadcast(
+                                                agent_id,
                                                 &mut text_buffer,
                                             )
                                             .await;
@@ -677,8 +953,8 @@ async fn handle_text_message(
                                                 accumulated_text.push_str(text);
                                                 text_buffer.push_str(text);
                                                 if text_buffer.len() >= DEBOUNCE_CHARS {
-                                                    let _ = flush_text_buffer(
-                                                        &sender_stream,
+                                                    flush_text_buffer_broadcast(
+                                                        agent_id,
                                                         &mut text_buffer,
                                                     )
                                                     .await;
@@ -690,8 +966,8 @@ async fn handle_text_message(
                                                 }
                                             } else {
                                                 // Flush pending text before non-text events
-                                                let _ = flush_text_buffer(
-                                                    &sender_stream,
+                                                flush_text_buffer_broadcast(
+                                                    agent_id,
                                                     &mut text_buffer,
                                                 )
                                                 .await;
@@ -702,9 +978,9 @@ async fn handle_text_message(
                                                     ref name, ..
                                                 } = ev
                                                 {
-                                                    let _ = send_json(
-                                                        &sender_stream,
-                                                        &serde_json::json!({
+                                                    let _ = emit_stream_event(
+                                                        agent_id,
+                                                        serde_json::json!({
                                                             "type": "typing",
                                                             "state": "tool",
                                                             "tool": name,
@@ -717,12 +993,7 @@ async fn handle_text_message(
                                                 if let Some(json) =
                                                     map_stream_event(&ev, vlevel)
                                                 {
-                                                    if send_json(&sender_stream, &json)
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        break;
-                                                    }
+                                                    let _ = emit_stream_event(agent_id, json).await;
                                                 }
                                             }
                                         }
@@ -730,8 +1001,8 @@ async fn handle_text_message(
                                 }
                                 _ = &mut sleep => {
                                     // Timer fired — flush text buffer
-                                    let _ = flush_text_buffer(
-                                        &sender_stream,
+                                    flush_text_buffer_broadcast(
+                                        agent_id,
                                         &mut text_buffer,
                                     )
                                     .await;
@@ -760,15 +1031,14 @@ async fn handle_text_message(
                     // Spawn the kernel task in the background for cleanup
                     // (canonical session writes, JSONL mirror, compaction).
                     // We don't need its result for the response event.
-                    let sender_bg = Arc::clone(sender);
                     tokio::spawn(async move {
                         match handle.await {
                             Ok(Err(e)) => {
                                 warn!("Agent post-processing failed: {e}");
                                 let user_msg = classify_streaming_error(&e);
-                                let _ = send_json(
-                                    &sender_bg,
-                                    &serde_json::json!({
+                                let _ = broadcast_to_ws(
+                                    agent_id,
+                                    serde_json::json!({
                                         "type": "error",
                                         "content": user_msg,
                                     }),
@@ -777,9 +1047,9 @@ async fn handle_text_message(
                             }
                             Err(e) => {
                                 warn!("Agent task panicked: {e}");
-                                let _ = send_json(
-                                    &sender_bg,
-                                    &serde_json::json!({
+                                let _ = broadcast_to_ws(
+                                    agent_id,
+                                    serde_json::json!({
                                         "type": "error",
                                         "content": "Internal error occurred",
                                     }),
@@ -796,21 +1066,18 @@ async fn handle_text_message(
                     match stream_result {
                         Ok((accumulated_text, stream_usage, is_silent)) => {
                             // Send typing lifecycle: stop
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
-                                    "type": "typing",
-                                    "state": "stop",
-                                }),
+                            let _ = emit_stream_event(
+                                agent_id,
+                                serde_json::json!({"type": "typing", "state": "stop"}),
                             )
                             .await;
 
                             let usage = stream_usage.unwrap_or_default();
 
                             if is_silent {
-                                let _ = send_json(
-                                    sender,
-                                    &serde_json::json!({
+                                let _ = complete_stream(
+                                    agent_id,
+                                    serde_json::json!({
                                         "type": "silent_complete",
                                         "input_tokens": usage.input_tokens,
                                         "output_tokens": usage.output_tokens,
@@ -845,9 +1112,9 @@ async fn handle_text_message(
                                 "low"
                             };
 
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
+                            let _ = complete_stream(
+                                agent_id,
+                                serde_json::json!({
                                     "type": "response",
                                     "content": content,
                                     "input_tokens": usage.input_tokens,
@@ -862,16 +1129,14 @@ async fn handle_text_message(
                         }
                         Err(e) => {
                             warn!("Stream task panicked: {e}");
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
-                                    "type": "typing", "state": "stop",
-                                }),
+                            let _ = emit_stream_event(
+                                agent_id,
+                                serde_json::json!({"type": "typing", "state": "stop"}),
                             )
                             .await;
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
+                            let _ = complete_stream(
+                                agent_id,
+                                serde_json::json!({
                                     "type": "error",
                                     "content": "Internal error occurred",
                                 }),
@@ -882,13 +1147,9 @@ async fn handle_text_message(
                 }
                 Err(e) => {
                     warn!("Streaming setup failed: {e}");
-                    let _ = send_json(
-                        sender,
-                        &serde_json::json!({
-                            "type": "typing", "state": "stop",
-                        }),
-                    )
-                    .await;
+                    // No LiveStream was created — direct unicast to the
+                    // requesting socket. Other tabs will not see this
+                    // setup-failure error, which matches prior behavior.
                     let user_msg = classify_streaming_error(&e);
                     let _ = send_json(
                         sender,
@@ -1247,26 +1508,6 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Flush accumulated text buffer as a single text_delta event.
-async fn flush_text_buffer(
-    sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
-    buffer: &mut String,
-) -> Result<(), axum::Error> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    let result = send_json(
-        sender,
-        &serde_json::json!({
-            "type": "text_delta",
-            "content": buffer.as_str(),
-        }),
-    )
-    .await;
-    buffer.clear();
-    result
-}
 
 /// Helper to send a JSON value over WebSocket.
 async fn send_json(
@@ -1631,5 +1872,155 @@ mod tests {
         );
         assert_eq!(strip_think_tags("No thinking here"), "No thinking here");
         assert_eq!(strip_think_tags("<think>all thinking</think>"), "");
+    }
+
+    // -------- Resumable stream snapshot tests --------
+
+    fn fresh_agent_id() -> AgentId {
+        // Each test gets an independent registry slot.
+        AgentId::new()
+    }
+
+    #[tokio::test]
+    async fn live_stream_seq_is_monotonic() {
+        let agent = fresh_agent_id();
+        ws_agent_streams().insert(agent, RwLock::new(LiveStream::new()));
+        for i in 0..50 {
+            let payload = serde_json::json!({
+                "type": "text_delta",
+                "content": format!("chunk-{i} "),
+            });
+            emit_stream_event(agent, payload).await;
+        }
+        {
+            let entry = ws_agent_streams().get(&agent).expect("stream registered");
+            let s = entry.value().read().await;
+            assert_eq!(s.next_seq, 50, "next_seq must equal number of emits");
+            assert!(
+                s.accumulated_text.contains("chunk-0 "),
+                "accumulated text must include first delta"
+            );
+            assert!(
+                s.accumulated_text.contains("chunk-49 "),
+                "accumulated text must include last delta"
+            );
+        }
+        // Drop the DashMap RefMulti (shard read lock) before remove (shard write).
+        ws_agent_streams().remove(&agent);
+    }
+
+    #[test]
+    fn accumulated_text_truncates_at_cap() {
+        let mut buf = String::new();
+        // Push ~300 KB across many appends — exceeds the 256 KB cap.
+        let block = "x".repeat(8 * 1024);
+        for _ in 0..40 {
+            append_text_capped(&mut buf, &block);
+        }
+        assert!(
+            buf.len() <= ACCUMULATED_TEXT_CAP,
+            "buf len {} exceeds cap {}",
+            buf.len(),
+            ACCUMULATED_TEXT_CAP
+        );
+        assert!(
+            buf.starts_with(TRUNCATION_MARKER),
+            "truncated buffer must start with marker"
+        );
+    }
+
+    #[test]
+    fn append_text_capped_keeps_utf8_boundary() {
+        // Force truncation to land near a multi-byte boundary.
+        let mut buf = String::new();
+        // Fill close to cap with multi-byte chars.
+        let multibyte = "λ".repeat(64 * 1024); // 2 bytes each = 128 KB
+        append_text_capped(&mut buf, &multibyte);
+        append_text_capped(&mut buf, &multibyte);
+        // Now ~256 KB. One more append triggers truncation.
+        append_text_capped(&mut buf, "tail-marker");
+        assert!(buf.len() <= ACCUMULATED_TEXT_CAP);
+        // The result must still be valid UTF-8 (any panic from char-boundary
+        // mismatch would have aborted before this point — String::split_off
+        // panics if split_at is not on a boundary).
+        assert!(buf.contains("tail-marker"), "tail must be preserved");
+    }
+
+    #[tokio::test]
+    async fn tool_state_lookup_by_id() {
+        let agent = fresh_agent_id();
+        ws_agent_streams().insert(agent, RwLock::new(LiveStream::new()));
+        emit_stream_event(
+            agent,
+            serde_json::json!({"type": "tool_start", "id": "t1", "tool": "file_read"}),
+        )
+            .await;
+        emit_stream_event(
+            agent,
+            serde_json::json!({
+                "type": "tool_end",
+                "id": "t1",
+                "tool": "file_read",
+                "input": {"path": "/etc/hosts"},
+            }),
+        )
+            .await;
+        emit_stream_event(
+            agent,
+            serde_json::json!({
+                "type": "tool_result",
+                "id": "t1",
+                "tool": "file_read",
+                "result": "127.0.0.1 localhost",
+                "is_error": false,
+            }),
+        )
+            .await;
+        {
+            let entry = ws_agent_streams().get(&agent).expect("stream registered");
+            let s = entry.value().read().await;
+            assert_eq!(s.tools.len(), 1, "exactly one tool registered");
+            let (id, t) = &s.tools[0];
+            assert_eq!(id, "t1");
+            assert_eq!(t.name, "file_read");
+            assert!(t.finished, "tool must be marked finished after tool_result");
+            assert_eq!(t.result_preview.as_deref(), Some("127.0.0.1 localhost"));
+            assert!(!t.is_error);
+        }
+        ws_agent_streams().remove(&agent);
+    }
+
+    #[tokio::test]
+    async fn snapshot_payload_includes_completed_terminal() {
+        let agent = fresh_agent_id();
+        ws_agent_streams().insert(agent, RwLock::new(LiveStream::new()));
+        emit_stream_event(
+            agent,
+            serde_json::json!({"type": "text_delta", "content": "hello"}),
+        )
+            .await;
+        complete_stream(
+            agent,
+            serde_json::json!({
+                "type": "response",
+                "content": "hello world",
+                "input_tokens": 10,
+                "output_tokens": 5,
+            }),
+        )
+            .await;
+        let entry = ws_agent_streams().get(&agent).expect("stream still in TTL window");
+        let snapshot = build_snapshot_json(&*entry.value().read().await);
+        assert_eq!(snapshot["type"], "stream_snapshot");
+        let completed = &snapshot["completed"];
+        assert!(completed.is_object(), "completed payload must be present");
+        assert_eq!(completed["type"], "response");
+        assert_eq!(completed["content"], "hello world");
+        assert!(
+            completed.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "terminal payload must be seq-stamped"
+        );
+        drop(entry);
+        ws_agent_streams().remove(&agent);
     }
 }

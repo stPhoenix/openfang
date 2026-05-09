@@ -631,7 +631,7 @@ function chatPage() {
                 id: (t.name || 'tool') + '-hist-' + idx,
                 name: t.name || 'unknown',
                 running: false,
-                expanded: true,
+                expanded: false,
                 input: t.input || '',
                 result: t.result || '',
                 is_error: !!t.is_error
@@ -640,7 +640,18 @@ function chatPage() {
             var images = (m.images || []).map(function(img) {
               return { file_id: img.file_id, filename: img.filename || 'image' };
             });
-            return { id: ++msgId, role: role, text: text, meta: '', tools: tools, images: images };
+            // Build parts so the message renders. The UI template iterates
+            // `msg.parts` for both text bubbles and tool cards; without parts,
+            // tool-only assistant turns become invisible after a reload.
+            var historyId = ++msgId;
+            var parts = [];
+            if (text && text.trim()) {
+              parts.push({type: 'text', id: 'hist-text-' + historyId, text: text});
+            }
+            tools.forEach(function (t) {
+              parts.push({type: 'tool', id: 'hist-tp-' + t.id, tool: t});
+            });
+            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts};
           });
           self.$nextTick(function() { self.scrollToBottom(); });
         }
@@ -721,9 +732,28 @@ function chatPage() {
       switch (data.type) {
         case 'connected': break;
 
-        // Incoming message from server (e.g., cron trigger) — display as user message
+          // Incoming message from server (cron trigger, OR user-message echo
+          // broadcast so other tabs see what was just asked).
         case 'message':
           if (data.content) {
+            // Dedupe: the originating tab already pushed this user message
+            // in sendMessage() before the WS round-trip. The thinking
+            // placeholder is now at the tail, so scan back through recent
+            // messages to find the matching user bubble.
+            if (data.source === 'user') {
+              var nowTs = Date.now();
+              var foundDup = false;
+              for (var di = this.messages.length - 1; di >= 0 && di >= this.messages.length - 5; di--) {
+                var m = this.messages[di];
+                if (!m || m.role !== 'user') continue;
+                if (nowTs - (m.ts || 0) > 5000) break;
+                if ((m.text || '').indexOf(data.content) !== -1) {
+                  foundDup = true;
+                  break;
+                }
+              }
+              if (foundDup) break;
+            }
             var meta = data.source === 'cron' ? '[Scheduled: ' + (data.job_name || data.job_id || '') + ']' : '';
             this.messages.push({ id: ++msgId, role: 'user', text: data.content, meta: meta, tools: [], images: [], ts: Date.now() });
             this.scrollToBottom();
@@ -812,84 +842,123 @@ function chatPage() {
           this.scrollToBottom();
           break;
 
-        case 'text_delta':
-          var lastIdx = this.messages.length - 1;
-          var last = lastIdx >= 0 ? this.messages[lastIdx] : null;
-          if (last && last.streaming) {
-              if (last.thinking) {
-                  last.text = '';
-                  last.parts = [];
-                  last.thinking = false;
-              }
-            // If we already detected a text-based tool call, skip further text
-            if (last._toolTextDetected) break;
-              this._appendText(last, data.content);
-            // Detect function-call patterns streamed as text and convert to tool cards
-            var fcIdx = last.text.search(/\w+<\/function[=,>]/);
-            if (fcIdx === -1) fcIdx = last.text.search(/<function=\w+>/);
-            if (fcIdx !== -1) {
-              var fcPart = last.text.substring(fcIdx);
-              var toolMatch = fcPart.match(/^(\w+)<\/function/) || fcPart.match(/^<function=(\w+)>/);
-                var truncated = last.text.substring(0, fcIdx).trim();
-                last.text = truncated;
-                // Mirror truncation into the trailing text part so the bubble matches
-                var lp = last.parts[last.parts.length - 1];
-                if (lp && lp.type === 'text') lp.text = truncated;
-              last._toolTextDetected = true;
-              if (toolMatch) {
-                var inputMatch = fcPart.match(/[=,>]\s*(\{[\s\S]*)/);
-                  this._appendTool(last, {
-                  id: toolMatch[1] + '-txt-' + Date.now(),
-                  name: toolMatch[1],
-                  running: true,
-                  expanded: true,
-                  input: inputMatch ? inputMatch[1].replace(/<\/function>?\s*$/, '').trim() : '',
-                  result: '',
-                  is_error: false
-                });
-              }
-            }
-            this.tokenCount = Math.round(last.text.length / 4);
-            // Force Alpine reactivity: splice-in-place so x-for re-renders
-            // this item. Direct property mutation on array elements may not
-            // trigger DOM updates from async WebSocket callbacks.
-            this.messages.splice(lastIdx, 1, last);
+        case 'stream_snapshot':
+          // Server replay on (re)connect with an in-flight or recently-
+          // completed stream. Wipe stale streaming/thinking placeholders
+          // and rebuild from the snapshot's accumulated text + tool list.
+          this._clearTypingTimeout();
+          this.messages = this.messages.filter(function (m) {
+            return !m.thinking && !m.streaming;
+          });
+          if (data.completed) {
+            // Stream already finished server-side — replay the terminal
+            // payload through its own handler. This re-enters the switch.
+            this.handleWsMessage(data.completed);
           } else {
-              var newMsg = {id: ++msgId, role: 'agent', text: '', meta: '', streaming: true, tools: [], parts: []};
-              this._appendText(newMsg, data.content);
-              this.messages.push(newMsg);
+            var snap = this._findOrCreateStreaming();
+            snap._streamId = data.stream_id;
+            if (data.accumulated_text) {
+              this._appendText(snap, data.accumulated_text);
+            }
+            var snapSelf = this;
+            (data.tools || []).forEach(function (t) {
+              snapSelf._appendTool(snap, {
+                id: t.id || ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)),
+                name: t.name || 'tool',
+                running: !t.finished,
+                expanded: false,
+                input: t.input || '',
+                result: t.result || '',
+                is_error: !!t.is_error
+              });
+            });
+            if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
+              OpenFangAPI.setCurrentStreamId(data.stream_id);
+            }
           }
           this.scrollToBottom();
           break;
 
-        case 'tool_start':
-          var tsIdx = this.messages.length - 1;
-          var lastMsg = tsIdx >= 0 ? this.messages[tsIdx] : null;
-          if (lastMsg && lastMsg.streaming) {
-              this._appendTool(lastMsg, {
-                  id: data.tool + '-' + Date.now(),
-                  name: data.tool,
-                  running: true,
-                  expanded: true,
-                  input: '',
-                  result: '',
-                  is_error: false
+        case 'text_delta':
+          var last = this._findOrCreateStreaming();
+          var lastIdx = this.messages.length - 1;
+          // If we already detected a text-based tool call, skip further text
+          if (last._toolTextDetected) break;
+          this._appendText(last, data.content);
+          // Detect function-call patterns streamed as text and convert to tool cards
+          var fcIdx = last.text.search(/\w+<\/function[=,>]/);
+          if (fcIdx === -1) fcIdx = last.text.search(/<function=\w+>/);
+          if (fcIdx !== -1) {
+            var fcPart = last.text.substring(fcIdx);
+            var toolMatch = fcPart.match(/^(\w+)<\/function/) || fcPart.match(/^<function=(\w+)>/);
+            var truncated = last.text.substring(0, fcIdx).trim();
+            last.text = truncated;
+            // Mirror truncation into the trailing text part so the bubble matches
+            var lp = last.parts[last.parts.length - 1];
+            if (lp && lp.type === 'text') lp.text = truncated;
+            last._toolTextDetected = true;
+            if (toolMatch) {
+              var inputMatch = fcPart.match(/[=,>]\s*(\{[\s\S]*)/);
+              this._appendTool(last, {
+                id: toolMatch[1] + '-txt-' + Date.now(),
+                name: toolMatch[1],
+                running: true,
+                expanded: true,
+                input: inputMatch ? inputMatch[1].replace(/<\/function>?\s*$/, '').trim() : '',
+                result: '',
+                is_error: false
               });
-            this.messages.splice(tsIdx, 1, lastMsg);
+            }
           }
+          this.tokenCount = Math.round(last.text.length / 4);
+          // Force Alpine reactivity: splice-in-place so x-for re-renders
+          // this item. Direct property mutation on array elements may not
+          // trigger DOM updates from async WebSocket callbacks.
+          this.messages.splice(lastIdx, 1, last);
+          this.scrollToBottom();
+          break;
+
+        case 'tool_start':
+          var lastMsg = this._findOrCreateStreaming();
+          var tsIdx = this.messages.length - 1;
+          this._appendTool(lastMsg, {
+            id: data.id || (data.tool + '-' + Date.now()),
+            name: data.tool,
+            running: true,
+            expanded: true,
+            input: '',
+            result: '',
+            is_error: false
+          });
+          this.messages.splice(tsIdx, 1, lastMsg);
           this.scrollToBottom();
           break;
 
         case 'tool_end':
           // Tool call parsed by LLM — update tool card with input params
+          var lastMsg2 = this._findOrCreateStreaming();
           var teIdx = this.messages.length - 1;
-          var lastMsg2 = teIdx >= 0 ? this.messages[teIdx] : null;
-          if (lastMsg2 && lastMsg2.tools) {
-            for (var ti = lastMsg2.tools.length - 1; ti >= 0; ti--) {
-              if (lastMsg2.tools[ti].name === data.tool && lastMsg2.tools[ti].running) {
-                lastMsg2.tools[ti].input = data.input || '';
-                break;
+          if (lastMsg2.tools && lastMsg2.tools.length) {
+            // Prefer match by id, fall back to last running of same name
+            var matched = -1;
+            if (data.id) {
+              for (var tj = lastMsg2.tools.length - 1; tj >= 0; tj--) {
+                if (lastMsg2.tools[tj].id === data.id) {
+                  matched = tj;
+                  break;
+                }
               }
+            }
+            if (matched === -1) {
+              for (var ti = lastMsg2.tools.length - 1; ti >= 0; ti--) {
+                if (lastMsg2.tools[ti].name === data.tool && lastMsg2.tools[ti].running) {
+                  matched = ti;
+                  break;
+                }
+              }
+            }
+            if (matched !== -1) {
+              lastMsg2.tools[matched].input = data.input || '';
             }
             this.messages.splice(teIdx, 1, lastMsg2);
           }
@@ -897,34 +966,52 @@ function chatPage() {
 
         case 'tool_result':
           // Tool execution completed — update tool card with result
+          var lastMsg3 = this._findOrCreateStreaming();
           var trIdx = this.messages.length - 1;
-          var lastMsg3 = trIdx >= 0 ? this.messages[trIdx] : null;
-          if (lastMsg3 && lastMsg3.tools) {
-            for (var ri = lastMsg3.tools.length - 1; ri >= 0; ri--) {
-              if (lastMsg3.tools[ri].name === data.tool && lastMsg3.tools[ri].running) {
-                lastMsg3.tools[ri].running = false;
-                lastMsg3.tools[ri].result = data.result || '';
-                lastMsg3.tools[ri].is_error = !!data.is_error;
-                // Extract image URLs from image_generate or browser_screenshot results
-                if ((data.tool === 'image_generate' || data.tool === 'browser_screenshot') && !data.is_error) {
-                  try {
-                    var parsed = JSON.parse(data.result);
-                    if (parsed.image_urls && parsed.image_urls.length) {
-                      lastMsg3.tools[ri]._imageUrls = parsed.image_urls;
-                    }
-                  } catch(e) { /* not JSON */ }
+          if (lastMsg3.tools && lastMsg3.tools.length) {
+            // Match by id when the server provides it; otherwise fall back
+            // to last running tool of the same name.
+            var matchedRi = -1;
+            if (data.id) {
+              for (var rk = lastMsg3.tools.length - 1; rk >= 0; rk--) {
+                if (lastMsg3.tools[rk].id === data.id) {
+                  matchedRi = rk;
+                  break;
                 }
-                // Extract audio file path from text_to_speech results
-                if (data.tool === 'text_to_speech' && !data.is_error) {
-                  try {
-                    var ttsResult = JSON.parse(data.result);
-                    if (ttsResult.saved_to) {
-                      lastMsg3.tools[ri]._audioFile = ttsResult.saved_to;
-                      lastMsg3.tools[ri]._audioDuration = ttsResult.duration_estimate_ms;
-                    }
-                  } catch(e) { /* not JSON */ }
+              }
+            }
+            if (matchedRi === -1) {
+              for (var ri = lastMsg3.tools.length - 1; ri >= 0; ri--) {
+                if (lastMsg3.tools[ri].name === data.tool && lastMsg3.tools[ri].running) {
+                  matchedRi = ri;
+                  break;
                 }
-                break;
+              }
+            }
+            if (matchedRi !== -1) {
+              lastMsg3.tools[matchedRi].running = false;
+              lastMsg3.tools[matchedRi].result = data.result || '';
+              lastMsg3.tools[matchedRi].is_error = !!data.is_error;
+              // Extract image URLs from image_generate or browser_screenshot results
+              if ((data.tool === 'image_generate' || data.tool === 'browser_screenshot') && !data.is_error) {
+                try {
+                  var parsed = JSON.parse(data.result);
+                  if (parsed.image_urls && parsed.image_urls.length) {
+                    lastMsg3.tools[matchedRi]._imageUrls = parsed.image_urls;
+                  }
+                } catch (e) { /* not JSON */
+                }
+              }
+              // Extract audio file path from text_to_speech results
+              if (data.tool === 'text_to_speech' && !data.is_error) {
+                try {
+                  var ttsResult = JSON.parse(data.result);
+                  if (ttsResult.saved_to) {
+                    lastMsg3.tools[matchedRi]._audioFile = ttsResult.saved_to;
+                    lastMsg3.tools[matchedRi]._audioDuration = ttsResult.duration_estimate_ms;
+                  }
+                } catch (e) { /* not JSON */
+                }
               }
             }
             this.messages.splice(trIdx, 1, lastMsg3);
@@ -934,6 +1021,13 @@ function chatPage() {
 
         case 'response':
           this._clearTypingTimeout();
+          // Stale terminal event for an old generation (e.g., snapshot replay
+          // after a new stream already started). Drop silently.
+          if (typeof OpenFangAPI.getCurrentStreamId === 'function') {
+            var curId = OpenFangAPI.getCurrentStreamId();
+            if (data.stream_id && curId && data.stream_id !== curId) break;
+            OpenFangAPI.setCurrentStreamId(null);
+          }
           // Update context pressure from response
           if (data.context_pressure) {
             this.contextPressure = data.context_pressure;
@@ -1015,6 +1109,9 @@ function chatPage() {
         case 'silent_complete':
           // Agent intentionally chose not to reply (NO_REPLY)
           this._clearTypingTimeout();
+          if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
+            OpenFangAPI.setCurrentStreamId(null);
+          }
           this.messages = this.messages.filter(function(m) { return !m.thinking && !m.streaming; });
           this.sending = false;
           this.tokenCount = 0;
@@ -1025,6 +1122,9 @@ function chatPage() {
 
         case 'error':
           this._clearTypingTimeout();
+          if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
+            OpenFangAPI.setCurrentStreamId(null);
+          }
           this.messages = this.messages.filter(function(m) { return !m.thinking && !m.streaming; });
           this.messages.push({ id: ++msgId, role: 'system', text: 'Error: ' + data.content, meta: '', tools: [], ts: Date.now() });
           this.sending = false;
@@ -1097,7 +1197,31 @@ function chatPage() {
           return 'p' + (++msgId) + Math.random().toString(36).slice(2, 6);
       },
 
-      // Append streamed text to a message, merging with the trailing text part if present.
+    // Find or lazily create a streaming agent message at the tail of the
+    // messages array. Used by tail-event handlers (text_delta, tool_*) so
+    // they work whether or not a placeholder was created by sendMessage —
+    // important after a mid-stream page reload, where there is no prior
+    // placeholder but events still arrive.
+    _findOrCreateStreaming: function () {
+      var last = this.messages.length ? this.messages[this.messages.length - 1] : null;
+      if (last && last.role === 'agent' && (last.streaming || last.thinking)) {
+        if (last.thinking) {
+          last.thinking = false;
+          if (!last.text) last.text = '';
+          if (!last.parts) last.parts = [];
+        }
+        last.streaming = true;
+        return last;
+      }
+      var msg = {
+        id: ++msgId, role: 'agent', text: '', meta: '',
+        streaming: true, tools: [], parts: [], ts: Date.now()
+      };
+      this.messages.push(msg);
+      return msg;
+    },
+
+    // Append streamed text to a message, merging with the trailing text part if present.
       // Keeps msg.text in sync as a flat aggregate (used by copy / sanitize / x-show toggles).
       _appendText: function (msg, content) {
           if (!content) return;

@@ -212,11 +212,25 @@ var OpenFangAPI = (function() {
   var _reconnectAttempts = 0;
   var MAX_RECONNECT = 5;
 
-  function wsConnect(agentId, callbacks) {
+    // Tracks the in-flight LLM stream id (set by stream_snapshot, cleared by
+    // response/silent_complete/error). Lets chat.js match terminal events
+    // to the correct generation across reconnects.
+    var _currentStreamId = null;
+
+    function getCurrentStreamId() {
+        return _currentStreamId;
+    }
+
+    function setCurrentStreamId(id) {
+        _currentStreamId = id;
+    }
+
+    function wsConnect(agentId, callbacks) {
     wsDisconnect();
     _wsCallbacks = callbacks || {};
     _wsAgentId = agentId;
     _reconnectAttempts = 0;
+        _currentStreamId = null;
     _doConnect(agentId);
   }
 
@@ -338,6 +352,8 @@ var OpenFangAPI = (function() {
     wsSend: wsSend,
     isWsConnected: isWsConnected,
     getConnectionState: getConnectionState,
-    onConnectionChange: onConnectionChange
+      onConnectionChange: onConnectionChange,
+      getCurrentStreamId: getCurrentStreamId,
+      setCurrentStreamId: setCurrentStreamId
   };
 })();
