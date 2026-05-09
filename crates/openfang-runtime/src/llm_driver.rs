@@ -140,6 +140,11 @@ pub enum StreamEvent {
         result_preview: String,
         is_error: bool,
     },
+    /// Boundary marker emitted at the start of a new agent-loop iteration
+    /// inside the same `/message` request. Used by ws.rs to clear the
+    /// per-agent LiveStream's text/tool buffers so a snapshot only carries
+    /// the in-flight iteration (prior iterations are already in the session).
+    IterationStart { iteration: u32 },
 }
 
 /// Trait for LLM drivers.

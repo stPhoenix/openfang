@@ -176,6 +176,10 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Set of agents currently inside an `agent_loop` run (streaming or not).
+    /// Used by `/api/agents` to surface a "generating" badge for delegated
+    /// sub-agents whose loop is invoked outside the WebSocket pipeline.
+    active_loops: dashmap::DashSet<AgentId>,
     /// Execution evolution analyzer engine.
     pub evolve_engine: openfang_evolve::EvolveEngine,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
@@ -564,6 +568,13 @@ fn gethostname() -> Option<String> {
 }
 
 impl OpenFangKernel {
+    /// Snapshot of agents currently inside an `agent_loop` run.
+    /// Includes both streaming (`/message/stream` and WS) and non-streaming
+    /// (`agent_delegate` sub-agents) paths.
+    pub fn active_loop_agents(&self) -> std::collections::HashSet<AgentId> {
+        self.active_loops.iter().map(|e| *e.key()).collect()
+    }
+
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
         let config = load_config(config_path);
@@ -1254,6 +1265,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            active_loops: dashmap::DashSet::new(),
             evolve_engine,
             self_handle: OnceLock::new(),
         };
@@ -1941,6 +1953,24 @@ impl OpenFangKernel {
             .clone();
         let _guard = lock.lock().await;
 
+        // Mark this agent as actively running an agent_loop so /api/agents
+        // surfaces a "generating" indicator (covers delegated sub-agents).
+        // RAII guard ensures removal on every exit path.
+        self.active_loops.insert(agent_id);
+        struct ActiveLoopGuard<'a> {
+            kernel: &'a OpenFangKernel,
+            id: AgentId,
+        }
+        impl Drop for ActiveLoopGuard<'_> {
+            fn drop(&mut self) {
+                self.kernel.active_loops.remove(&self.id);
+            }
+        }
+        let _active_loop_guard = ActiveLoopGuard {
+            kernel: self,
+            id: agent_id,
+        };
+
         // Enforce quota before running the agent loop
         self.scheduler
             .check_quota(agent_id)
@@ -2027,6 +2057,7 @@ impl OpenFangKernel {
         sender_name: Option<String>,
         sender_role: Option<openfang_types::sender::SenderRole>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        thinking_override: Option<openfang_types::config::ThinkingConfig>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -2349,6 +2380,24 @@ impl OpenFangKernel {
         let kernel_clone = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
+            // Mark this agent as actively generating (parallels the
+            // non-streaming path's tracking so /api/agents shows the
+            // "generating" indicator for delegated and streaming runs alike).
+            kernel_clone.active_loops.insert(agent_id);
+            struct ActiveLoopGuard {
+                kernel: Arc<OpenFangKernel>,
+                id: AgentId,
+            }
+            impl Drop for ActiveLoopGuard {
+                fn drop(&mut self) {
+                    self.kernel.active_loops.remove(&self.id);
+                }
+            }
+            let _active_loop_guard = ActiveLoopGuard {
+                kernel: Arc::clone(&kernel_clone),
+                id: agent_id,
+            };
+
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
@@ -2425,6 +2474,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.process_manager),
                 content_blocks,
                 sender_role,
+                thinking_override,
             )
             .await;
 
@@ -3027,6 +3077,7 @@ impl OpenFangKernel {
             Some(&self.process_manager),
             content_blocks,
             sender_role,
+            self.config.thinking.clone(),
         )
         .await
         .map_err(KernelError::OpenFang)?;

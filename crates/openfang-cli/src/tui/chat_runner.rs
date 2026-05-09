@@ -146,8 +146,10 @@ impl StandaloneChat {
                 }
             }
             StreamEvent::ThinkingDelta { text } => {
-                self.chat.thinking = true;
-                self.chat.append_stream(&text);
+                self.chat.reasoning_streaming = true;
+                self.chat.thinking = false;
+                self.chat.reasoning_text.push_str(&text);
+                self.chat.scroll_offset = 0;
             }
             StreamEvent::ToolExecutionResult {
                 name,
@@ -157,6 +159,7 @@ impl StandaloneChat {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            StreamEvent::IterationStart { .. } => {}
         }
     }
 

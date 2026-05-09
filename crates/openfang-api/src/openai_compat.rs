@@ -31,6 +31,10 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// OpenAI/DeepSeek-style reasoning effort: `"low" | "medium" | "high"`.
+    /// Any present value enables streaming reasoning over SSE; absence keeps
+    /// the kernel default (no override).
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +126,10 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaiToolCall>>,
+    /// DeepSeek/o1-shape reasoning content delta. Emitted on dedicated chunks
+    /// when the upstream model produces thinking tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -293,6 +301,15 @@ pub async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
 
+    let thinking_override = req.reasoning_effort.as_deref().and_then(|effort| {
+        crate::ws::parse_thinking_mode(
+            // Treat any reasoning_effort value as "stream" so SSE clients see
+            // reasoning_content chunks. "off" explicitly disables.
+            if effort == "off" { Some("off") } else { Some("stream") },
+            state.kernel.config.thinking.as_ref(),
+        )
+    });
+
     if req.stream {
         // Streaming response
         return match stream_response(
@@ -302,6 +319,7 @@ pub async fn chat_completions(
             &last_user_msg,
             request_id,
             created,
+            thinking_override,
         )
         .await
         {
@@ -374,12 +392,22 @@ async fn stream_response(
     message: &str,
     request_id: String,
     created: u64,
+    thinking_override: Option<openfang_types::config::ThinkingConfig>,
 ) -> Result<axum::response::Response, String> {
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
 
     let (mut rx, _handle) = state
         .kernel
-        .send_message_streaming(agent_id, message, Some(kernel_handle), None, None, None, None)
+        .send_message_streaming(
+            agent_id,
+            message,
+            Some(kernel_handle),
+            None,
+            None,
+            None,
+            None,
+            thinking_override,
+        )
         .map_err(|e| format!("Streaming setup failed: {e}"))?;
 
     let (tx, stream_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
@@ -396,6 +424,7 @@ async fn stream_response(
                 role: Some("assistant"),
                 content: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             finish_reason: None,
         }],
@@ -444,6 +473,7 @@ async fn stream_response(
                         role: None,
                         content: Some(text),
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     None,
                 ),
@@ -466,6 +496,7 @@ async fn stream_response(
                                     arguments: Some(String::new()),
                                 },
                             }]),
+                            reasoning_content: None,
                         },
                         None,
                     )
@@ -489,6 +520,7 @@ async fn stream_response(
                                     arguments: Some(text),
                                 },
                             }]),
+                            reasoning_content: None,
                         },
                         None,
                     )
@@ -501,7 +533,19 @@ async fn stream_response(
                     }
                     continue;
                 }
-                // ToolUseEnd, ToolExecutionResult, ThinkingDelta, PhaseChange — skip
+                StreamEvent::ThinkingDelta { text } => make_chunk(
+                    &req_id,
+                    created,
+                    &agent_name,
+                    ChunkDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: None,
+                        reasoning_content: Some(text),
+                    },
+                    None,
+                ),
+                // ToolUseEnd, ToolExecutionResult, PhaseChange — skip
                 _ => continue,
             };
             if tx.send(Ok(SseEvent::default().data(json))).await.is_err() {
@@ -518,6 +562,7 @@ async fn stream_response(
                 role: None,
                 content: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Some("stop"),
         );
@@ -664,6 +709,7 @@ mod tests {
                     role: None,
                     content: Some("Hello".to_string()),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -716,6 +762,7 @@ mod tests {
                             arguments: Some(String::new()),
                         },
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -766,6 +813,7 @@ mod tests {
             role: Some("assistant"),
             content: Some("Hi".to_string()),
             tool_calls: None,
+            reasoning_content: None,
         };
         let json_str = serde_json::to_string(&delta).unwrap();
         assert!(!json_str.contains("tool_calls"));

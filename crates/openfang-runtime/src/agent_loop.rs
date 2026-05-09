@@ -381,6 +381,7 @@ pub async fn run_agent_loop(
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
+    thinking_override: Option<openfang_types::config::ThinkingConfig>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -676,7 +677,7 @@ pub async fn run_agent_loop(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: thinking_override.clone(),
         };
 
         // Notify phase: Thinking
@@ -1693,6 +1694,7 @@ pub async fn run_agent_loop_streaming(
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
+    thinking_override: Option<openfang_types::config::ThinkingConfig>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1886,6 +1888,14 @@ pub async fn run_agent_loop_streaming(
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
+        // Boundary marker for the WS snapshot: clears the per-agent
+        // LiveStream's text/tool buffers so a reload only replays the
+        // in-flight iteration. Prior iterations are persisted to the
+        // session and rendered via /api/agents/:id/session on reload.
+        let _ = stream_tx
+            .send(StreamEvent::IterationStart { iteration })
+            .await;
+
         // Layer 1: Microcompaction — clear old tool results if time gap exceeded
         if comp_settings.microcompact.enabled {
             crate::microcompact::microcompact_messages(
@@ -2004,7 +2014,7 @@ pub async fn run_agent_loop_streaming(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: thinking_override.clone(),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -3862,6 +3872,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should complete without error");
@@ -3918,6 +3929,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should complete without error");
@@ -3976,6 +3988,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should complete without error");
@@ -4032,6 +4045,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should complete without error");
@@ -4081,6 +4095,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4208,6 +4223,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should recover via retry");
@@ -4258,6 +4274,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4316,6 +4333,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -5295,6 +5313,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Agent loop should complete");
@@ -5350,6 +5369,7 @@ mod tests {
             &memory,
             driver,
             &tools,
+            None,
             None,
             None,
             None,
@@ -5443,6 +5463,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Normal loop should complete");
@@ -5509,6 +5530,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // sender_role
+            None, // thinking_override
         )
         .await
         .expect("Streaming loop should complete");

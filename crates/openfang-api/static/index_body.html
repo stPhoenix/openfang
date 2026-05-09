@@ -629,6 +629,17 @@
                         <div class="message-bubble" x-show="msg.thinking" style="background:transparent;border:none;padding:4px 0">
                           <div class="typing-dots"><span></span><span></span><span></span></div>
                         </div>
+                        <!-- Reasoning panel: live + persisted thinking tokens -->
+                        <details class="reasoning-panel"
+                                 x-show="msg.reasoning && msg.reasoning.length"
+                                 :open="msg.reasoningExpanded"
+                                 @toggle="msg.reasoningUserToggled = true">
+                          <summary>
+                            <span class="reasoning-summary-label" x-text="msg.streaming ? 'Thinking…' : 'Reasoning'"></span>
+                            <span class="reasoning-summary-meta" x-text="msg.reasoning ? msg.reasoning.length + ' chars' : ''"></span>
+                          </summary>
+                          <div class="reasoning-content" x-html="renderMarkdown(msg.reasoning || '')"></div>
+                        </details>
                           <!-- Plain text bubble: messages without parts (user, system, fallback) -->
                           <template x-if="!msg.parts || !msg.parts.length">
                               <div :class="{ 'markdown-body': (msg.role === 'agent' || msg.role === 'system') && !msg.thinking && !msg.isHtml }"
@@ -913,6 +924,10 @@
                     <div class="font-bold" style="font-size:13px" x-text="agent.name"></div>
                     <div class="text-xs text-dim font-mono" style="font-size:11px" x-text="agent.model_name"></div>
                   </div>
+                  <span class="badge badge-generating" x-show="agent.is_generating" title="Agent is generating a response" style="font-size:10px">
+                    <svg class="spin" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                    <span>generating</span>
+                  </span>
                   <span class="badge" :class="'badge-' + agent.state.toLowerCase()" x-text="agent.state" style="font-size:10px"></span>
                   <button class="agent-chip-config-btn" @click.stop="showDetail(agent)" title="Agent settings" style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;border:1px solid var(--border);background:transparent;cursor:pointer;color:var(--text-dim);transition:all 0.15s;flex-shrink:0" @mouseenter="$el.style.borderColor='var(--accent)';$el.style.color='var(--accent)';$el.style.background='var(--surface2)'" @mouseleave="$el.style.borderColor='var(--border)';$el.style.color='var(--text-dim)';$el.style.background='transparent'">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>

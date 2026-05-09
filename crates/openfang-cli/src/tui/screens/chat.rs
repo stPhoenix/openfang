@@ -34,6 +34,8 @@ pub struct ChatMessage {
     pub tool: Option<ToolInfo>,
     /// Pre-built ratatui lines for rich rendering (bypasses dim_style).
     pub styled_lines: Option<Vec<Line<'static>>>,
+    /// LLM reasoning / extended-thinking text attached to this turn.
+    pub reasoning: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,10 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     /// Current streaming text being accumulated.
     pub streaming_text: String,
+    /// Streaming reasoning/thinking text for the current turn.
+    pub reasoning_text: String,
+    /// Whether reasoning tokens are currently arriving.
+    pub reasoning_streaming: bool,
     /// Whether we are currently streaming.
     pub is_streaming: bool,
     /// Waiting for first token (shows "thinking..." spinner).
@@ -110,6 +116,8 @@ impl ChatState {
             mode_label: String::new(),
             messages: Vec::new(),
             streaming_text: String::new(),
+            reasoning_text: String::new(),
+            reasoning_streaming: false,
             is_streaming: false,
             thinking: false,
             active_tool: None,
@@ -133,6 +141,8 @@ impl ChatState {
     pub fn reset(&mut self) {
         self.messages.clear();
         self.streaming_text.clear();
+        self.reasoning_text.clear();
+        self.reasoning_streaming = false;
         self.is_streaming = false;
         self.thinking = false;
         self.active_tool = None;
@@ -158,6 +168,7 @@ impl ChatState {
             text,
             tool: None,
             styled_lines: None,
+            reasoning: None,
         });
         self.scroll_offset = 0; // Auto-scroll to bottom
     }
@@ -174,6 +185,7 @@ impl ChatState {
             text,
             tool: None,
             styled_lines: Some(styled_lines),
+            reasoning: None,
         });
         self.scroll_offset = 0;
     }
@@ -197,12 +209,35 @@ impl ChatState {
 
     /// Finalize streaming: move accumulated text to history.
     pub fn finalize_stream(&mut self) {
+        let reasoning = if self.reasoning_text.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.reasoning_text))
+        };
         if !self.streaming_text.is_empty() {
             let text = sanitize_function_tags(&std::mem::take(&mut self.streaming_text));
-            self.push_message(Role::Agent, text);
+            self.messages.push(ChatMessage {
+                role: Role::Agent,
+                text,
+                tool: None,
+                styled_lines: None,
+                reasoning,
+            });
+            self.scroll_offset = 0;
+        } else if let Some(reasoning) = reasoning {
+            // Reasoning-only turn (no answer yet) — keep it in history.
+            self.messages.push(ChatMessage {
+                role: Role::Agent,
+                text: String::new(),
+                tool: None,
+                styled_lines: None,
+                reasoning: Some(reasoning),
+            });
+            self.scroll_offset = 0;
         }
         self.is_streaming = false;
         self.thinking = false;
+        self.reasoning_streaming = false;
         self.active_tool = None;
         self.streaming_chars = 0;
         self.tool_input_buf.clear();
@@ -227,6 +262,7 @@ impl ChatState {
                 is_error: false,
             }),
             styled_lines: None,
+            reasoning: None,
         });
         self.scroll_offset = 0;
         self.active_tool = None;
@@ -665,6 +701,9 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &ChatState) {
 
     // Build lines from message history
     for msg in &state.messages {
+        if let Some(ref reasoning) = msg.reasoning {
+            push_reasoning_lines(&mut lines, reasoning, width);
+        }
         match msg.role {
             Role::User => {
                 lines.push(Line::from(""));
@@ -787,6 +826,11 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &ChatState) {
         }
     }
 
+    // Live reasoning panel (streamed thinking tokens for the in-flight turn).
+    if !state.reasoning_text.is_empty() {
+        push_reasoning_lines(&mut lines, &state.reasoning_text, width);
+    }
+
     // Add streaming text if any
     if !state.streaming_text.is_empty() {
         lines.push(Line::from(""));
@@ -872,6 +916,41 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &ChatState) {
             ind_area,
         );
     }
+}
+
+/// Render a reasoning/thinking block as dimmed italic lines bracketed by a
+/// header and footer rule. Used for both historical and in-flight reasoning.
+fn push_reasoning_lines(lines: &mut Vec<Line<'static>>, reasoning: &str, width: usize) {
+    let inner_width = width.saturating_sub(6).max(1);
+    let style = Style::default()
+        .fg(theme::DIM)
+        .add_modifier(Modifier::ITALIC);
+    let rule_style = Style::default().fg(theme::DIM);
+
+    lines.push(Line::from(""));
+    let header_fill = "\u{2500}".repeat(width.saturating_sub(13).max(1));
+    lines.push(Line::from(vec![
+        Span::styled("  \u{256d}\u{2500} ", rule_style),
+        Span::styled("thinking", style),
+        Span::styled(format!(" {header_fill}"), rule_style),
+    ]));
+    for raw_line in reasoning.lines() {
+        if raw_line.is_empty() {
+            lines.push(Line::from(vec![Span::styled("  \u{2502}", rule_style)]));
+            continue;
+        }
+        for wline in wrap_text(raw_line, inner_width) {
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2502} ", rule_style),
+                Span::styled(wline, style),
+            ]));
+        }
+    }
+    let footer_fill = "\u{2500}".repeat(width.saturating_sub(4).max(1));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  \u{2570}{footer_fill}"),
+        rule_style,
+    )]));
 }
 
 /// Simple word-wrapping.

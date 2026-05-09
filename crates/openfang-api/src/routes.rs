@@ -176,6 +176,13 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let catalog = state.kernel.model_catalog.read().ok();
     let dm = &state.kernel.config.default_model;
 
+    // Snapshot of agents currently producing a response. Combines two
+    // sources: WS LiveStream registry (covers user-driven streaming
+    // requests) and the kernel's active-loops set (covers delegated
+    // sub-agents whose loop runs outside the WebSocket pipeline).
+    let mut generating = crate::ws::agents_currently_generating();
+    generating.extend(state.kernel.active_loop_agents());
+
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
@@ -227,6 +234,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "model_tier": tier,
                 "auth_status": auth_status,
                 "ready": ready,
+                "is_generating": generating.contains(&e.id),
                 "profile": e.manifest.profile,
                 "identity": {
                     "emoji": e.identity.emoji,
@@ -519,6 +527,7 @@ pub async fn get_agent_session(
                 let m = *m;
                 let mut tools: Vec<serde_json::Value> = Vec::new();
                 let mut msg_images: Vec<serde_json::Value> = Vec::new();
+                let mut reasoning_text = String::new();
                 let content = match &m.content {
                     openfang_types::message::MessageContent::Text(t) => t.clone(),
                     openfang_types::message::MessageContent::Blocks(blocks) => {
@@ -527,6 +536,17 @@ pub async fn get_agent_session(
                             match b {
                                 openfang_types::message::ContentBlock::Text { text, .. } => {
                                     texts.push(text.clone());
+                                }
+                                openfang_types::message::ContentBlock::Thinking {
+                                    thinking,
+                                    ..
+                                } => {
+                                    if !thinking.is_empty() {
+                                        if !reasoning_text.is_empty() {
+                                            reasoning_text.push('\n');
+                                        }
+                                        reasoning_text.push_str(thinking);
+                                    }
                                 }
                                 openfang_types::message::ContentBlock::Image {
                                     media_type,
@@ -583,7 +603,7 @@ pub async fn get_agent_session(
                     }
                 };
                 // Skip messages that are purely tool results (User role with only ToolResult blocks)
-                if content.is_empty() && tools.is_empty() {
+                if content.is_empty() && tools.is_empty() && reasoning_text.is_empty() {
                     continue;
                 }
                 let msg_idx = built_messages.len();
@@ -602,6 +622,9 @@ pub async fn get_agent_session(
                 }
                 if !msg_images.is_empty() {
                     msg["images"] = serde_json::Value::Array(msg_images);
+                }
+                if !reasoning_text.is_empty() {
+                    msg["reasoning"] = serde_json::Value::String(reasoning_text);
                 }
                 built_messages.push(msg);
             }
@@ -1532,6 +1555,7 @@ pub async fn send_message_stream(
         req.sender_name,
         None, // sender_role: API callers don't have RBAC role yet
         None, // SSE streaming doesn't support image attachments yet
+        None, // thinking_override: server-side default applies
     ) {
         Ok(pair) => pair,
         Err(e) => {

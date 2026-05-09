@@ -130,6 +130,8 @@
 
 .badge-running { background: rgba(74,222,128,0.12); color: var(--success); }
 .badge-suspended { background: rgba(245,158,11,0.12); color: var(--warning); }
+.badge-generating { background: rgba(245,158,11,0.16); color: var(--warning); display: inline-flex; align-items: center; gap: 4px; }
+.badge-generating .spin { animation: spin 0.8s linear infinite; }
 .badge-terminated { background: rgba(239,68,68,0.12); color: var(--error); }
 .badge-created { background: rgba(59,130,246,0.12); color: var(--info); }
 .badge-crashed { background: rgba(239,68,68,0.2); color: var(--error); }
@@ -668,6 +670,51 @@ mark.search-highlight {
 }
 
 .copy-btn:hover { color: var(--text); background: var(--surface); border-color: var(--border-light); }
+
+/* Reasoning / extended-thinking panel — collapsible block above the answer */
+.reasoning-panel {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-dim);
+  border-radius: var(--radius-md);
+  margin: 4px 0 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
+  overflow: hidden;
+}
+.reasoning-panel summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  list-style: none;
+}
+.reasoning-panel summary::-webkit-details-marker { display: none; }
+.reasoning-panel summary::before {
+  content: "\25B8";
+  display: inline-block;
+  transition: transform var(--transition-fast);
+  font-style: normal;
+  font-size: 10px;
+  opacity: 0.7;
+}
+.reasoning-panel[open] summary::before { transform: rotate(90deg); }
+.reasoning-summary-label { font-weight: 500; }
+.reasoning-summary-meta { margin-left: auto; opacity: 0.6; font-size: 11px; }
+.reasoning-content {
+  padding: 6px 12px 10px;
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.85;
+  border-top: 1px dashed var(--border);
+}
 
 /* Tool call cards — premium design with category icons */
 .tool-card {

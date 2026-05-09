@@ -221,6 +221,30 @@ fn ws_agent_streams() -> &'static DashMap<AgentId, RwLock<LiveStream>> {
     REGISTRY.get_or_init(DashMap::new)
 }
 
+/// Snapshot of agents currently producing a response (stream not yet completed).
+///
+/// Sync lookup using `try_read` so callers don't have to await and
+/// DashMap shard guards never cross an `.await` (which would break
+/// `Send` for axum handler futures). A failed `try_read` means a writer
+/// holds the lock — i.e. an event is being applied right now — which
+/// is itself evidence the stream is active.
+pub fn agents_currently_generating() -> std::collections::HashSet<AgentId> {
+    let mut out = std::collections::HashSet::new();
+    for entry in ws_agent_streams().iter() {
+        match entry.value().try_read() {
+            Ok(s) => {
+                if s.completed.is_none() {
+                    out.insert(*entry.key());
+                }
+            }
+            Err(_) => {
+                out.insert(*entry.key());
+            }
+        }
+    }
+    out
+}
+
 /// Append text to the snapshot's accumulated buffer; truncate from the
 /// front if the cap is exceeded so memory stays bounded for long runs.
 fn append_text_capped(buf: &mut String, delta: &str) {
@@ -333,6 +357,13 @@ fn apply_event_to_snapshot(s: &mut LiveStream, payload: &serde_json::Value) {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             s.last_phase = Some((phase, detail));
+        }
+        "iteration_start" => {
+            // Reset per-iteration content. Keep stream_id / started_at_ms
+            // / next_seq so client de-dup by seq still works.
+            s.accumulated_text.clear();
+            s.tools.clear();
+            s.last_phase = None;
         }
         _ => {}
     }
@@ -868,6 +899,11 @@ async fn handle_text_message(
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
 
+            let thinking_override = parse_thinking_mode(
+                parsed["thinking_mode"].as_str(),
+                state.kernel.config.thinking.as_ref(),
+            );
+
             // Look up the model's actual context window from the catalog
             // instead of hardcoding 200K — different models have different limits.
             let model_ctx_window = state
@@ -895,6 +931,7 @@ async fn handle_text_message(
                 None,
                 None, // sender_role: WebSocket callers don't have RBAC role yet
                 ws_content_blocks,
+                thinking_override,
             ) {
                 Ok((mut rx, handle)) => {
                     // Establish a fresh LiveStream for this generation. All
@@ -1501,8 +1538,38 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "phase": phase,
             "detail": detail,
         })),
+        StreamEvent::ThinkingDelta { text } => Some(serde_json::json!({
+            "type": "thinking_delta",
+            "content": text,
+        })),
+        StreamEvent::IterationStart { iteration } => Some(serde_json::json!({
+            "type": "iteration_start",
+            "iteration": iteration,
+        })),
         _ => None, // Skip ToolInputDelta, ContentComplete
     }
+}
+
+/// Build a ThinkingConfig override from the client's `thinking_mode` field.
+/// `"off"` / missing → None; `"on"` → non-streaming reasoning; `"stream"` → streaming reasoning.
+/// `budget_tokens` falls back to KernelConfig when no client-side budget exists.
+pub(crate) fn parse_thinking_mode(
+    mode: Option<&str>,
+    default: Option<&openfang_types::config::ThinkingConfig>,
+) -> Option<openfang_types::config::ThinkingConfig> {
+    let stream_thinking = match mode? {
+        "off" => return None,
+        "on" => false,
+        "stream" => true,
+        _ => return None,
+    };
+    let budget_tokens = default
+        .map(|c| c.budget_tokens)
+        .unwrap_or_else(|| openfang_types::config::ThinkingConfig::default().budget_tokens);
+    Some(openfang_types::config::ThinkingConfig {
+        budget_tokens,
+        stream_thinking,
+    })
 }
 
 // ---------------------------------------------------------------------------

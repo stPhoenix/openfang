@@ -612,6 +612,12 @@ function chatPage() {
       var self = this;
       try {
         var data = await OpenFangAPI.get('/api/agents/' + agentId + '/session');
+        // Preserve any in-flight streaming/thinking placeholders that may
+        // have been created by a `stream_snapshot` arriving before this
+        // session fetch resolved (race between WS connect and HTTP load).
+        var inflight = (self.messages || []).filter(function(m){
+          return m && (m.streaming || m.thinking);
+        });
         if (data.messages && data.messages.length) {
           // Defense-in-depth (#935): never render system-role messages in the
           // conversation history view, even if the backend somehow returns
@@ -651,9 +657,17 @@ function chatPage() {
             tools.forEach(function (t) {
               parts.push({type: 'tool', id: 'hist-tp-' + t.id, tool: t});
             });
-            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts};
+            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts, reasoning: m.reasoning || '', reasoningExpanded: false};
           });
+          // Re-append any in-flight bubbles preserved from the prior list so
+          // typing-dots / partial streaming content survive the session load.
+          if (inflight.length) {
+            self.messages = self.messages.concat(inflight);
+          }
           self.$nextTick(function() { self.scrollToBottom(); });
+        } else if (inflight.length) {
+          // No session messages — but keep any in-flight placeholder.
+          self.messages = inflight;
         }
         // Seed context indicator from /api/agents/:id/context
         OpenFangAPI.get('/api/agents/' + agentId + '/context').then(function(ctx) {
@@ -818,12 +832,6 @@ function chatPage() {
             if (data.phase === 'context_warning') {
               var cwDetail = data.detail || 'Context limit reached.';
               this.messages.push({ id: ++msgId, role: 'system', text: cwDetail, meta: '', tools: [] });
-            } else if (data.phase === 'thinking' && this.thinkingMode === 'stream') {
-              // Stream reasoning tokens to a collapsible panel
-              if (!phaseMsg._reasoning) phaseMsg._reasoning = '';
-              phaseMsg._reasoning += (data.detail || '') + '\n';
-              phaseMsg.text = '<details><summary>Reasoning...</summary>\n\n' + phaseMsg._reasoning + '</details>';
-              this.messages.splice(phaseIdx, 1, phaseMsg);
             } else if (phaseMsg.thinking) {
               // Only update text on messages still in thinking state (not yet
               // receiving streamed content) to avoid overwriting accumulated text.
@@ -855,27 +863,79 @@ function chatPage() {
             // payload through its own handler. This re-enters the switch.
             this.handleWsMessage(data.completed);
           } else {
-            var snap = this._findOrCreateStreaming();
-            snap._streamId = data.stream_id;
-            if (data.accumulated_text) {
-              this._appendText(snap, data.accumulated_text);
-            }
-            var snapSelf = this;
-            (data.tools || []).forEach(function (t) {
-              snapSelf._appendTool(snap, {
-                id: t.id || ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)),
-                name: t.name || 'tool',
-                running: !t.finished,
-                expanded: false,
-                input: t.input || '',
-                result: t.result || '',
-                is_error: !!t.is_error
+            // Stream still in-flight on reconnect: revive the "Generating…"
+            // badge + typing icon, both gated by `sending`.
+            this.sending = true;
+            var snapHasContent = !!(data.accumulated_text) || ((data.tools || []).length > 0);
+            if (!snapHasContent) {
+              // No text and no tools yet (LLM in pre-content phase):
+              // show typing-dots placeholder until the first delta.
+              this.messages.push({
+                id: ++msgId, role: 'agent', text: 'Processing...', meta: '',
+                thinking: true, streaming: true, tools: [], parts: [], ts: Date.now()
               });
-            });
-            if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
-              OpenFangAPI.setCurrentStreamId(data.stream_id);
+              if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
+                OpenFangAPI.setCurrentStreamId(data.stream_id);
+              }
+            } else {
+              var snap = this._findOrCreateStreaming();
+              snap._streamId = data.stream_id;
+              if (data.accumulated_text) {
+                this._appendText(snap, data.accumulated_text);
+              }
+              var snapSelf = this;
+              (data.tools || []).forEach(function (t) {
+                snapSelf._appendTool(snap, {
+                  id: t.id || ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)),
+                  name: t.name || 'tool',
+                  running: !t.finished,
+                  expanded: false,
+                  input: t.input || '',
+                  result: t.result || '',
+                  is_error: !!t.is_error
+                });
+              });
+              if (typeof OpenFangAPI.setCurrentStreamId === 'function') {
+                OpenFangAPI.setCurrentStreamId(data.stream_id);
+              }
             }
           }
+          this.scrollToBottom();
+          break;
+
+        case 'iteration_start':
+          // Boundary between LLM iterations within one /message request.
+          // The previous iteration's text/tools have already been persisted
+          // to the kernel session; finalize the in-progress streaming
+          // bubble so the next iteration's deltas create a fresh one.
+          for (var ii = this.messages.length - 1; ii >= 0; ii--) {
+            var pm = this.messages[ii];
+            if (pm && pm.role === 'agent' && (pm.streaming || pm.thinking)) {
+              var hasBubbleContent = !!(pm.text && pm.text.length)
+                || (pm.tools && pm.tools.length)
+                || (pm.parts && pm.parts.length);
+              if (!hasBubbleContent) {
+                // Drop empty placeholder — would render as a blank gap.
+                this.messages.splice(ii, 1);
+              } else {
+                pm.streaming = false;
+                pm.thinking = false;
+                this.messages.splice(ii, 1, pm);
+              }
+              break;
+            }
+          }
+          break;
+
+        case 'thinking_delta':
+          var tlast = this._findOrCreateStreaming();
+          var tlastIdx = this.messages.length - 1;
+          if (!tlast.reasoning) tlast.reasoning = '';
+          tlast.reasoning += data.content || '';
+          if (typeof tlast.reasoningExpanded === 'undefined') {
+            tlast.reasoningExpanded = (this.thinkingMode === 'stream');
+          }
+          this.messages.splice(tlastIdx, 1, tlast);
           this.scrollToBottom();
           break;
 
@@ -1039,11 +1099,16 @@ function chatPage() {
           var streamedText = '';
           var streamedTools = [];
             var streamedParts = [];
+            var streamedReasoning = '';
           this.messages.forEach(function(m) {
             if (m.streaming && !m.thinking && m.role === 'agent') {
               streamedText += m.text || '';
               streamedTools = streamedTools.concat(m.tools || []);
                 streamedParts = streamedParts.concat(m.parts || []);
+                if (m.reasoning) streamedReasoning += m.reasoning;
+            } else if (m.thinking && m.role === 'agent' && m.reasoning) {
+              // ThinkingDelta-only turn: agent emitted reasoning but no answer yet.
+              streamedReasoning += m.reasoning;
             }
           });
           streamedTools.forEach(function(t) {
@@ -1094,6 +1159,8 @@ function chatPage() {
                 meta: meta,
                 tools: streamedTools,
                 parts: finalParts,
+                reasoning: streamedReasoning,
+                reasoningExpanded: false,
                 ts: Date.now()
             });
           this.sending = false;
@@ -1322,7 +1389,7 @@ function chatPage() {
       this.sending = true;
 
       // Try WebSocket first
-      var wsPayload = { type: 'message', content: finalText };
+      var wsPayload = { type: 'message', content: finalText, thinking_mode: this.thinkingMode };
       if (uploadedFiles && uploadedFiles.length) wsPayload.attachments = uploadedFiles;
       if (OpenFangAPI.wsSend(wsPayload)) {
         this.messages.push({ id: ++msgId, role: 'agent', text: '', meta: '', thinking: true, streaming: true, tools: [], ts: Date.now() });
@@ -1339,7 +1406,7 @@ function chatPage() {
       this.scrollToBottom();
 
       try {
-        var httpBody = { message: finalText };
+        var httpBody = { message: finalText, thinking_mode: this.thinkingMode };
         if (uploadedFiles && uploadedFiles.length) httpBody.attachments = uploadedFiles;
         var res = await OpenFangAPI.post('/api/agents/' + this.currentAgent.id + '/message', httpBody);
         this.messages = this.messages.filter(function(m) { return !m.thinking; });

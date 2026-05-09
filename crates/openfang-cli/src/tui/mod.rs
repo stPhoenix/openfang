@@ -1193,6 +1193,7 @@ impl App {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            StreamEvent::IterationStart { .. } => {}
         }
     }
 
