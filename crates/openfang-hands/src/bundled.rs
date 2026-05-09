@@ -55,6 +55,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/infisical-sync/HAND.toml"),
             include_str!("../bundled/infisical-sync/SKILL.md"),
         ),
+        (
+            "demiurg",
+            include_str!("../bundled/demiurg/HAND.toml"),
+            include_str!("../bundled/demiurg/SKILL.md"),
+        ),
     ]
 }
 
@@ -86,7 +91,52 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 10);
+        assert_eq!(hands.len(), 11);
+    }
+
+    #[test]
+    fn parse_demiurg_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "demiurg")
+            .expect("demiurg hand must be registered");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "demiurg");
+        assert_eq!(def.name, "Demiurg Orchestrator Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+        // Demiurg orchestrates — must NOT have domain-execution tools.
+        assert!(!def.tools.contains(&"web_search".to_string()));
+        assert!(!def.tools.contains(&"web_fetch".to_string()));
+        assert!(!def.tools.contains(&"shell_exec".to_string()));
+        // Discovery + activation tools.
+        assert!(def.tools.contains(&"agent_list".to_string()));
+        assert!(def.tools.contains(&"hand_list".to_string()));
+        assert!(def.tools.contains(&"hand_activate".to_string()));
+        assert!(def.tools.contains(&"hand_deactivate".to_string()));
+        assert!(def.tools.contains(&"agent_send".to_string()));
+        assert!(def.tools.contains(&"agent_delegate".to_string()));
+        // Workspace + persistence.
+        assert!(def.tools.contains(&"file_read".to_string()));
+        assert!(def.tools.contains(&"file_write".to_string()));
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        // Dashboard wired with demiurg-prefixed keys.
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"demiurg_subagent_calls"));
+        assert!(metric_keys.contains(&"demiurg_active_slug"));
+        // Settings present.
+        assert!(def.settings.iter().any(|s| s.key == "max_subagent_calls"));
+        assert!(def.settings.iter().any(|s| s.key == "auto_kill_spawned"));
+        // Demiurg uses the hand's own model for every subagent invocation;
+        // there is intentionally no separate classifier_model setting.
+        assert!(!def.settings.iter().any(|s| s.key == "classifier_model"));
     }
 
     #[test]

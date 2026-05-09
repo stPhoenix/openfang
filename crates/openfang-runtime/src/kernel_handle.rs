@@ -333,4 +333,17 @@ pub trait KernelHandle: Send + Sync {
         self.spawn_agent(manifest_toml, parent_id).await
     }
 
+    /// Block until each listed async delegation completes, or `timeout_secs`
+    /// elapses. Returns one entry per id (preserving input order); ids that
+    /// never completed get `error: "timed_out"`. The boolean indicates whether
+    /// any id failed to complete in time.
+    async fn await_delegations(
+        &self,
+        ids: Vec<String>,
+        timeout_secs: u64,
+    ) -> Result<(Vec<serde_json::Value>, bool), String> {
+        let _ = (ids, timeout_secs);
+        Err("delegation_await not available".to_string())
+    }
+
 }

@@ -617,6 +617,9 @@ pub async fn get_agent_session(
                     "role": format!("{:?}", m.role),
                     "content": content,
                 });
+                if let Some(ts) = m.timestamp {
+                    msg["timestamp"] = serde_json::Value::String(ts.to_rfc3339());
+                }
                 if !tools.is_empty() {
                     msg["tools"] = serde_json::Value::Array(tools);
                 }
@@ -6744,6 +6747,20 @@ pub async fn a2a_list_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
 }
 
 /// POST /a2a/tasks/send — Submit a task to an agent via A2A.
+///
+/// Async-from-creation: the task is inserted as `Working` and returned
+/// immediately. A background tokio task drives the agent loop and either
+/// `complete`s or `fail`s the task in the store. Callers poll
+/// `GET /a2a/tasks/{id}` until the status leaves `Working`.
+///
+/// Routing: if any active agent's name contains `"demiurg"` (case-insensitive),
+/// the task is routed there. Otherwise falls back to the first registered
+/// agent (legacy behavior).
+///
+/// Artifact contract: when the agent's reply contains lines of the form
+/// `<artifact path="..." mime="..."/>`, those files are read from the agent's
+/// workspace, base64-encoded, and packed into the task's `artifacts[]` as
+/// `A2aPart::File`. The remaining prose becomes `A2aPart::Text`.
 pub async fn a2a_send_task(
     State(state): State<Arc<AppState>>,
     Json(request): Json<serde_json::Value>,
@@ -6762,7 +6779,8 @@ pub async fn a2a_send_task(
         })
         .unwrap_or_else(|| "No message provided".to_string());
 
-    // Find target agent (use first available or specified)
+    // Pick the target agent: prefer an active agent whose name contains
+    // "demiurg" (case-insensitive); fall back to the first registered agent.
     let agents = state.kernel.registry.list();
     if agents.is_empty() {
         return (
@@ -6771,11 +6789,16 @@ pub async fn a2a_send_task(
         );
     }
 
-    let agent = &agents[0];
+    let agent = agents
+        .iter()
+        .find(|a| a.name.to_ascii_lowercase().contains("demiurg"))
+        .unwrap_or(&agents[0]);
+    let agent_id = agent.id;
+    let workspace = agent.manifest.workspace.clone();
     let task_id = uuid::Uuid::new_v4().to_string();
     let session_id = request["params"]["sessionId"].as_str().map(String::from);
 
-    // Create the task in the store as Working
+    // Create the task in the store as Working — caller will poll for completion.
     let task = openfang_runtime::a2a::A2aTask {
         id: task_id.clone(),
         session_id: session_id.clone(),
@@ -6790,50 +6813,156 @@ pub async fn a2a_send_task(
     };
     state.kernel.a2a_task_store.insert(task);
 
-    // Send message to agent
-    match state.kernel.send_message(agent.id, &message_text).await {
-        Ok(result) => {
-            let response_msg = openfang_runtime::a2a::A2aMessage {
-                role: "agent".to_string(),
-                parts: vec![openfang_runtime::a2a::A2aPart::Text {
-                    text: result.response,
-                }],
-            };
-            state
-                .kernel
-                .a2a_task_store
-                .complete(&task_id, response_msg, vec![]);
-            match state.kernel.a2a_task_store.get(&task_id) {
-                Some(completed_task) => (
-                    StatusCode::OK,
-                    Json(serde_json::to_value(&completed_task).unwrap_or_default()),
-                ),
-                None => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Task disappeared after completion"})),
-                ),
+    // Snapshot the inserted task to return immediately.
+    let working_task = state.kernel.a2a_task_store.get(&task_id);
+
+    // Spawn the actual dispatch in the background. The HTTP response returns
+    // as soon as the spawn is scheduled — the agent loop runs without blocking
+    // the request.
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_message = message_text.clone();
+    tokio::spawn(async move {
+        match bg_state.kernel.send_message(agent_id, &bg_message).await {
+            Ok(result) => {
+                let (clean_text, artifacts) = extract_a2a_artifacts(
+                    &result.response,
+                    workspace.as_deref(),
+                    &bg_task_id,
+                );
+                let response_msg = openfang_runtime::a2a::A2aMessage {
+                    role: "agent".to_string(),
+                    parts: vec![openfang_runtime::a2a::A2aPart::Text { text: clean_text }],
+                };
+                bg_state
+                    .kernel
+                    .a2a_task_store
+                    .complete(&bg_task_id, response_msg, artifacts);
+            }
+            Err(e) => {
+                let error_msg = openfang_runtime::a2a::A2aMessage {
+                    role: "agent".to_string(),
+                    parts: vec![openfang_runtime::a2a::A2aPart::Text {
+                        text: format!("Error: {e}"),
+                    }],
+                };
+                bg_state.kernel.a2a_task_store.fail(&bg_task_id, error_msg);
             }
         }
-        Err(e) => {
-            let error_msg = openfang_runtime::a2a::A2aMessage {
-                role: "agent".to_string(),
-                parts: vec![openfang_runtime::a2a::A2aPart::Text {
-                    text: format!("Error: {e}"),
-                }],
-            };
-            state.kernel.a2a_task_store.fail(&task_id, error_msg);
-            match state.kernel.a2a_task_store.get(&task_id) {
-                Some(failed_task) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::to_value(&failed_task).unwrap_or_default()),
-                ),
-                None => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Agent error: {e}")})),
-                ),
-            }
-        }
+    });
+
+    match working_task {
+        Some(t) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&t).unwrap_or_default()),
+        ),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Task disappeared after insert"})),
+        ),
     }
+}
+
+/// Parse `<artifact path="..." mime="..."/>` markers out of an agent reply.
+///
+/// Returns the text with markers stripped, plus one `A2aArtifact` per marker.
+/// Files are resolved relative to `workspace_root` (the agent's workspace
+/// directory) and **not** read into memory — the artifact carries metadata
+/// (UUID id, mime, size, download URL) only. The actual bytes are served
+/// later by `a2a_get_artifact` via a separate authenticated GET. Markers
+/// whose target file is missing, unreadable, or escapes the workspace root
+/// are silently dropped (the body of the reply still surfaces to the
+/// caller, just without that artifact).
+fn extract_a2a_artifacts(
+    reply: &str,
+    workspace_root: Option<&std::path::Path>,
+    task_id: &str,
+) -> (String, Vec<openfang_runtime::a2a::A2aArtifact>) {
+    let mut artifacts = Vec::new();
+    let mut clean_lines = Vec::new();
+    for line in reply.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<artifact ") && trimmed.ends_with("/>") {
+            if let (Some(path), Some(mime)) = (
+                extract_attr(trimmed, "path"),
+                extract_attr(trimmed, "mime"),
+            ) {
+                if let Some(root) = workspace_root {
+                    if let Some(art) = build_artifact(root, &path, &mime, task_id) {
+                        artifacts.push(art);
+                    }
+                }
+            }
+            // Drop the marker line from the visible reply regardless of resolution.
+            continue;
+        }
+        clean_lines.push(line);
+    }
+    // Trim trailing blank lines left behind by stripped markers.
+    while matches!(clean_lines.last(), Some(l) if l.trim().is_empty()) {
+        clean_lines.pop();
+    }
+    (clean_lines.join("\n"), artifacts)
+}
+
+/// Resolve `marker_path` against `workspace_root` and build a server-emitted
+/// artifact. Returns `None` if the file does not exist, is unreadable, or
+/// escapes the workspace root via `..` traversal.
+fn build_artifact(
+    workspace_root: &std::path::Path,
+    marker_path: &str,
+    mime: &str,
+    task_id: &str,
+) -> Option<openfang_runtime::a2a::A2aArtifact> {
+    let full = workspace_root.join(marker_path);
+
+    // Path-traversal guard: canonicalise both sides and confirm the resolved
+    // file path is still under the workspace root. If canonicalisation fails
+    // (file missing, broken symlink, etc.) the artifact is dropped.
+    let canon_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canon_full = std::fs::canonicalize(&full).ok()?;
+    if !canon_full.starts_with(&canon_root) {
+        return None;
+    }
+
+    let metadata = std::fs::metadata(&canon_full).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let size = metadata.len();
+
+    let filename = std::path::Path::new(marker_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(marker_path)
+        .to_string();
+    let id = uuid::Uuid::new_v4().to_string();
+    let url = format!("/api/a2a/tasks/{task_id}/artifacts/{id}");
+
+    Some(openfang_runtime::a2a::A2aArtifact {
+        id: Some(id),
+        name: Some(filename.clone()),
+        description: None,
+        metadata: None,
+        index: None,
+        last_chunk: Some(true),
+        parts: vec![openfang_runtime::a2a::A2aPart::FileRef {
+            name: filename,
+            mime_type: mime.to_string(),
+            url,
+            size: Some(size),
+        }],
+        fs_path: Some(canon_full),
+    })
+}
+
+/// Extract `attr="value"` from an XML-like tag. Returns the value without quotes.
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// GET /a2a/tasks/{id} — Get task status from the task store.
@@ -6851,6 +6980,89 @@ pub async fn a2a_get_task(
             Json(serde_json::json!({"error": format!("Task '{}' not found", task_id)})),
         ),
     }
+}
+
+/// GET /api/a2a/tasks/{tid}/artifacts/{aid} — Download an artifact's bytes.
+///
+/// Auth: Bearer or X-API-Key (default `/api/*` middleware applies).
+/// Lifetime: artifact is downloadable while its parent task is in the
+/// `A2aTaskStore`; once the task is evicted (FIFO at capacity), this
+/// endpoint returns 404.
+///
+/// Path-traversal is prevented at artifact construction time
+/// (`extract_a2a_artifacts` canonicalises the path under the agent's
+/// workspace root and refuses anything that escapes); this handler
+/// re-checks the canonicalised path before reading.
+pub async fn a2a_get_artifact(
+    State(state): State<Arc<AppState>>,
+    Path((task_id, artifact_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
+    use axum::response::Response;
+
+    let not_found = || {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": "artifact not found"}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let task = match state.kernel.a2a_task_store.get(&task_id) {
+        Some(t) => t,
+        None => return not_found(),
+    };
+
+    let artifact = match task
+        .artifacts
+        .iter()
+        .find(|a| a.id.as_deref() == Some(artifact_id.as_str()))
+    {
+        Some(a) => a.clone(),
+        None => return not_found(),
+    };
+
+    let fs_path = match artifact.fs_path {
+        Some(p) => p,
+        None => return not_found(),
+    };
+
+    let bytes = match tokio::fs::read(&fs_path).await {
+        Ok(b) => b,
+        Err(_) => return not_found(),
+    };
+
+    let (mime, name) = match artifact.parts.iter().find_map(|p| match p {
+        openfang_runtime::a2a::A2aPart::FileRef {
+            mime_type, name, ..
+        } => Some((mime_type.clone(), name.clone())),
+        _ => None,
+    }) {
+        Some(pair) => pair,
+        None => (
+            "application/octet-stream".to_string(),
+            artifact.name.unwrap_or_else(|| artifact_id.clone()),
+        ),
+    };
+
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c == '"' || c.is_control() { '_' } else { c })
+        .collect();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, mime)
+        .header(CONTENT_LENGTH, bytes.len())
+        .header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{safe_name}\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap()
 }
 
 /// POST /a2a/tasks/{id}/cancel — Cancel a tracked task.

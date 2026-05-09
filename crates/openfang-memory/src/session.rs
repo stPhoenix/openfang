@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
@@ -383,15 +384,35 @@ impl SessionStore {
 
         match result {
             Ok((messages_blob, cursor, summary, updated_at)) => {
-                let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
-                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-                Ok(CanonicalSession {
-                    agent_id,
-                    messages,
-                    compaction_cursor: cursor as usize,
-                    compacted_summary: summary,
-                    updated_at,
-                })
+                match rmp_serde::from_slice::<Vec<Message>>(&messages_blob) {
+                    Ok(messages) => Ok(CanonicalSession {
+                        agent_id,
+                        messages,
+                        compaction_cursor: cursor as usize,
+                        compacted_summary: summary,
+                        updated_at,
+                    }),
+                    Err(e) => {
+                        warn!(
+                            agent_id = %agent_id.0,
+                            blob_size = messages_blob.len(),
+                            error = %e,
+                            "Canonical session blob unreadable (likely legacy positional msgpack); resetting"
+                        );
+                        // Drop the bad row so the next save_canonical writes fresh named bytes.
+                        let _ = conn.execute(
+                            "DELETE FROM canonical_sessions WHERE agent_id = ?1",
+                            rusqlite::params![agent_id.0.to_string()],
+                        );
+                        Ok(CanonicalSession {
+                            agent_id,
+                            messages: Vec::new(),
+                            compaction_cursor: 0,
+                            compacted_summary: summary,
+                            updated_at,
+                        })
+                    }
+                }
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let now = Utc::now().to_rfc3339();
@@ -496,7 +517,7 @@ impl SessionStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let messages_blob = rmp_serde::to_vec(&canonical.messages)
+        let messages_blob = rmp_serde::to_vec_named(&canonical.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         conn.execute(
             "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
@@ -809,5 +830,181 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    /// Build a Vec<Message> covering every MessageContent / ContentBlock variant.
+    /// Used by round-trip tests below to lock in the msgpack wire format.
+    fn all_variants_messages() -> Vec<Message> {
+        vec![
+            // MessageContent::Text variant
+            Message::user("plain text content"),
+            // MessageContent::Blocks containing every ContentBlock variant
+            Message::assistant_with_blocks(vec![
+                ContentBlock::Text {
+                    text: "answer".into(),
+                    provider_metadata: None,
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "web_fetch".into(),
+                    input: serde_json::json!({"url": "https://example.com"}),
+                    provider_metadata: None,
+                },
+                // Triggering shape from production teddy21 canonical: signature=None
+                // (deepseek/ollama don't emit signatures) but provider_metadata=Some(...).
+                // With positional msgpack the elided signature shifts provider_metadata into
+                // the signature slot, breaking deserialization.
+                ContentBlock::Thinking {
+                    thinking: "let me reason about this...".into(),
+                    signature: None,
+                    provider_metadata: Some(serde_json::json!({"format": "reasoning_content"})),
+                },
+            ]),
+            Message::user_with_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                tool_name: "web_fetch".into(),
+                content: "<html>...</html>".into(),
+                is_error: false,
+            }]),
+        ]
+    }
+
+    /// `to_vec_named` (the writer used by save_session and now save_canonical) must round-trip
+    /// every variant cleanly via from_slice. This is the invariant the canonical store relies on.
+    #[test]
+    fn test_msgpack_named_roundtrip_all_variants() {
+        let messages = all_variants_messages();
+        let blob = rmp_serde::to_vec_named(&messages).expect("serialize named");
+        let decoded: Vec<Message> = rmp_serde::from_slice(&blob).expect("deserialize named");
+        assert_eq!(decoded.len(), messages.len());
+
+        // Spot-check that ContentBlock discriminants survived the round-trip.
+        match &decoded[1].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 4);
+                assert!(matches!(blocks[0], ContentBlock::Text { .. }));
+                assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+                assert!(matches!(blocks[2], ContentBlock::ToolUse { .. }));
+                assert!(matches!(blocks[3], ContentBlock::Thinking { .. }));
+            }
+            _ => panic!("expected Blocks variant"),
+        }
+        match &decoded[2].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+            }
+            _ => panic!("expected Blocks variant"),
+        }
+    }
+
+    /// Negative invariant: positional `to_vec` cannot round-trip messages whose content is
+    /// `Blocks(Vec<ContentBlock>)`, because ContentBlock is `#[serde(tag = "type")]` and needs
+    /// the field name `"type"` in the wire format. If this test ever starts passing, the writer
+    /// in save_canonical (and save_session) must NOT silently switch to to_vec — readers expect
+    /// named bytes.
+    #[test]
+    fn test_msgpack_positional_fails_on_blocks() {
+        let messages = all_variants_messages();
+        let blob = rmp_serde::to_vec(&messages).expect("serialize positional");
+        let result = rmp_serde::from_slice::<Vec<Message>>(&blob);
+        assert!(
+            result.is_err(),
+            "positional msgpack must fail when content uses Blocks/ContentBlock variants"
+        );
+    }
+
+    /// Canonical sessions written with the buggy positional format (pre-fix) used to crash
+    /// post-loop compaction. After the fix, load_canonical must detect the unreadable blob,
+    /// log, drop the row, and return an empty canonical so the next save rewrites it cleanly.
+    #[test]
+    fn test_canonical_recovers_from_legacy_positional_blob() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        // Simulate the legacy bug: write canonical bytes via the (wrong) positional encoder.
+        let messages = all_variants_messages();
+        let bad_blob = rmp_serde::to_vec(&messages).expect("serialize positional");
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
+                 VALUES (?1, ?2, 0, ?3, ?4)",
+                rusqlite::params![
+                    agent_id.0.to_string(),
+                    bad_blob,
+                    Some::<String>("prior summary".into()),
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        // load_canonical must NOT propagate the deserialization error; it should reset the row.
+        let canonical = store.load_canonical(agent_id).expect("recover");
+        assert!(canonical.messages.is_empty());
+        assert_eq!(canonical.compaction_cursor, 0);
+        assert_eq!(canonical.compacted_summary.as_deref(), Some("prior summary"));
+
+        // The bad row must have been deleted (next load returns the no-rows defaults).
+        let canonical2 = store.load_canonical(agent_id).expect("second load");
+        assert!(canonical2.messages.is_empty());
+        assert!(canonical2.compacted_summary.is_none());
+    }
+
+    /// Diagnostic probe: decode a real canonical_sessions blob from disk, if available.
+    /// Set OPENFANG_DECODE_PROBE=/path/to/blob.bin to run. Marked ignored so CI doesn't need
+    /// the fixture file.
+    #[test]
+    #[ignore]
+    fn test_decode_real_canonical_blob() {
+        let Ok(path) = std::env::var("OPENFANG_DECODE_PROBE") else {
+            eprintln!("skip: set OPENFANG_DECODE_PROBE=<path>");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read blob");
+        eprintln!("blob_size={}", bytes.len());
+        match rmp_serde::from_slice::<Vec<Message>>(&bytes) {
+            Ok(v) => eprintln!("OK: {} messages decoded", v.len()),
+            Err(e) => eprintln!("decode-as-Vec<Message> failed: {e}"),
+        }
+        // Decode as Vec<rmpv::Value> to see raw structure and find which message fails.
+        let raw: rmpv::Value = rmp_serde::from_slice(&bytes).expect("decode as rmpv::Value");
+        let arr = raw.as_array().expect("top-level array");
+        eprintln!("raw count: {}", arr.len());
+        for (i, m) in arr.iter().enumerate() {
+            // Re-encode this single element back to bytes and try Message decode.
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, m).unwrap();
+            match rmp_serde::from_slice::<Message>(&buf) {
+                Ok(_) => eprintln!("  msg[{i}] OK"),
+                Err(e) => {
+                    eprintln!("  msg[{i}] FAIL: {e}");
+                    eprintln!("  shape: {m:?}");
+                }
+            }
+        }
+    }
+
+    /// After recovery, a fresh save_canonical must write named bytes that round-trip cleanly.
+    #[test]
+    fn test_canonical_save_uses_named_format() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let mut canonical = store.load_canonical(agent_id).unwrap();
+        canonical.messages = all_variants_messages();
+        store.save_canonical(&canonical).unwrap();
+
+        let reloaded = store.load_canonical(agent_id).unwrap();
+        assert_eq!(reloaded.messages.len(), canonical.messages.len());
+        // If the writer regressed to positional, deserialization in load_canonical would have
+        // hit the recovery path and returned an empty Vec — assert that did NOT happen.
+        assert!(!reloaded.messages.is_empty());
     }
 }

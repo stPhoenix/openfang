@@ -797,6 +797,7 @@ pub async fn execute_tool(
         "agent_kill" => tool_agent_kill(input, kernel),
         "agent_delegate" => tool_agent_delegate(input, kernel, caller_agent_id).await,
         "agent_delegate_async" => tool_agent_delegate_async(input, kernel, caller_agent_id).await,
+        "delegation_await" => tool_delegation_await(input, kernel).await,
 
         // Self-inspection / self-modification tools
         "agent_self_inspect" => tool_agent_self_inspect(kernel, caller_agent_id),
@@ -1375,6 +1376,28 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["manifest_toml", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "delegation_await".to_string(),
+            description: "Block until the listed async delegations complete or the timeout expires. \
+                          Returns one entry per delegation_id (preserving input order) with \
+                          {success, result|error}. Pair with agent_delegate_async to fan out work \
+                          and barrier before continuing.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "delegation_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "IDs returned by prior agent_delegate_async calls"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Max seconds to wait (default 1200, clamped to [60, 3700])"
+                    }
+                },
+                "required": ["delegation_ids"]
             }),
         },
         // --- Self-inspection / self-modification tools ---
@@ -2578,6 +2601,44 @@ async fn tool_agent_delegate_async(
         callback_event_type,
     )
     .await
+}
+
+async fn tool_delegation_await(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let ids: Vec<String> = input
+        .get("delegation_ids")
+        .and_then(|v| v.as_array())
+        .ok_or("Missing 'delegation_ids' array")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if ids.is_empty() {
+        return Err("delegation_ids must be non-empty".to_string());
+    }
+    let raw = input
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1200);
+    let clamped = raw.clamp(60, 3700);
+
+    let (results, timed_out) = kh.await_delegations(ids, clamped).await?;
+    let completed = results
+        .iter()
+        .filter(|r| {
+            // An entry counts as completed if it has a real success/error
+            // payload — i.e. NOT the synthetic timed_out fill.
+            r.get("error").and_then(|e| e.as_str()) != Some("timed_out")
+        })
+        .count();
+    Ok(serde_json::json!({
+        "results": results,
+        "completed": completed,
+        "timed_out": timed_out,
+    })
+    .to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -758,6 +758,11 @@ pub async fn build_router(
             "/a2a/tasks/{id}/cancel",
             axum::routing::post(routes::a2a_cancel_task),
         )
+        // A2A artifact download — bearer-authenticated under /api/* by default
+        .route(
+            "/api/a2a/tasks/{tid}/artifacts/{aid}",
+            axum::routing::get(routes::a2a_get_artifact),
+        )
         // A2A management (outbound) endpoints
         .route(
             "/api/a2a/agents",

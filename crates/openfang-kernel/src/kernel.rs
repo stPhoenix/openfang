@@ -36,9 +36,31 @@ use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
+
+/// Outcome of a single async delegation. Cached so `await_delegations`
+/// can return immediately when the completion event already fired
+/// before the awaiter subscribed.
+#[derive(Debug, Clone)]
+pub struct DelegationOutcome {
+    pub success: bool,
+    pub result: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub finished_at: std::time::Instant,
+}
+
+/// Public result returned to the tool layer / LLM by `await_delegations`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DelegationResult {
+    pub delegation_id: String,
+    pub success: bool,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
 
 /// The main OpenFang kernel — coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
@@ -182,6 +204,13 @@ pub struct OpenFangKernel {
     active_loops: dashmap::DashSet<AgentId>,
     /// Execution evolution analyzer engine.
     pub evolve_engine: openfang_evolve::EvolveEngine,
+    /// Bounded LRU cache of completed async delegation outcomes.
+    /// Written by the `delegate_async` background task; read by
+    /// `await_delegations` to avoid the subscribe-after-event race.
+    /// Cap = 1024 entries — outcomes only need to live until the
+    /// corresponding `delegation_await` resolves.
+    pub delegation_outcomes:
+        Arc<tokio::sync::RwLock<lru::LruCache<String, DelegationOutcome>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1267,6 +1296,9 @@ impl OpenFangKernel {
             agent_msg_locks: dashmap::DashMap::new(),
             active_loops: dashmap::DashSet::new(),
             evolve_engine,
+            delegation_outcomes: Arc::new(tokio::sync::RwLock::new(lru::LruCache::new(
+                NonZeroUsize::new(1024).expect("1024 != 0"),
+            ))),
             self_handle: OnceLock::new(),
         };
 
@@ -8003,6 +8035,27 @@ impl KernelHandle for ScopedKernelHandle {
             .delegate_to_agent(manifest_toml, message, parent_id, parent_caps, timeout_secs)
             .await
     }
+
+    async fn delegate_async(
+        &self,
+        manifest_toml: &str,
+        message: &str,
+        parent_id: Option<&str>,
+        parent_caps: &[openfang_types::capability::Capability],
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .delegate_async(manifest_toml, message, parent_id, parent_caps, callback_event_type)
+            .await
+    }
+
+    async fn await_delegations(
+        &self,
+        ids: Vec<String>,
+        timeout_secs: u64,
+    ) -> Result<(Vec<serde_json::Value>, bool), String> {
+        self.inner.await_delegations(ids, timeout_secs).await
+    }
 }
 
 /// Sanitize a human-readable string into a valid `CronJob.name`.
@@ -9151,6 +9204,24 @@ impl KernelHandle for OpenFangKernel {
                         Ok(r) => (true, r.response),
                         Err(e) => (false, format!("{e}")),
                     };
+
+                    // Cache the outcome BEFORE publishing the event so an
+                    // awaiter that races to look it up after seeing the event
+                    // also finds the cached entry.
+                    {
+                        let mut cache = kernel.delegation_outcomes.write().await;
+                        cache.put(
+                            delegation_id_clone.clone(),
+                            DelegationOutcome {
+                                success,
+                                result: response.clone(),
+                                agent_id: agent_id.to_string(),
+                                agent_name: agent_name_clone.clone(),
+                                finished_at: std::time::Instant::now(),
+                            },
+                        );
+                    }
+
                     let payload = serde_json::json!({
                         "type": event_type,
                         "data": {
@@ -9182,6 +9253,126 @@ impl KernelHandle for OpenFangKernel {
         .to_string())
     }
 
+    async fn await_delegations(
+        &self,
+        ids: Vec<String>,
+        timeout_secs: u64,
+    ) -> Result<(Vec<serde_json::Value>, bool), String> {
+        use tokio::sync::broadcast::error::RecvError;
+
+        if ids.is_empty() {
+            return Err("delegation_ids must be non-empty".to_string());
+        }
+
+        // Subscribe FIRST so a completion event that fires between the
+        // cache check and the recv loop is not lost.
+        let mut rx = self.event_bus.subscribe_all();
+
+        let mut pending: std::collections::HashSet<String> =
+            ids.iter().cloned().collect();
+        let mut results: std::collections::HashMap<String, DelegationResult> =
+            std::collections::HashMap::new();
+
+        // Cache-first path: pick up any delegations that already completed.
+        {
+            let mut cache = self.delegation_outcomes.write().await;
+            for id in &ids {
+                if let Some(o) = cache.get(id).cloned() {
+                    results.insert(id.clone(), outcome_to_result(id, &o));
+                    pending.remove(id);
+                }
+            }
+        }
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        while !pending.is_empty() {
+            let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => {
+                    timed_out = true;
+                    break;
+                }
+            };
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+                Ok(Err(RecvError::Closed)) => {
+                    timed_out = true;
+                    break;
+                }
+                Ok(Err(RecvError::Lagged(_))) => {
+                    // Re-poll the cache for ids that may have completed during the lag.
+                    let cache = self.delegation_outcomes.read().await;
+                    let still_pending: Vec<String> = pending.iter().cloned().collect();
+                    for id in still_pending {
+                        if let Some(o) = cache.peek(&id).cloned() {
+                            results.insert(id.clone(), outcome_to_result(&id, &o));
+                            pending.remove(&id);
+                        }
+                    }
+                    continue;
+                }
+                Ok(Ok(event)) => {
+                    if let EventPayload::Custom(bytes) = &event.payload {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                            if let Some(did) = v
+                                .pointer("/data/delegation_id")
+                                .and_then(|x| x.as_str())
+                            {
+                                if pending.remove(did) {
+                                    let success = v
+                                        .pointer("/data/success")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(false);
+                                    let body = v
+                                        .pointer("/data/result")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    results.insert(
+                                        did.to_string(),
+                                        DelegationResult {
+                                            delegation_id: did.to_string(),
+                                            success,
+                                            result: if success { Some(body.clone()) } else { None },
+                                            error: if success { None } else { Some(body) },
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let ordered: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let r = results.remove(id).unwrap_or_else(|| DelegationResult {
+                    delegation_id: id.clone(),
+                    success: false,
+                    result: None,
+                    error: Some("timed_out".to_string()),
+                });
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            })
+            .collect();
+        Ok((ordered, timed_out))
+    }
+}
+
+fn outcome_to_result(id: &str, o: &DelegationOutcome) -> DelegationResult {
+    DelegationResult {
+        delegation_id: id.to_string(),
+        success: o.success,
+        result: if o.success { Some(o.result.clone()) } else { None },
+        error: if o.success { None } else { Some(o.result.clone()) },
+    }
 }
 
 // --- OFP Wire Protocol integration ---
@@ -10135,5 +10326,202 @@ mod tests {
         }
 
         kernel.shutdown();
+    }
+
+    // ── Delegation outcome cache + await_delegations ─────────────────────
+
+    #[test]
+    fn test_outcome_to_result_success() {
+        let o = DelegationOutcome {
+            success: true,
+            result: "hello".to_string(),
+            agent_id: "agent-x".to_string(),
+            agent_name: "x".to_string(),
+            finished_at: std::time::Instant::now(),
+        };
+        let r = outcome_to_result("did-1", &o);
+        assert_eq!(r.delegation_id, "did-1");
+        assert!(r.success);
+        assert_eq!(r.result.as_deref(), Some("hello"));
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn test_outcome_to_result_failure() {
+        let o = DelegationOutcome {
+            success: false,
+            result: "boom".to_string(),
+            agent_id: "agent-x".to_string(),
+            agent_name: "x".to_string(),
+            finished_at: std::time::Instant::now(),
+        };
+        let r = outcome_to_result("did-2", &o);
+        assert!(!r.success);
+        assert!(r.result.is_none());
+        assert_eq!(r.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn test_outcomes_lru_capped() {
+        let mut cache: lru::LruCache<String, DelegationOutcome> =
+            lru::LruCache::new(NonZeroUsize::new(1024).unwrap());
+        for i in 0..2000 {
+            cache.put(
+                format!("did-{i}"),
+                DelegationOutcome {
+                    success: true,
+                    result: String::new(),
+                    agent_id: String::new(),
+                    agent_name: String::new(),
+                    finished_at: std::time::Instant::now(),
+                },
+            );
+        }
+        assert!(cache.len() <= 1024, "len={}", cache.len());
+        // Earliest entries evicted; latest retained.
+        assert!(cache.peek("did-1999").is_some());
+        assert!(cache.peek("did-0").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_await_delegations_pre_completed_via_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("await-precompleted");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        // Pre-populate the cache as if delegate_async's bg task already ran.
+        {
+            let mut cache = kernel.delegation_outcomes.write().await;
+            cache.put(
+                "did-pre".to_string(),
+                DelegationOutcome {
+                    success: true,
+                    result: "ok-body".to_string(),
+                    agent_id: "agent-pre".to_string(),
+                    agent_name: "pre".to_string(),
+                    finished_at: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let kh: &dyn kernel_handle::KernelHandle = &kernel;
+        let (results, timed_out) = kh
+            .await_delegations(vec!["did-pre".to_string()], 60)
+            .await
+            .expect("await ok");
+        assert!(!timed_out);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["delegation_id"], "did-pre");
+        assert_eq!(results[0]["success"], true);
+        assert_eq!(results[0]["result"], "ok-body");
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_await_delegations_unknown_id_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("await-timeout");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let kh: &dyn kernel_handle::KernelHandle = &kernel;
+        // Use the smallest accepted timeout via the trait directly (clamping
+        // happens in the tool layer; the trait accepts any u64).
+        let (results, timed_out) = kh
+            .await_delegations(vec!["did-never".to_string()], 1)
+            .await
+            .expect("await ok");
+        assert!(timed_out);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["delegation_id"], "did-never");
+        assert_eq!(results[0]["success"], false);
+        assert_eq!(results[0]["error"], "timed_out");
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_await_delegations_rejects_empty_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("await-empty");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let kh: &dyn kernel_handle::KernelHandle = &kernel;
+        let err = kh
+            .await_delegations(vec![], 60)
+            .await
+            .expect_err("empty must be rejected");
+        assert!(err.contains("non-empty"));
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_await_delegations_event_arrives_via_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("await-broadcast");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel: Arc<OpenFangKernel> =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+
+        let kernel_clone = kernel.clone();
+        let did = "did-bcast".to_string();
+        let did_clone = did.clone();
+
+        // Fire an event 100ms after the await starts. await_delegations
+        // subscribes BEFORE the cache check, so it must receive this.
+        let pump = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let payload = serde_json::json!({
+                "type": "delegation_completed",
+                "data": {
+                    "delegation_id": did_clone,
+                    "agent_id": "agent-b",
+                    "agent_name": "b",
+                    "success": true,
+                    "result": "via-event",
+                }
+            });
+            let event = Event::new(
+                AgentId::new(),
+                EventTarget::Broadcast,
+                EventPayload::Custom(serde_json::to_vec(&payload).unwrap()),
+            );
+            kernel_clone.publish_event(event).await;
+        });
+
+        let kh: &dyn kernel_handle::KernelHandle = kernel.as_ref();
+        let (results, timed_out) = kh
+            .await_delegations(vec![did.clone()], 5)
+            .await
+            .expect("await ok");
+        assert!(!timed_out);
+        assert_eq!(results[0]["result"], "via-event");
+        let _ = pump.await;
+
+        // Manually shut down via Arc::try_unwrap — easier here is to skip
+        // shutdown since tempfile cleans up; the kernel has no live tasks.
+        drop(kernel);
     }
 }

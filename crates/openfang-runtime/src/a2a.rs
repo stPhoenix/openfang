@@ -168,11 +168,24 @@ pub struct A2aMessage {
 pub enum A2aPart {
     /// Text content.
     Text { text: String },
-    /// File content (base64-encoded).
+    /// File content (base64-encoded). Accepted on inbound A2A messages from
+    /// external systems, but the daemon no longer **emits** this variant for
+    /// outbound artifacts — see `FileRef` below.
     File {
         name: String,
         mime_type: String,
         data: String,
+    },
+    /// Reference to a file artifact retrievable via a separate download
+    /// endpoint. The byte stream is NOT inline — the client must `GET url`
+    /// with the same Bearer auth used for `tasks/send`. Server-emitted
+    /// artifacts use this variant to keep the task JSON small.
+    FileRef {
+        name: String,
+        mime_type: String,
+        url: String,
+        #[serde(default)]
+        size: Option<u64>,
     },
     /// Structured data.
     Data {
@@ -185,6 +198,10 @@ pub enum A2aPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct A2aArtifact {
+    /// Stable per-task artifact id (UUID v4). Set on every server-emitted
+    /// artifact so clients can address it via the download endpoint.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Artifact name (optional per spec).
     #[serde(default)]
     pub name: Option<String>,
@@ -202,6 +219,10 @@ pub struct A2aArtifact {
     pub last_chunk: Option<bool>,
     /// Artifact content parts.
     pub parts: Vec<A2aPart>,
+    /// Server-only filesystem path used to serve the artifact via the
+    /// download endpoint. Never crosses the wire.
+    #[serde(skip)]
+    pub fs_path: Option<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +633,66 @@ mod tests {
         assert_eq!(full.description.as_deref(), Some("The result"));
         assert_eq!(full.index, Some(0));
         assert_eq!(full.last_chunk, Some(true));
+    }
+
+    #[test]
+    fn test_a2a_file_ref_round_trip() {
+        // FileRef serializes with type=fileRef and carries url + size, no data field.
+        let part = A2aPart::FileRef {
+            name: "report.md".to_string(),
+            mime_type: "text/markdown".to_string(),
+            url: "/api/a2a/tasks/t1/artifacts/abcd".to_string(),
+            size: Some(12_345),
+        };
+        let json = serde_json::to_string(&part).unwrap();
+        assert!(json.contains("\"type\":\"fileRef\""));
+        assert!(json.contains("\"url\":\"/api/a2a/tasks/t1/artifacts/abcd\""));
+        assert!(json.contains("\"size\":12345"));
+        assert!(!json.contains("\"data\""));
+
+        let back: A2aPart = serde_json::from_str(&json).unwrap();
+        match back {
+            A2aPart::FileRef {
+                name,
+                mime_type,
+                url,
+                size,
+            } => {
+                assert_eq!(name, "report.md");
+                assert_eq!(mime_type, "text/markdown");
+                assert_eq!(url, "/api/a2a/tasks/t1/artifacts/abcd");
+                assert_eq!(size, Some(12_345));
+            }
+            _ => panic!("expected FileRef variant"),
+        }
+    }
+
+    #[test]
+    fn test_a2a_artifact_with_id_and_fs_path_skipped() {
+        // `id` round-trips on the wire, `fs_path` does NOT.
+        let artifact = A2aArtifact {
+            id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            name: Some("out.bin".to_string()),
+            description: None,
+            metadata: None,
+            index: Some(0),
+            last_chunk: Some(true),
+            parts: vec![A2aPart::FileRef {
+                name: "out.bin".to_string(),
+                mime_type: "application/octet-stream".to_string(),
+                url: "/api/a2a/tasks/t/artifacts/x".to_string(),
+                size: Some(7),
+            }],
+            fs_path: Some(std::path::PathBuf::from("/secret/should/not/serialize")),
+        };
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert!(json.contains("\"id\":\"11111111-2222-3333-4444-555555555555\""));
+        assert!(!json.contains("fs_path"));
+        assert!(!json.contains("/secret/should/not/serialize"));
+
+        let back: A2aArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+        assert!(back.fs_path.is_none());
     }
 
     #[test]

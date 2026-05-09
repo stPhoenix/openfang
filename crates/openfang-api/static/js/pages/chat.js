@@ -657,7 +657,8 @@ function chatPage() {
             tools.forEach(function (t) {
               parts.push({type: 'tool', id: 'hist-tp-' + t.id, tool: t});
             });
-            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts, reasoning: m.reasoning || '', reasoningExpanded: false};
+            var ts = m.timestamp ? Date.parse(m.timestamp) : null;
+            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts, reasoning: m.reasoning || '', reasoningExpanded: false, ts: ts};
           });
           // Re-append any in-flight bubbles preserved from the prior list so
           // typing-dots / partial streaming content survive the session load.
@@ -1243,11 +1244,15 @@ function chatPage() {
     formatTime: function(ts) {
       if (!ts) return '';
       var d = new Date(ts);
+      var months = ['January','February','March','April','May','June',
+                    'July','August','September','October','November','December'];
+      var date = months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
       var h = d.getHours();
       var m = d.getMinutes();
       var ampm = h >= 12 ? 'PM' : 'AM';
       h = h % 12 || 12;
-      return h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
+      var time = h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
+      return date + ' - ' + time;
     },
 
     // Copy message text to clipboard
