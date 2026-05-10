@@ -48,6 +48,10 @@ pub struct MessageRequest {
     /// Sender display name.
     #[serde(default)]
     pub sender_name: Option<String>,
+    /// Browser-supplied dedupe id stamped on the persisted user turn so the
+    /// frontend can match its server-echoed message back to the local bubble.
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
 }
 
 /// Response from sending a message.

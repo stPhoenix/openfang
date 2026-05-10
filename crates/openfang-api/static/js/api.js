@@ -203,7 +203,13 @@ var OpenFangAPI = (function() {
   function patch(path, body) { return request('PATCH', path, body); }
   function del(path, body) { return request('DELETE', path, body); }
 
-  // WebSocket manager with auto-reconnect
+    // WebSocket manager with auto-reconnect.
+    //
+    // Reconnect policy is intentionally infinite (mirrors Open WebUI / Socket.IO
+    // behavior): network blips, daemon restarts, or laptop sleep should never
+    // permanently downgrade the user to HTTP-only mode. Backoff caps at 30 s with
+    // jitter; the `online` event triggers an immediate retry when the OS reports
+    // network recovery.
   var _ws = null;
   var _wsCallbacks = {};
   var _wsConnected = false;
@@ -212,7 +218,9 @@ var OpenFangAPI = (function() {
   var _reconnectAttempts = 0;
     var _heartbeatTimer = null;
     var HEARTBEAT_MS = 30000;
-  var MAX_RECONNECT = 5;
+    var RECONNECT_CAP_MS = 30000;
+    var _stillTryingNotified = false;
+    var _onlineHooked = false;
 
     function _stopHeartbeat() {
         if (_heartbeatTimer) {
@@ -235,12 +243,35 @@ var OpenFangAPI = (function() {
     // to the correct generation across reconnects.
     var _currentStreamId = null;
 
+    // Resume cursor: highest `seq` seen on the current stream. On reconnect
+    // we ask the server "send everything after seq N for stream X" instead of
+    // re-bootstrapping from the cumulative snapshot. The server falls back to
+    // a snapshot if the ring buffer no longer covers the gap, so this is safe
+    // even when the daemon was restarted.
+    var _lastSeq = -1;
+    var _lastStreamId = null;
+
+    function noteEventSeq(streamId, seq) {
+        if (!streamId) return;
+        if (streamId !== _lastStreamId) {
+            _lastStreamId = streamId;
+            _lastSeq = -1;
+        }
+        if (typeof seq === 'number' && seq > _lastSeq) _lastSeq = seq;
+    }
+
     function getCurrentStreamId() {
         return _currentStreamId;
     }
 
     function setCurrentStreamId(id) {
         _currentStreamId = id;
+        if (id == null) {
+            // Stream finished — drop the resume cursor so a brand-new stream
+            // doesn't accidentally inherit a stale `since_seq` from this one.
+            _lastSeq = -1;
+            _lastStreamId = null;
+        }
     }
 
     function wsConnect(agentId, callbacks) {
@@ -248,14 +279,38 @@ var OpenFangAPI = (function() {
     _wsCallbacks = callbacks || {};
     _wsAgentId = agentId;
     _reconnectAttempts = 0;
+        _stillTryingNotified = false;
         _currentStreamId = null;
+        if (!_onlineHooked && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            _onlineHooked = true;
+            window.addEventListener('online', function () {
+                // OS reports network recovery — cancel pending backoff and try now.
+                if (_wsAgentId && !_wsConnected) {
+                    if (_reconnectTimer) {
+                        clearTimeout(_reconnectTimer);
+                        _reconnectTimer = null;
+                    }
+                    _reconnectAttempts = 0;
+                    _doConnect(_wsAgentId);
+                }
+            });
+        }
     _doConnect(agentId);
   }
 
   function _doConnect(agentId) {
     try {
       var url = WS_BASE + '/api/agents/' + agentId + '/ws';
-      if (_authToken) url += '?token=' + encodeURIComponent(_authToken);
+        var qs = [];
+        if (_authToken) qs.push('token=' + encodeURIComponent(_authToken));
+        // Resume cursor: if we have a known last seq for an in-flight stream,
+        // ask the server to replay the gap from its ring buffer instead of
+        // re-sending the cumulative snapshot.
+        if (_lastStreamId && _lastSeq >= 0) {
+            qs.push('stream_id=' + encodeURIComponent(_lastStreamId));
+            qs.push('since_seq=' + _lastSeq);
+        }
+        if (qs.length) url += '?' + qs.join('&');
       var socket = new WebSocket(url);
       _ws = socket;
 
@@ -264,6 +319,7 @@ var OpenFangAPI = (function() {
         if (_ws !== socket) return;
         _wsConnected = true;
         _reconnectAttempts = 0;
+          _stillTryingNotified = false;
         setConnectionState('connected');
           _startHeartbeat();
         if (_reconnectAttempt > 0) {
@@ -279,6 +335,11 @@ var OpenFangAPI = (function() {
         } catch(parseErr) {
           return; // Ignore malformed JSON frames
         }
+          // Update resume cursor BEFORE dispatch so a reconnect triggered by
+          // an exception in the handler still has the latest seq.
+          if (data && data.stream_id && typeof data.seq === 'number') {
+              noteEventSeq(data.stream_id, data.seq);
+          }
         // Dispatch outside try/catch so handler errors are not swallowed
         if (_wsCallbacks.onMessage) _wsCallbacks.onMessage(data);
       };
@@ -290,20 +351,27 @@ var OpenFangAPI = (function() {
         _wsConnected = false;
         _ws = null;
           _stopHeartbeat();
-        if (_wsAgentId && _reconnectAttempts < MAX_RECONNECT && e.code !== 1000) {
+          // Infinite reconnect with capped exponential backoff + jitter. Only
+          // a clean close (1000) or an explicit `wsDisconnect` stops retrying.
+          if (_wsAgentId && e.code !== 1000) {
           _reconnectAttempts++;
           _reconnectAttempt = _reconnectAttempts;
           setConnectionState('reconnecting');
           if (_reconnectAttempts === 1) {
             OpenFangToast.warn('Connection lost, reconnecting...');
+          } else if (_reconnectAttempts === 6 && !_stillTryingNotified) {
+              // After ~30 s of failed retries, surface a one-shot warn so the
+              // user knows we're still trying instead of silently looping.
+              _stillTryingNotified = true;
+              OpenFangToast.warn('Still trying to reconnect...');
           }
-          var delay = Math.min(1000 * Math.pow(2, _reconnectAttempts - 1), 10000);
-          _reconnectTimer = setTimeout(function() { _doConnect(_wsAgentId); }, delay);
+              var exp = Math.min(_reconnectAttempts - 1, 5);
+              var delay = Math.min(1000 * Math.pow(2, exp), RECONNECT_CAP_MS);
+              delay = delay + Math.floor(Math.random() * 1000); // jitter
+              _reconnectTimer = setTimeout(function () {
+                  if (_wsAgentId) _doConnect(_wsAgentId);
+              }, delay);
           return;
-        }
-        if (_wsAgentId && _reconnectAttempts >= MAX_RECONNECT) {
-          setConnectionState('disconnected');
-          OpenFangToast.error('Connection lost — switched to HTTP mode', 0);
         }
         if (_wsCallbacks.onClose) _wsCallbacks.onClose();
       };
@@ -316,16 +384,29 @@ var OpenFangAPI = (function() {
       };
     } catch(e) {
       _wsConnected = false;
+        // Synchronous failure (e.g. blocked by mixed-content / CSP). Schedule
+        // a backoff retry — onclose won't fire because the socket never opened.
+        if (_wsAgentId) {
+            _reconnectAttempts++;
+            var expE = Math.min(_reconnectAttempts - 1, 5);
+            var delayE = Math.min(1000 * Math.pow(2, expE), RECONNECT_CAP_MS);
+            delayE = delayE + Math.floor(Math.random() * 1000);
+            _reconnectTimer = setTimeout(function () {
+                if (_wsAgentId) _doConnect(_wsAgentId);
+            }, delayE);
+        }
     }
   }
 
   function wsDisconnect() {
     _wsAgentId = null;
-    _reconnectAttempts = MAX_RECONNECT;
+      _reconnectAttempts = 0;
+      _stillTryingNotified = false;
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       _stopHeartbeat();
     if (_ws) { _ws.close(1000); _ws = null; }
     _wsConnected = false;
+      setConnectionState('disconnected');
   }
 
   function wsSend(data) {

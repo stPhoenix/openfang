@@ -26,6 +26,7 @@ use openfang_runtime::llm_errors;
 use openfang_types::agent::AgentId;
 use openfang_types::commands::{self, Surfaces};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -186,6 +187,11 @@ struct CompletedSnapshot {
     completed_at: tokio::time::Instant,
 }
 
+/// Cap on the per-stream replay buffer. 256 events covers ~25s of dense
+/// streaming at the typical 10 events/sec; older entries are dropped from
+/// the front, in which case the client falls back to the full snapshot.
+const RECENT_EVENTS_CAP: usize = 256;
+
 struct LiveStream {
     stream_id: uuid::Uuid,
     started_at_ms: i64,
@@ -194,6 +200,9 @@ struct LiveStream {
     tools: Vec<(String, ToolState)>,
     last_phase: Option<(String, Option<String>)>,
     completed: Option<CompletedSnapshot>,
+    /// Recent stamped events for `?since_seq=` resume on reconnect. Bounded
+    /// FIFO; missing range = client must fall back to the cumulative snapshot.
+    recent_events: VecDeque<(u64, serde_json::Value)>,
 }
 
 impl LiveStream {
@@ -210,6 +219,7 @@ impl LiveStream {
             tools: Vec::new(),
             last_phase: None,
             completed: None,
+            recent_events: VecDeque::with_capacity(RECENT_EVENTS_CAP),
         }
     }
 }
@@ -370,7 +380,8 @@ fn apply_event_to_snapshot(s: &mut LiveStream, payload: &serde_json::Value) {
 }
 
 /// Emit a stream event: stamp seq + stream_id, mutate the per-agent
-/// snapshot, then broadcast to all connected sockets.
+/// snapshot, push into the recent-events ring (for `?since_seq=` resume),
+/// then broadcast to all connected sockets.
 async fn emit_stream_event(agent_id: AgentId, mut payload: serde_json::Value) -> usize {
     if let Some(entry) = ws_agent_streams().get(&agent_id) {
         let mut s = entry.value().write().await;
@@ -378,10 +389,17 @@ async fn emit_stream_event(agent_id: AgentId, mut payload: serde_json::Value) ->
         s.next_seq += 1;
         apply_event_to_snapshot(&mut s, &payload);
         let stream_id = s.stream_id.to_string();
-        drop(s);
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("seq".to_string(), serde_json::Value::from(seq));
-            obj.insert("stream_id".to_string(), serde_json::Value::from(stream_id));
+            obj.insert(
+                "stream_id".to_string(),
+                serde_json::Value::from(stream_id.clone()),
+            );
+        }
+        // Push into the ring buffer for late reconnect replay.
+        s.recent_events.push_back((seq, payload.clone()));
+        while s.recent_events.len() > RECENT_EVENTS_CAP {
+            s.recent_events.pop_front();
         }
     }
     broadcast_to_ws(agent_id, payload).await
@@ -403,6 +421,10 @@ async fn complete_stream(agent_id: AgentId, mut payload: serde_json::Value) -> u
             payload: payload.clone(),
             completed_at: tokio::time::Instant::now(),
         });
+        s.recent_events.push_back((seq, payload.clone()));
+        while s.recent_events.len() > RECENT_EVENTS_CAP {
+            s.recent_events.pop_front();
+        }
         payload
     } else {
         payload
@@ -428,6 +450,54 @@ async fn complete_stream(agent_id: AgentId, mut payload: serde_json::Value) -> u
         }
     });
     count
+}
+
+/// Read the current stream id for an agent (if a LiveStream exists).
+async fn current_stream_id(agent_id: AgentId) -> Option<String> {
+    let entry = ws_agent_streams().get(&agent_id)?;
+    let s = entry.value().read().await;
+    Some(s.stream_id.to_string())
+}
+
+/// Drop the LiveStream entry for an agent. Called once the agent loop's
+/// cleanup task has confirmed the assistant turn is persisted, so the 60s
+/// completed-snapshot TTL no longer needs to mirror the response — the
+/// canonical source of truth is the saved session, and replaying `completed`
+/// after the response is already in history would create a duplicate bubble.
+fn clear_completed_snapshot(agent_id: AgentId) {
+    ws_agent_streams().remove(&agent_id);
+}
+
+/// After the kernel post-processing task succeeds, stamp the LiveStream's
+/// `stream_id` onto the most recent assistant turn in the persisted session.
+/// The frontend uses this id to dedupe a `stream_snapshot.completed` payload
+/// against the assistant message already loaded via GET `/session`.
+async fn stamp_stream_id_on_last_assistant(
+    kernel: &Arc<openfang_kernel::OpenFangKernel>,
+    agent_id: AgentId,
+    stream_id: &str,
+) {
+    let session_id = match kernel.registry.get(agent_id) {
+        Some(e) => e.session_id,
+        None => return,
+    };
+    let mut session = match kernel.memory.get_session(session_id) {
+        Ok(Some(s)) => s,
+        _ => return,
+    };
+    let mut changed = false;
+    for msg in session.messages.iter_mut().rev() {
+        if msg.role == openfang_types::message::Role::Assistant {
+            if msg.metadata.stream_id.as_deref() != Some(stream_id) {
+                msg.metadata.stream_id = Some(stream_id.to_string());
+                changed = true;
+            }
+            break;
+        }
+    }
+    if changed {
+        let _ = kernel.memory.save_session_async(&session).await;
+    }
 }
 
 /// Flush an accumulated text buffer as a single text_delta event via
@@ -585,8 +655,36 @@ pub async fn agent_ws(
         }
     }
 
+    // Parse optional resume params (`since_seq` + `stream_id`) from the URL
+    // query so a reconnecting client can ask for "all events after seq N for
+    // stream X" instead of just the cumulative snapshot. Lossless when the
+    // ring buffer still covers the gap.
+    let mut since_seq: Option<u64> = None;
+    let mut resume_stream_id: Option<String> = None;
+    if let Some(q) = uri.query() {
+        for pair in q.split('&') {
+            if let Some(v) = pair.strip_prefix("since_seq=") {
+                if let Ok(n) = v.parse::<u64>() {
+                    since_seq = Some(n);
+                }
+            } else if let Some(v) = pair.strip_prefix("stream_id=") {
+                resume_stream_id = Some(crate::percent_decode(v));
+            }
+        }
+    }
+
     let id_str = id.clone();
-    ws.on_upgrade(move |socket| handle_agent_ws(socket, state, agent_id, id_str, guard))
+    ws.on_upgrade(move |socket| {
+        handle_agent_ws(
+            socket,
+            state,
+            agent_id,
+            id_str,
+            guard,
+            since_seq,
+            resume_stream_id,
+        )
+    })
         .into_response()
 }
 
@@ -604,6 +702,8 @@ async fn handle_agent_ws(
     agent_id: AgentId,
     id_str: String,
     _guard: WsConnectionGuard,
+    since_seq: Option<u64>,
+    resume_stream_id: Option<String>,
 ) {
     info!(agent_id = %id_str, "WebSocket connected");
 
@@ -626,11 +726,44 @@ async fn handle_agent_ws(
     )
     .await;
 
-    // If a stream is in flight (or recently completed) for this agent,
-    // unicast the snapshot to the new socket so the UI can resume.
+    // If a stream is in flight (or recently completed) for this agent, try to
+    // resume losslessly via the per-stream ring buffer. Falls back to the
+    // cumulative snapshot when the buffer doesn't fully cover the gap (or
+    // when the stream_id has rolled over to a new generation).
     if let Some(entry) = ws_agent_streams().get(&agent_id) {
-        let snapshot = build_snapshot_json(&*entry.value().read().await);
-        let _ = send_json(&sender, &snapshot).await;
+        let s = entry.value().read().await;
+        let stream_matches = resume_stream_id
+            .as_ref()
+            .is_some_and(|sid| sid == &s.stream_id.to_string());
+        let mut sent_resume = false;
+        if let (Some(client_seq), true) = (since_seq, stream_matches) {
+            // The ring buffer is FIFO with `next_seq` events ever stamped;
+            // cover means the oldest stored seq is <= client_seq + 1.
+            let oldest = s.recent_events.front().map(|(seq, _)| *seq);
+            if let Some(oldest_seq) = oldest {
+                if oldest_seq <= client_seq + 1 {
+                    let to_send: Vec<serde_json::Value> = s
+                        .recent_events
+                        .iter()
+                        .filter(|(seq, _)| *seq > client_seq)
+                        .map(|(_, p)| p.clone())
+                        .collect();
+                    drop(s);
+                    for ev in to_send {
+                        let _ = send_json(&sender, &ev).await;
+                    }
+                    sent_resume = true;
+                }
+            } else if s.next_seq <= client_seq + 1 {
+                // Empty buffer but no events newer than the cursor: nothing
+                // to resend. Treat as a successful resume.
+                sent_resume = true;
+            }
+        }
+        if !sent_resume {
+            let snapshot = build_snapshot_json(&*entry.value().read().await);
+            let _ = send_json(&sender, &snapshot).await;
+        }
     }
 
     // Spawn background task: periodic agent list updates with change detection
@@ -930,6 +1063,27 @@ async fn handle_text_message(
                 })
                 .unwrap_or(200_000) as f64;
 
+            // Synchronously persist the user turn BEFORE spawning the agent
+            // loop so a page reload mid-stream still finds the prompt in
+            // GET /session. The agent loop's own pre-save runs inside its
+            // spawned task, which races the reload's GET request.
+            let client_msg_id = parsed
+                .get("client_msg_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Err(e) = state
+                .kernel
+                .persist_user_message(
+                    agent_id,
+                    &content,
+                    ws_content_blocks.clone(),
+                    client_msg_id,
+                )
+                .await
+            {
+                warn!(agent_id = %agent_id, "Pre-save user message failed: {e}");
+            }
+
             match state.kernel.send_message_streaming(
                 agent_id,
                 &content,
@@ -939,6 +1093,7 @@ async fn handle_text_message(
                 None, // sender_role: WebSocket callers don't have RBAC role yet
                 ws_content_blocks,
                 thinking_override,
+                true, // already_persisted: we just called persist_user_message
             ) {
                 Ok((mut rx, handle)) => {
                     // Establish a fresh LiveStream for this generation. All
@@ -1075,6 +1230,7 @@ async fn handle_text_message(
                     // Spawn the kernel task in the background for cleanup
                     // (canonical session writes, JSONL mirror, compaction).
                     // We don't need its result for the response event.
+                    let cleanup_kernel = state.kernel.clone();
                     tokio::spawn(async move {
                         match handle.await {
                             Ok(Err(e)) => {
@@ -1101,7 +1257,21 @@ async fn handle_text_message(
                                 .await;
                             }
                             Ok(Ok(_)) => {
-                                // Post-processing completed successfully — nothing to send
+                                // Stamp the stream_id onto the persisted
+                                // assistant turn so a reload-within-60s can
+                                // dedupe the snapshot's `completed` payload
+                                // against the loaded history. Then drop the
+                                // LiveStream entry — the response is now in
+                                // SQLite and replaying it would duplicate.
+                                if let Some(sid) = current_stream_id(agent_id).await {
+                                    stamp_stream_id_on_last_assistant(
+                                        &cleanup_kernel,
+                                        agent_id,
+                                        &sid,
+                                    )
+                                        .await;
+                                }
+                                clear_completed_snapshot(agent_id);
                             }
                         }
                     });

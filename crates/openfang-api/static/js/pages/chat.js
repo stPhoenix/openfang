@@ -635,11 +635,21 @@ function chatPage() {
       var self = this;
       try {
         var data = await OpenFangAPI.get('/api/agents/' + agentId + '/session');
-        // Preserve any in-flight streaming/thinking placeholders that may
-        // have been created by a `stream_snapshot` arriving before this
-        // session fetch resolved (race between WS connect and HTTP load).
-        var inflight = (self.messages || []).filter(function(m){
-          return m && (m.streaming || m.thinking);
+          // Preserve in-flight bubbles AND recent user echoes whose
+          // `client_msg_id` is missing from the GET response. Without the
+          // user-echo branch, a sibling tab's just-broadcast `message` event
+          // would be wiped when this session fetch resolves with a stale list.
+          var serverCmids = {};
+          (data.messages || []).forEach(function (m) {
+              if (m && m.client_msg_id) serverCmids[m.client_msg_id] = true;
+          });
+          var inflight = (self.messages || []).filter(function (m) {
+              if (!m) return false;
+              if (m.streaming || m.thinking) return true;
+              if (m.role === 'user' && m.client_msg_id && !serverCmids[m.client_msg_id]) {
+                  return true;
+              }
+              return false;
         });
         if (data.messages && data.messages.length) {
           // Defense-in-depth (#935): never render system-role messages in the
@@ -681,7 +691,13 @@ function chatPage() {
               parts.push({type: 'tool', id: 'hist-tp-' + t.id, tool: t});
             });
             var ts = m.timestamp ? Date.parse(m.timestamp) : null;
-            return {id: historyId, role: role, text: text, meta: '', tools: tools, images: images, parts: parts, reasoning: m.reasoning || '', reasoningExpanded: false, ts: ts};
+              return {
+                  id: historyId, role: role, text: text, meta: '',
+                  tools: tools, images: images, parts: parts,
+                  reasoning: m.reasoning || '', reasoningExpanded: false, ts: ts,
+                  client_msg_id: m.client_msg_id || null,
+                  stream_id: m.stream_id || null
+              };
           });
           // Re-append any in-flight bubbles preserved from the prior list so
           // typing-dots / partial streaming content survive the session load.
@@ -753,6 +769,9 @@ function chatPage() {
       OpenFangAPI.wsConnect(agentId, {
         onOpen: function() {
           Alpine.store('app').wsConnected = true;
+            // Replay any prompts the user typed but whose send never reached
+            // the server (tab crash, network blip, daemon restart).
+            self._replayPendingSends(agentId);
         },
         onMessage: function(data) { self.handleWsMessage(data); },
         onClose: function() {
@@ -766,7 +785,82 @@ function chatPage() {
       });
     },
 
-    handleWsMessage(data) {
+      // ── Pending-send queue (durable across tab crashes / reloads) ──
+      //
+      // Mirrors the LibreChat "resilient streams" idea on the *send* side: the
+      // user's prompt is staged in localStorage before the WS frame leaves the
+      // tab so a crash between key-press and server-ack doesn't lose the text.
+      // Confirmation comes via the server's `user_echo` broadcast (matched by
+      // `client_msg_id`) or the HTTP fallback's success response.
+      _pendingSendKey: function (agentId) {
+          return 'openfang-pending-sends-' + agentId;
+      },
+
+      _readPendingSends: function (agentId) {
+          try {
+              var raw = localStorage.getItem(this._pendingSendKey(agentId));
+              if (!raw) return [];
+              var arr = JSON.parse(raw);
+              if (!Array.isArray(arr)) return [];
+              // TTL: drop entries older than 10 minutes — past that the user
+              // probably retyped or the prompt is stale.
+              var cutoff = Date.now() - 10 * 60 * 1000;
+              return arr.filter(function (e) {
+                  return e && e.ts && e.ts >= cutoff;
+              });
+          } catch (e) {
+              return [];
+          }
+      },
+
+      _writePendingSends: function (agentId, arr) {
+          try {
+              if (!arr.length) {
+                  localStorage.removeItem(this._pendingSendKey(agentId));
+              } else {
+                  localStorage.setItem(this._pendingSendKey(agentId), JSON.stringify(arr));
+              }
+          } catch (e) { /* localStorage full or disabled — best effort */
+          }
+      },
+
+      _enqueuePendingSend: function (agentId, entry) {
+          var arr = this._readPendingSends(agentId);
+          arr.push(entry);
+          this._writePendingSends(agentId, arr);
+      },
+
+      _dropPendingSend: function (agentId, clientMsgId) {
+          if (!agentId || !clientMsgId) return;
+          var arr = this._readPendingSends(agentId);
+          var next = arr.filter(function (e) {
+              return e.client_msg_id !== clientMsgId;
+          });
+          if (next.length !== arr.length) this._writePendingSends(agentId, next);
+      },
+
+      _replayPendingSends: function (agentId) {
+          if (!agentId) return;
+          var pending = this._readPendingSends(agentId);
+          if (!pending.length) return;
+          var self = this;
+          pending.forEach(function (entry) {
+              var payload = {
+                  type: 'message',
+                  content: entry.text,
+                  thinking_mode: entry.thinking_mode || 'auto',
+                  client_msg_id: entry.client_msg_id
+              };
+              if (entry.attachments && entry.attachments.length) {
+                  payload.attachments = entry.attachments;
+              }
+              // Try WS first; if it fails, leave the entry in place — onOpen
+              // will fire again on the next reconnect.
+              OpenFangAPI.wsSend(payload);
+          });
+      },
+
+      handleWsMessage(data) {
       switch (data.type) {
         case 'connected': break;
 
@@ -779,6 +873,11 @@ function chatPage() {
               // (set by sendMessage when present); fall back to a recent-text
               // heuristic for cron-injected messages that have no id.
             if (data.source === 'user') {
+                // Server confirmed the prompt landed — drop it from the
+                // pending-send queue so we don't replay it on reconnect.
+                if (data.client_msg_id && this.currentAgent) {
+                    this._dropPendingSend(this.currentAgent.id, data.client_msg_id);
+                }
               var foundDup = false;
                 if (data.client_msg_id) {
                     for (var dj = this.messages.length - 1; dj >= 0; dj--) {
@@ -909,9 +1008,29 @@ function chatPage() {
             return !m.thinking && !m.streaming;
           });
           if (data.completed) {
-            // Stream already finished server-side — replay the terminal
-            // payload through its own handler. This re-enters the switch.
-            this.handleWsMessage(data.completed);
+              // Stream already finished server-side. If the persisted history
+              // (loaded via GET /session) already contains an assistant turn
+              // tagged with this stream_id, skip the replay — re-entering the
+              // `response` handler would push a duplicate bubble.
+              var completedStreamId = (data.completed && data.completed.stream_id) || data.stream_id;
+              var alreadyHaveResponse = false;
+              if (completedStreamId) {
+                  for (var dq = 0; dq < this.messages.length; dq++) {
+                      var dm = this.messages[dq];
+                      if (dm && dm.role === 'agent' && dm.stream_id === completedStreamId) {
+                          alreadyHaveResponse = true;
+                          break;
+                      }
+                  }
+              }
+              if (!alreadyHaveResponse) {
+                  // Replay the terminal payload through its own handler. This
+                  // re-enters the switch.
+                  this.handleWsMessage(data.completed);
+              } else {
+                  this.sending = false;
+                  this._clearTypingTimeout();
+              }
           } else {
             // Stream still in-flight on reconnect: revive the "Generating…"
             // badge + typing icon, both gated by `sending`.
@@ -1214,7 +1333,8 @@ function chatPage() {
                 parts: finalParts,
                 reasoning: streamedReasoning,
                 reasoningExpanded: false,
-                ts: Date.now()
+                ts: Date.now(),
+                stream_id: data.stream_id || null
             });
           this.sending = false;
           this.tokenCount = 0;
@@ -1434,6 +1554,29 @@ function chatPage() {
             ? 'cm-' + crypto.randomUUID()
             : 'cm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
 
+        // Stage the prompt in localStorage BEFORE clearing the input or
+        // attempting to send. If the tab crashes between here and the WS
+        // ack, the next page load (or the next successful reconnect) will
+        // replay this entry. Removed by the user_echo dedupe handler or by
+        // the HTTP fallback's success branch.
+        if (this.currentAgent) {
+            this._enqueuePendingSend(this.currentAgent.id, {
+                client_msg_id: clientMsgId,
+                text: finalText,
+                attachments: uploadedFiles && uploadedFiles.length
+                    ? uploadedFiles.map(function (f) {
+                        return {
+                            file_id: f.file_id,
+                            filename: f.filename,
+                            content_type: f.content_type
+                        };
+                    })
+                    : [],
+                thinking_mode: this.thinkingMode,
+                ts: Date.now()
+            });
+        }
+
         // Always show user message immediately
         this.messages.push({
             id: ++msgId,
@@ -1488,7 +1631,13 @@ function chatPage() {
       try {
         var httpBody = { message: finalText, thinking_mode: this.thinkingMode };
         if (uploadedFiles && uploadedFiles.length) httpBody.attachments = uploadedFiles;
+          if (clientMsgId) httpBody.client_msg_id = clientMsgId;
         var res = await OpenFangAPI.post('/api/agents/' + this.currentAgent.id + '/message', httpBody);
+          // HTTP confirmed the prompt landed (and the response is in hand) —
+          // drop the pending-send entry.
+          if (clientMsgId && this.currentAgent) {
+              this._dropPendingSend(this.currentAgent.id, clientMsgId);
+          }
         this.messages = this.messages.filter(function(m) { return !m.thinking; });
         var httpMeta = (res.input_tokens || 0) + ' in / ' + (res.output_tokens || 0) + ' out';
         if (res.cost_usd != null) httpMeta += ' | $' + res.cost_usd.toFixed(4);

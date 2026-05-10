@@ -50,6 +50,16 @@ pub struct MessageMetadata {
     /// API-level message ID (for streaming chunk grouping / API round detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_message_id: Option<String>,
+    /// Client-supplied UUID stamped on user turns persisted from the WS/HTTP
+    /// frontend. Lets the browser dedupe its own server-echoed messages and
+    /// preserve in-flight bubbles across `loadSession` races.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
+    /// Server-side stream id stamped on the assistant turn so the WebSocket
+    /// snapshot replay can dedupe a `completed` payload against a freshly-
+    /// loaded persisted history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
 }
 
 impl MessageMetadata {
@@ -61,6 +71,8 @@ impl MessageMetadata {
             && !self.is_meta
             && self.compact_metadata.is_none()
             && self.api_message_id.is_none()
+            && self.client_msg_id.is_none()
+            && self.stream_id.is_none()
     }
 }
 

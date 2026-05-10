@@ -332,7 +332,7 @@ pub struct AgentLoopResult {
 /// When the turn has both text and image blocks the text is emitted as the
 /// first block followed by the images so the LLM sees the full multimodal
 /// turn. When only one is present the single-mode representation is used.
-fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>) -> Message {
+pub fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>) -> Message {
     match blocks {
         Some(blocks) if !blocks.is_empty() => {
             if user_message.trim().is_empty() {
@@ -382,6 +382,7 @@ pub async fn run_agent_loop(
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
     thinking_override: Option<openfang_types::config::ThinkingConfig>,
+    already_persisted: bool,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -469,46 +470,65 @@ pub async fn run_agent_loop(
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
-    session
-        .messages
-        .push(build_user_turn_message(user_message, user_content_blocks));
+    // If `already_persisted` is true, the caller (web frontend) already pushed
+    // and saved the user turn synchronously via `kernel.persist_user_message`,
+    // and the `session` was loaded from disk with that turn at the tail; do
+    // not push again, but rebuild the LLM-facing copy with the original image
+    // data (the persisted copy was image-stripped to avoid base64 bloat).
+    let llm_messages: Vec<Message> = if already_persisted {
+        let mut msgs: Vec<Message> = session
+            .messages
+            .iter()
+            .take(session.messages.len().saturating_sub(1))
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        msgs.push(build_user_turn_message(user_message, user_content_blocks));
+        msgs
+    } else {
+        session
+            .messages
+            .push(build_user_turn_message(user_message, user_content_blocks));
 
-    // Build the messages for the LLM, filtering system messages
-    // System prompt goes into the separate `system` field.
-    // NOTE: We build llm_messages BEFORE stripping images so the LLM
-    // sees the full image data for the current turn.
-    let llm_messages: Vec<Message> = session
-        .messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .cloned()
-        .collect();
+        // Build the messages for the LLM, filtering system messages
+        // System prompt goes into the separate `system` field.
+        // NOTE: We build llm_messages BEFORE stripping images so the LLM
+        // sees the full image data for the current turn.
+        let llm_messages: Vec<Message> = session
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
 
-    // Strip Image blocks from session to prevent base64 bloat.
-    // The LLM already received them via llm_messages above.
-    for msg in session.messages.iter_mut() {
-        if let MessageContent::Blocks(blocks) = &mut msg.content {
-            let had_images = blocks
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Image { .. }));
-            if had_images {
-                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
-                if blocks.is_empty() {
-                    blocks.push(ContentBlock::Text {
-                        text: "[Image processed]".to_string(),
-                        provider_metadata: None,
-                    });
+        // Strip Image blocks from session to prevent base64 bloat.
+        // The LLM already received them via llm_messages above.
+        for msg in session.messages.iter_mut() {
+            if let MessageContent::Blocks(blocks) = &mut msg.content {
+                let had_images = blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                if had_images {
+                    blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+                    if blocks.is_empty() {
+                        blocks.push(ContentBlock::Text {
+                            text: "[Image processed]".to_string(),
+                            provider_metadata: None,
+                        });
+                    }
                 }
             }
         }
-    }
 
-    // Pre-save the session with the user message so it persists even if the
-    // LLM call fails (provider error, quota exceeded, etc.). Without this,
-    // refreshing the page after an error would lose the user's message.
-    if let Err(e) = memory.save_session_async(session).await {
-        warn!(agent = %manifest.name, "Failed to pre-save user message: {e}");
-    }
+        // Pre-save the session with the user message so it persists even if the
+        // LLM call fails (provider error, quota exceeded, etc.). Without this,
+        // refreshing the page after an error would lose the user's message.
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!(agent = %manifest.name, "Failed to pre-save user message: {e}");
+        }
+
+        llm_messages
+    };
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
@@ -1709,6 +1729,7 @@ pub async fn run_agent_loop_streaming(
     user_content_blocks: Option<Vec<ContentBlock>>,
     sender_role: Option<openfang_types::sender::SenderRole>,
     thinking_override: Option<openfang_types::config::ThinkingConfig>,
+    already_persisted: bool,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1796,42 +1817,60 @@ pub async fn run_agent_loop_streaming(
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
-    session
-        .messages
-        .push(build_user_turn_message(user_message, user_content_blocks));
+    // If `already_persisted` is true, the WS/HTTP frontend already pushed +
+    // saved the user turn synchronously via `kernel.persist_user_message`;
+    // skip the duplicate push and pre-save but rebuild the LLM-facing copy
+    // with the original (un-stripped) image blocks for this turn.
+    let llm_messages: Vec<Message> = if already_persisted {
+        let mut msgs: Vec<Message> = session
+            .messages
+            .iter()
+            .take(session.messages.len().saturating_sub(1))
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        msgs.push(build_user_turn_message(user_message, user_content_blocks));
+        msgs
+    } else {
+        session
+            .messages
+            .push(build_user_turn_message(user_message, user_content_blocks));
 
-    let llm_messages: Vec<Message> = session
-        .messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .cloned()
-        .collect();
+        let llm_messages: Vec<Message> = session
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
 
-    // Strip Image blocks from session to prevent base64 bloat.
-    // The LLM already received them via llm_messages above.
-    for msg in session.messages.iter_mut() {
-        if let MessageContent::Blocks(blocks) = &mut msg.content {
-            let had_images = blocks
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Image { .. }));
-            if had_images {
-                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
-                if blocks.is_empty() {
-                    blocks.push(ContentBlock::Text {
-                        text: "[Image processed]".to_string(),
-                        provider_metadata: None,
-                    });
+        // Strip Image blocks from session to prevent base64 bloat.
+        // The LLM already received them via llm_messages above.
+        for msg in session.messages.iter_mut() {
+            if let MessageContent::Blocks(blocks) = &mut msg.content {
+                let had_images = blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                if had_images {
+                    blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+                    if blocks.is_empty() {
+                        blocks.push(ContentBlock::Text {
+                            text: "[Image processed]".to_string(),
+                            provider_metadata: None,
+                        });
+                    }
                 }
             }
         }
-    }
 
-    // Pre-save the session with the user message so it persists even if the
-    // LLM call fails (provider error, quota exceeded, etc.). Without this,
-    // refreshing the page after an error would lose the user's message.
-    if let Err(e) = memory.save_session_async(session).await {
-        warn!(agent = %manifest.name, "Failed to pre-save user message (streaming): {e}");
-    }
+        // Pre-save the session with the user message so it persists even if the
+        // LLM call fails (provider error, quota exceeded, etc.). Without this,
+        // refreshing the page after an error would lose the user's message.
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!(agent = %manifest.name, "Failed to pre-save user message (streaming): {e}");
+        }
+
+        llm_messages
+    };
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
@@ -4014,6 +4053,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should complete without error");
@@ -4071,6 +4111,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should complete without error");
@@ -4130,6 +4171,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should complete without error");
@@ -4187,6 +4229,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should complete without error");
@@ -4237,6 +4280,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4365,6 +4409,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should recover via retry");
@@ -4416,6 +4461,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4475,6 +4521,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -5455,6 +5502,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Agent loop should complete");
@@ -5529,6 +5577,7 @@ mod tests {
             None,
             None,
             None,
+            false, // already_persisted
         )
         .await
         .expect("Agent loop should recover nested XML tool calls");
@@ -5605,6 +5654,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Normal loop should complete");
@@ -5672,6 +5722,7 @@ mod tests {
             None, // user_content_blocks
             None, // sender_role
             None, // thinking_override
+            false, // already_persisted
         )
         .await
         .expect("Streaming loop should complete");

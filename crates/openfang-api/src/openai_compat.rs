@@ -407,6 +407,7 @@ async fn stream_response(
             None,
             None,
             thinking_override,
+            false, // already_persisted: openai-compat caller doesn't pre-save
         )
         .map_err(|e| format!("Streaming setup failed: {e}"))?;
 

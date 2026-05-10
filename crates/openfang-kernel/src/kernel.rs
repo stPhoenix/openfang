@@ -1958,6 +1958,7 @@ impl OpenFangKernel {
             sender.map(|s| s.display_name.clone()),
             sender.and_then(|s| s.role),
             None,
+            false,
         )
         .await
     }
@@ -1986,6 +1987,7 @@ impl OpenFangKernel {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -2009,6 +2011,7 @@ impl OpenFangKernel {
             sender_name,
             sender_role,
             None,
+            false,
         )
             .await
     }
@@ -2039,6 +2042,7 @@ impl OpenFangKernel {
             None,
             None,
             Some(session_id),
+            false,
         )
         .await
     }
@@ -2063,6 +2067,7 @@ impl OpenFangKernel {
         sender_name: Option<String>,
         sender_role: Option<openfang_types::sender::SenderRole>,
         session_id_override: Option<openfang_types::agent::SessionId>,
+        already_persisted: bool,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -2120,6 +2125,7 @@ impl OpenFangKernel {
                 sender_name,
                 sender_role,
                 session_id_override,
+                already_persisted,
             )
             .await
         };
@@ -2181,6 +2187,7 @@ impl OpenFangKernel {
         sender_role: Option<openfang_types::sender::SenderRole>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         thinking_override: Option<openfang_types::config::ThinkingConfig>,
+        already_persisted: bool,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -2598,6 +2605,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_role,
                 thinking_override,
+                already_persisted,
             )
             .await;
 
@@ -2695,6 +2703,76 @@ impl OpenFangKernel {
         self.running_tasks.insert(agent_id, handle.abort_handle());
 
         Ok((rx, handle))
+    }
+
+    /// Synchronously persist a user message to the agent's session before
+    /// dispatching to the agent loop. Stamps `client_msg_id` (browser-supplied
+    /// dedupe id) into the message metadata. Used by the WS handler and the
+    /// HTTP `/message` endpoints so a page reload during the LLM call always
+    /// shows the user's prompt — without this, the pre-save inside the spawned
+    /// agent-loop task races the GET `/session` response.
+    ///
+    /// Image content blocks are stripped from the persisted copy to avoid
+    /// base64 bloat in the SQLite session blob; the LLM still receives the
+    /// full image data through `send_message_streaming` /
+    /// `send_message_with_handle_and_blocks` because callers pass the blocks
+    /// separately and the agent loop reattaches them when
+    /// `already_persisted=true`.
+    pub async fn persist_user_message(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        client_msg_id: Option<String>,
+    ) -> KernelResult<openfang_types::agent::SessionId> {
+        use openfang_types::message::{ContentBlock, MessageContent};
+
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let session_id = entry.session_id;
+
+        let mut session = self
+            .memory
+            .get_session(session_id)
+            .map_err(KernelError::OpenFang)?
+            .unwrap_or_else(|| openfang_memory::session::Session {
+                id: session_id,
+                agent_id,
+                messages: Vec::new(),
+                context_window_tokens: 0,
+                label: None,
+            });
+
+        let mut user_turn =
+            openfang_runtime::agent_loop::build_user_turn_message(message, content_blocks);
+        if let Some(cid) = client_msg_id {
+            user_turn.metadata.client_msg_id = Some(cid);
+        }
+        // Strip image blocks from the persisted turn — same policy as the
+        // agent loop's pre-save (avoid 200KB+ base64 in the SQLite blob).
+        if let MessageContent::Blocks(blocks) = &mut user_turn.content {
+            let had_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            if had_images {
+                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+                if blocks.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: "[Image processed]".to_string(),
+                        provider_metadata: None,
+                    });
+                }
+            }
+        }
+        session.messages.push(user_turn);
+
+        self.memory
+            .save_session_async(&session)
+            .await
+            .map_err(KernelError::OpenFang)?;
+
+        Ok(session_id)
     }
 
     // -----------------------------------------------------------------------
@@ -2846,6 +2924,7 @@ impl OpenFangKernel {
 
     /// Execute the default LLM-based agent loop.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn execute_llm_agent(
         &self,
         entry: &AgentEntry,
@@ -2857,6 +2936,7 @@ impl OpenFangKernel {
         sender_name: Option<String>,
         sender_role: Option<openfang_types::sender::SenderRole>,
         session_id_override: Option<openfang_types::agent::SessionId>,
+        already_persisted: bool,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -3207,6 +3287,7 @@ impl OpenFangKernel {
             content_blocks,
             sender_role,
             self.config.thinking.clone(),
+            already_persisted,
         )
         .await
         .map_err(KernelError::OpenFang)?;

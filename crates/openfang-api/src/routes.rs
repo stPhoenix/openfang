@@ -402,6 +402,22 @@ pub async fn send_message(
     };
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+
+    // Persist the user turn synchronously so a page reload during the LLM
+    // call still finds it in GET /session. Mirrors the WS handler.
+    if let Err(e) = state
+        .kernel
+        .persist_user_message(
+            agent_id,
+            &req.message,
+            content_blocks.clone(),
+            req.client_msg_id.clone(),
+        )
+        .await
+    {
+        tracing::warn!(agent_id = %id, "Pre-save user message failed: {e}");
+    }
+
     match state
         .kernel
         .send_message_with_handle_and_blocks(
@@ -413,6 +429,7 @@ pub async fn send_message(
             req.sender_name,
             None, // sender_role: API callers don't have RBAC role yet
             None, // session_id_override: HTTP /agents/:id/message uses agent default session
+            true, // already_persisted
         )
         .await
     {
@@ -629,6 +646,12 @@ pub async fn get_agent_session(
                 }
                 if !reasoning_text.is_empty() {
                     msg["reasoning"] = serde_json::Value::String(reasoning_text);
+                }
+                if let Some(ref cid) = m.metadata.client_msg_id {
+                    msg["client_msg_id"] = serde_json::Value::String(cid.clone());
+                }
+                if let Some(ref sid) = m.metadata.stream_id {
+                    msg["stream_id"] = serde_json::Value::String(sid.clone());
                 }
                 built_messages.push(msg);
             }
@@ -1551,6 +1574,16 @@ pub async fn send_message_stream(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+
+    // Pre-save the user turn so reload-during-stream still finds the prompt.
+    if let Err(e) = state
+        .kernel
+        .persist_user_message(agent_id, &req.message, None, req.client_msg_id.clone())
+        .await
+    {
+        tracing::warn!(agent_id = %id, "Pre-save user message (SSE) failed: {e}");
+    }
+
     let (rx, _handle) = match state.kernel.send_message_streaming(
         agent_id,
         &req.message,
@@ -1560,6 +1593,7 @@ pub async fn send_message_stream(
         None, // sender_role: API callers don't have RBAC role yet
         None, // SSE streaming doesn't support image attachments yet
         None, // thinking_override: server-side default applies
+        true, // already_persisted
     ) {
         Ok(pair) => pair,
         Err(e) => {
