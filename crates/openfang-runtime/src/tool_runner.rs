@@ -794,6 +794,8 @@ pub async fn execute_tool(
         }
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
+        "agent_template_list" => tool_agent_template_list(kernel),
+        "agent_template_spawn" => tool_agent_template_spawn(input, kernel).await,
         "agent_kill" => tool_agent_kill(input, kernel),
         "agent_delegate" => tool_agent_delegate(input, kernel, caller_agent_id).await,
         "agent_delegate_async" => tool_agent_delegate_async(input, kernel, caller_agent_id).await,
@@ -1010,7 +1012,7 @@ pub async fn execute_tool(
 
         // Hand tools (curated autonomous capability packages)
         "hand_list" => tool_hand_list(kernel).await,
-        "hand_activate" => tool_hand_activate(input, kernel).await,
+        "hand_activate" => tool_hand_activate(input, kernel, caller_agent_id).await,
         "hand_status" => tool_hand_status(input, kernel).await,
         "hand_deactivate" => tool_hand_deactivate(input, kernel).await,
 
@@ -1295,13 +1297,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Inter-agent tools ---
         ToolDefinition {
             name: "agent_send".to_string(),
-            description: "Send a message to another agent and receive their response. Accepts UUID or agent name. Use agent_find first to discover agents.".to_string(),
+            description: "Send a message to another agent and receive their response. Accepts UUID or agent name. Each call lands on a fresh session by default — pack any required context into `message`. Use agent_find first to discover agents.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
                     "message": { "type": "string", "description": "The message to send to the agent" },
-                    "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for response (optional, default: no timeout)" }
+                    "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for response (optional, default: no timeout)" },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session routing. Omit (or pass \"new\") for a fresh isolated session — orchestrators should leave this blank so independent subtasks don't share history. Pass an existing session UUID to continue a multi-turn conversation. Pass \"default\" to reuse the agent's registered default session (channel-style)."
+                    }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -1326,6 +1332,38 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "agent_template_list".to_string(),
+            description: "List installed agent templates (~/.openfang/agents/<name>/agent.toml). \
+                          Templates are dormant blueprints — distinct from running agents \
+                          (`agent_list`) and from hands (`hand_list`). Spawn one with \
+                          `agent_template_spawn`.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "agent_template_spawn".to_string(),
+            description: "Spawn a new agent from an installed template by name. Returns the \
+                          new agent's ID and (instance) name; follow with `agent_send` to \
+                          dispatch a task. Multiple instances of the same template can \
+                          coexist by passing a unique `instance_name`.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "template_name": {
+                        "type": "string",
+                        "description": "The template directory name (e.g. 'researcher', 'coder', 'code-reviewer'). Use `agent_template_list` to discover."
+                    },
+                    "instance_name": {
+                        "type": "string",
+                        "description": "Optional name for the spawned agent. If omitted, a short UUID suffix is appended to the template's declared name."
+                    }
+                },
+                "required": ["template_name"]
             }),
         },
         ToolDefinition {
@@ -2425,12 +2463,16 @@ async fn tool_agent_send(
     }
 
     let timeout_secs = input.get("timeout_seconds").and_then(|v| v.as_u64());
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
 
     let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
             match timeout_secs {
-                Some(secs) => kh.send_to_agent_with_timeout(agent_id, message, secs).await,
-                None => kh.send_to_agent(agent_id, message).await,
+                Some(secs) => {
+                    kh.send_to_agent_with_timeout(agent_id, message, secs, session_id)
+                        .await
+                }
+                None => kh.send_to_agent(agent_id, message, session_id).await,
             }
         })
         .await;
@@ -2470,6 +2512,42 @@ fn tool_agent_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, Str
         ));
     }
     Ok(output)
+}
+
+fn tool_agent_template_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let templates = kh.list_agent_templates();
+    if templates.is_empty() {
+        return Ok("No agent templates installed.".to_string());
+    }
+    let mut output = format!(
+        "Available agent templates ({}). Spawn one with `agent_template_spawn`:\n",
+        templates.len()
+    );
+    for t in &templates {
+        output.push_str(&format!(
+            "  - {} [{}]: {}\n",
+            t.name, t.category, t.description
+        ));
+    }
+    Ok(output)
+}
+
+async fn tool_agent_template_spawn(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let template_name = input["template_name"]
+        .as_str()
+        .ok_or("Missing 'template_name' parameter")?;
+    let instance_name = input["instance_name"].as_str();
+    let (id, name) = kh
+        .spawn_agent_from_template(template_name, instance_name)
+        .await?;
+    Ok(format!(
+        "Agent spawned from template '{template_name}'.\n  ID: {id}\n  Name: {name}"
+    ))
 }
 
 fn tool_agent_kill(
@@ -3503,6 +3581,12 @@ async fn tool_hand_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String
         if let Some(iid) = h["instance_id"].as_str() {
             lines.push(format!("  Instance: {}", iid));
         }
+        if let Some(aid) = h["agent_id"].as_str() {
+            lines.push(format!(
+                "  Agent ID: {} (use this id with agent_send, NOT the hand id)",
+                aid
+            ));
+        }
         lines.push(String::new());
     }
 
@@ -3512,6 +3596,7 @@ async fn tool_hand_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String
 async fn tool_hand_activate(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let hand_id = input["hand_id"]
@@ -3524,15 +3609,16 @@ async fn tool_hand_activate(
             std::collections::HashMap::new()
         };
 
-    let result = kh.hand_activate(hand_id, config).await?;
+    let result = kh.hand_activate(hand_id, config, caller_agent_id).await?;
 
     let instance_id = result["instance_id"].as_str().unwrap_or("?");
     let agent_name = result["agent_name"].as_str().unwrap_or("?");
+    let agent_id = result["agent_id"].as_str().unwrap_or("?");
     let status = result["status"].as_str().unwrap_or("?");
 
     Ok(format!(
-        "Hand '{}' activated!\n  Instance: {}\n  Agent: {} ({})",
-        hand_id, instance_id, agent_name, status
+        "Hand '{}' activated!\n  Instance: {}\n  Agent: {} ({})\n  Agent ID: {} (use this id with agent_send, NOT the hand id '{}')",
+        hand_id, instance_id, agent_name, status, agent_id, hand_id
     ))
 }
 
@@ -3552,11 +3638,12 @@ async fn tool_hand_status(
     let status = result["status"].as_str().unwrap_or("unknown");
     let instance_id = result["instance_id"].as_str().unwrap_or("?");
     let agent_name = result["agent_name"].as_str().unwrap_or("?");
+    let agent_id = result["agent_id"].as_str().unwrap_or("?");
     let activated = result["activated_at"].as_str().unwrap_or("?");
 
     Ok(format!(
-        "{} {} — {}\n  Instance: {}\n  Agent: {}\n  Activated: {}",
-        icon, name, status, instance_id, agent_name, activated
+        "{} {} — {}\n  Instance: {}\n  Agent: {}\n  Agent ID: {} (use this id with agent_send, NOT the hand id '{}')\n  Activated: {}",
+        icon, name, status, instance_id, agent_name, agent_id, hand_id, activated
     ))
 }
 
@@ -5588,7 +5675,12 @@ mod tests {
         ) -> Result<(String, String), String> {
             Err("not used".into())
         }
-        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+        async fn send_to_agent(
+            &self,
+            _agent_id: &str,
+            _message: &str,
+            _session_id: Option<&str>,
+        ) -> Result<String, String> {
             Err("not used".into())
         }
         fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {

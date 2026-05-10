@@ -53,9 +53,18 @@ The system prompt's Phase 2 fast-path table is authoritative for keyword routing
 - `medium` — one weak match (e.g. URL with no verb). Run slow path to confirm.
 - `low` — no pattern matched. Run slow path.
 
-**Slow-path budget**: classifier subagent uses `tools = []` and inherits this hand's provider/model (no separate classifier model — set `provider = "default"`, `model = "default"` in the child manifest). Max 1 call per task, timeout 120s. If it fails twice, fall back to the fast-path's best guess. Never re-classify a task once Phase 2 produced an output — it causes drift.
+**Slow-path budget**: classifier subagent has discovery-only tools (`agent_list`, `hand_list`, `agent_template_list`)
+and inherits this hand's provider/model (no separate classifier model — set `provider = "default"`, `model = "default"`
+in the child manifest). The classifier reasons step-by-step about complexity and picks the target specialist itself,
+returning `selected_resource = {kind, id, rationale}` alongside the classification fields. Max 1 call per task, timeout
+180s. If it fails twice, fall back to the fast-path's best guess and demiurg's own heuristic in Phase 4. Never
+re-classify a task once Phase 2 produced an output — it causes drift.
 
 ## 3. Resource selection priority
+
+If the slow-path classifier ran (Phase 2) and emitted `selected_resource`, trust it for the primary subtask — the
+classifier already enumerated live agents, hands, and templates. Apply the heuristic below only for secondary subtasks
+not covered by the classifier, OR when the classifier failed and the fast path is the source of truth.
 
 Apply this order **per subtask** (not per task):
 

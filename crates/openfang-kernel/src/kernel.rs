@@ -123,6 +123,9 @@ pub struct OpenFangKernel {
     >,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// AbortHandles for in-flight A2A tasks, keyed by A2A task id.
+    /// Populated by `a2a_send_task`; aborted by `a2a_cancel_task`.
+    pub a2a_task_handles: dashmap::DashMap<String, tokio::task::AbortHandle>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1263,6 +1266,7 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
+            a2a_task_handles: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
@@ -1841,6 +1845,58 @@ impl OpenFangKernel {
     /// Automatically upgrades the kernel handle from `self_handle` so that
     /// agent turns triggered by cron, channels, events, or inter-agent calls
     /// have full access to kernel tools (cron_create, agent_send, etc.).
+    /// Resolve an agent identifier (UUID or name) to a registry AgentId.
+    pub fn resolve_agent_id(&self, agent_id: &str) -> Result<AgentId, String> {
+        match agent_id.parse() {
+            Ok(id) => Ok(id),
+            Err(_) => self
+                .registry
+                .find_by_name(agent_id)
+                .map(|e| e.id)
+                .ok_or_else(|| format!("Agent not found: {agent_id}")),
+        }
+    }
+
+    /// Resolve the session id for an inter-agent send.
+    ///
+    /// - `None` or `Some("new")` → allocate a fresh session on the target
+    ///   so each `agent_send` is isolated. This is the default for
+    ///   orchestrator dispatch (demiurg etc.) and prevents cross-task
+    ///   history bleed.
+    /// - `Some("default")` → reuse the target agent's registered default
+    ///   session (`entry.session_id`). Used by channel auto-reply paths
+    ///   where the agent should keep one continuous conversation per
+    ///   channel.
+    /// - `Some(uuid)` → route into that specific existing session,
+    ///   enabling explicit multi-turn flows.
+    pub fn resolve_session_for_send(
+        &self,
+        agent_id: AgentId,
+        requested: Option<&str>,
+    ) -> Result<openfang_types::agent::SessionId, String> {
+        match requested {
+            Some(s) if s.eq_ignore_ascii_case("default") => self
+                .registry
+                .get(agent_id)
+                .map(|e| e.session_id)
+                .ok_or_else(|| format!("Agent not found: {agent_id}")),
+            Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("new") => {
+                let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
+                    format!(
+                        "Invalid session_id '{s}': {e}. Pass a UUID, omit the field, \
+                         or pass \"new\" / \"default\" for sentinel routing."
+                    )
+                })?;
+                Ok(openfang_types::agent::SessionId(uuid))
+            }
+            _ => self
+                .memory
+                .create_session(agent_id)
+                .map(|s| s.id)
+                .map_err(|e| format!("Failed to create fresh session for agent_send: {e}")),
+        }
+    }
+
     pub async fn send_message(
         &self,
         agent_id: AgentId,
@@ -1901,6 +1957,7 @@ impl OpenFangKernel {
             sender.map(|s| s.platform_id.clone()),
             sender.map(|s| s.display_name.clone()),
             sender.and_then(|s| s.role),
+            None,
         )
         .await
     }
@@ -1928,6 +1985,7 @@ impl OpenFangKernel {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1950,6 +2008,37 @@ impl OpenFangKernel {
             sender_id,
             sender_name,
             sender_role,
+            None,
+        )
+            .await
+    }
+
+    /// Send a message routed onto a caller-supplied session id (overrides the
+    /// agent's default `entry.session_id`).
+    ///
+    /// Used by the A2A entry point so each incoming task is processed in its
+    /// own session — preventing cross-task history bleed when multiple A2A
+    /// clients hit the same agent (e.g. demiurg).
+    pub async fn send_message_with_session(
+        &self,
+        agent_id: AgentId,
+        session_id: openfang_types::agent::SessionId,
+        message: &str,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            None,
+            None,
+            None,
+            None,
+            Some(session_id),
         )
         .await
     }
@@ -1973,6 +2062,7 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         sender_role: Option<openfang_types::sender::SenderRole>,
+        session_id_override: Option<openfang_types::agent::SessionId>,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -2029,6 +2119,7 @@ impl OpenFangKernel {
                 sender_id,
                 sender_name,
                 sender_role,
+                session_id_override,
             )
             .await
         };
@@ -2765,18 +2856,24 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         sender_role: Option<openfang_types::sender::SenderRole>,
+        session_id_override: Option<openfang_types::agent::SessionId>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
+        // Per-call session override (e.g. A2A task isolation) takes precedence
+        // over the agent's default `entry.session_id`. memory.save_session keys
+        // by id, so a fresh override creates a new session row on first save.
+        let session_id_used = session_id_override.unwrap_or(entry.session_id);
+
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(session_id_used)
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: session_id_used,
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -4013,6 +4110,7 @@ impl OpenFangKernel {
     // ─── Hand lifecycle ─────────────────────────────────────────────────────
 
     /// Activate a hand: check requirements, create instance, spawn agent.
+    #[allow(clippy::too_many_arguments)]
     pub fn activate_hand(
         &self,
         hand_id: &str,
@@ -4021,6 +4119,7 @@ impl OpenFangKernel {
         model_override: Option<String>,
         instance_id_override: Option<uuid::Uuid>,
         instance_name: Option<String>,
+        caller: Option<AgentId>,
     ) -> KernelResult<openfang_hands::HandInstance> {
         let provider_override = provider_override.filter(|s| !s.is_empty());
         let model_override = model_override.filter(|s| !s.is_empty());
@@ -4038,7 +4137,7 @@ impl OpenFangKernel {
         // Create the instance in the registry
         let instance = self
             .hand_registry
-            .activate(hand_id, config, instance_id_override, instance_name.clone())
+            .activate(hand_id, config.clone(), instance_id_override, instance_name.clone())
             .map_err(|e| match e {
                 openfang_hands::HandError::AlreadyActive(id) => KernelError::OpenFang(OpenFangError::Internal(
                     format!("Hand already active: {id}"),
@@ -4047,21 +4146,46 @@ impl OpenFangKernel {
             })?;
 
         // Build an agent manifest from the hand definition.
-        // If the hand declares provider/model as "default", inherit the kernel's configured LLM.
-        let hand_provider = if let Some(ref p) = provider_override {
-            p.clone()
-        } else if def.agent.provider == "default" {
-            self.config.default_model.provider.clone()
-        } else {
-            def.agent.provider.clone()
+        // Precedence: explicit override arg > HAND `[[settings]]` value (from `config`,
+        //   else the setting's declared `default`) > `[agent]` field > daemon default.
+        // The literal "default" at any tier is treated as fallthrough so users can
+        // intentionally defer to the daemon.
+        let lookup_setting = |key: &str| -> Option<String> {
+            config
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    def.settings
+                        .iter()
+                        .find(|s| s.key == key)
+                        .map(|s| s.default.clone())
+                })
         };
-        let hand_model = if let Some(ref m) = model_override {
-            m.clone()
-        } else if def.agent.model == "default" {
-            self.config.default_model.model.clone()
-        } else {
-            def.agent.model.clone()
-        };
+        let setting_provider = lookup_setting("provider");
+        let setting_model = lookup_setting("model");
+
+        // Leave the manifest as the literal "default" sentinel when neither
+        // an explicit override, hand setting, nor [agent] entry resolves to
+        // a concrete model. spawn_agent_with_parent then performs the final
+        // resolution: if a caller agent is set and its model is concrete,
+        // the spawned hand inherits the caller's provider/model
+        // (parent-overlay at the top of spawn_agent_with_parent); otherwise
+        // it falls back to the daemon default. This is what makes
+        // demiurg-activated hands run on demiurg's configured model rather
+        // than the daemon's.
+        let hand_provider = provider_override
+            .clone()
+            .or_else(|| setting_provider.filter(|s| !s.is_empty() && s != "default"))
+            .or_else(|| {
+                Some(def.agent.provider.clone()).filter(|s| !s.is_empty() && s != "default")
+            })
+            .unwrap_or_else(|| String::from("default"));
+        let hand_model = model_override
+            .clone()
+            .or_else(|| setting_model.filter(|s| !s.is_empty() && s != "default"))
+            .or_else(|| Some(def.agent.model.clone()).filter(|s| !s.is_empty() && s != "default"))
+            .unwrap_or_else(|| String::from("default"));
 
         // When a custom instance_name is provided, use it as the agent name so multiple
         // instances of the same hand type can coexist. Falls back to "{hand_name}-{suffix}"
@@ -4210,7 +4334,9 @@ impl OpenFangKernel {
 
         // Spawn the agent with a fixed ID based on hand_id + instance_id for
         // stable identity across restarts while allowing multiple instances.
-        let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_agent_id))?;
+        // `caller` propagates parent-overlay so hands inherit the activator's
+        // resolved provider/model when the manifest is "default".
+        let agent_id = self.spawn_agent_with_parent(manifest, caller, Some(fixed_agent_id))?;
 
         // Re-insert the prior session blob (kill_agent cascade-deleted it) and
         // re-point the registry at it. Without this the conversation history
@@ -4728,7 +4854,7 @@ impl OpenFangKernel {
                     }
                     _ => (None, None),
                 };
-                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, saved_instance_name) {
+                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, saved_instance_name, None) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart
@@ -7798,8 +7924,13 @@ impl KernelHandle for ScopedKernelHandle {
         self.inner.spawn_agent(manifest_toml, parent_id).await
     }
 
-    async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String> {
-        self.inner.send_to_agent(agent_id, message).await
+    async fn send_to_agent(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner.send_to_agent(agent_id, message, session_id).await
     }
 
     async fn send_to_agent_with_timeout(
@@ -7807,9 +7938,10 @@ impl KernelHandle for ScopedKernelHandle {
         agent_id: &str,
         message: &str,
         timeout_secs: u64,
+        session_id: Option<&str>,
     ) -> Result<String, String> {
         self.inner
-            .send_to_agent_with_timeout(agent_id, message, timeout_secs)
+            .send_to_agent_with_timeout(agent_id, message, timeout_secs, session_id)
             .await
     }
 
@@ -7942,8 +8074,11 @@ impl KernelHandle for ScopedKernelHandle {
         &self,
         hand_id: &str,
         config: std::collections::HashMap<String, serde_json::Value>,
+        caller_agent_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        self.inner.hand_activate(hand_id, config).await
+        self.inner
+            .hand_activate(hand_id, config, caller_agent_id)
+            .await
     }
 
     async fn hand_status(&self, hand_id: &str) -> Result<serde_json::Value, String> {
@@ -8055,6 +8190,20 @@ impl KernelHandle for ScopedKernelHandle {
         timeout_secs: u64,
     ) -> Result<(Vec<serde_json::Value>, bool), String> {
         self.inner.await_delegations(ids, timeout_secs).await
+    }
+
+    fn list_agent_templates(&self) -> Vec<kernel_handle::AgentTemplateInfo> {
+        self.inner.list_agent_templates()
+    }
+
+    async fn spawn_agent_from_template(
+        &self,
+        template_name: &str,
+        instance_name: Option<&str>,
+    ) -> Result<(String, String), String> {
+        self.inner
+            .spawn_agent_from_template(template_name, instance_name)
+            .await
     }
 }
 
@@ -8279,18 +8428,16 @@ impl KernelHandle for OpenFangKernel {
         Ok((id.to_string(), name))
     }
 
-    async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String> {
-        // Try UUID first, then fall back to name lookup
-        let id: AgentId = match agent_id.parse() {
-            Ok(id) => id,
-            Err(_) => self
-                .registry
-                .find_by_name(agent_id)
-                .map(|e| e.id)
-                .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
-        };
+    async fn send_to_agent(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        let id: AgentId = self.resolve_agent_id(agent_id)?;
+        let session = self.resolve_session_for_send(id, session_id)?;
         let result = self
-            .send_message(id, message)
+            .send_message_with_session(id, session, message)
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
         Ok(result.response)
@@ -8301,18 +8448,13 @@ impl KernelHandle for OpenFangKernel {
         agent_id: &str,
         message: &str,
         timeout_secs: u64,
+        session_id: Option<&str>,
     ) -> Result<String, String> {
-        let id: AgentId = match agent_id.parse() {
-            Ok(id) => id,
-            Err(_) => self
-                .registry
-                .find_by_name(agent_id)
-                .map(|e| e.id)
-                .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
-        };
+        let id: AgentId = self.resolve_agent_id(agent_id)?;
+        let session = self.resolve_session_for_send(id, session_id)?;
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            self.send_message(id, message),
+            self.send_message_with_session(id, session, message),
         )
         .await
         {
@@ -8747,9 +8889,11 @@ impl KernelHandle for OpenFangKernel {
         &self,
         hand_id: &str,
         config: std::collections::HashMap<String, serde_json::Value>,
+        caller_agent_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        let caller: Option<AgentId> = caller_agent_id.and_then(|s| s.parse().ok());
         let instance = self
-            .activate_hand(hand_id, config, None, None, None, None)
+            .activate_hand(hand_id, config, None, None, None, None, caller)
             .map_err(|e| format!("{e}"))?;
 
         Ok(serde_json::json!({
@@ -9364,6 +9508,93 @@ impl KernelHandle for OpenFangKernel {
             .collect();
         Ok((ordered, timed_out))
     }
+
+    fn list_agent_templates(&self) -> Vec<kernel_handle::AgentTemplateInfo> {
+        let agents_dir = crate::config::openfang_home().join("agents");
+        let mut out: Vec<kernel_handle::AgentTemplateInfo> = Vec::new();
+        let entries = match std::fs::read_dir(&agents_dir) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("agent.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            let description = std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|c| toml::from_str::<openfang_types::agent::AgentManifest>(&c).ok())
+                .map(|m| m.description)
+                .unwrap_or_default();
+            out.push(kernel_handle::AgentTemplateInfo {
+                category: agent_template_category(&name).to_string(),
+                name,
+                description,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    async fn spawn_agent_from_template(
+        &self,
+        template_name: &str,
+        instance_name: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let manifest_path = crate::config::openfang_home()
+            .join("agents")
+            .join(template_name)
+            .join("agent.toml");
+        if !manifest_path.exists() {
+            return Err(format!("Template not found: {template_name}"));
+        }
+        let content = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read template '{template_name}': {e}"))?;
+        let mut manifest: openfang_types::agent::AgentManifest = toml::from_str(&content)
+            .map_err(|e| format!("Failed to parse template '{template_name}': {e}"))?;
+        // Override the manifest name so multiple instances of the same template
+        // can coexist. Caller-supplied name wins; otherwise append a short
+        // UUID suffix to the manifest's declared name.
+        if let Some(name) = instance_name {
+            manifest.name = name.to_string();
+        } else {
+            let suffix = &uuid::Uuid::new_v4().to_string()[..8].to_string();
+            manifest.name = format!("{}-{}", manifest.name, suffix);
+        }
+        let agent_name = manifest.name.clone();
+        let agent_id = self
+            .spawn_agent_with_parent(manifest, None, None)
+            .map_err(|e| format!("{e}"))?;
+        Ok((agent_id.to_string(), agent_name))
+    }
+}
+
+/// Mirror of the category mapping in `routes::list_templates`. Kept here so
+/// the kernel-side template tool returns the same labels as the HTTP API.
+fn agent_template_category(name: &str) -> &'static str {
+    match name {
+        "hello-world" | "assistant" => "General",
+        "researcher" | "analyst" => "Research",
+        "coder" | "debugger" | "devops-lead" => "Development",
+        "writer" | "doc-writer" => "Writing",
+        "ops" | "planner" => "Operations",
+        "architect" | "security-auditor" => "Development",
+        "code-reviewer" | "data-scientist" | "test-engineer" => "Development",
+        "legal-assistant" | "email-assistant" | "social-media" => "Business",
+        "customer-support" | "sales-assistant" | "recruiter" => "Business",
+        "meeting-assistant" => "Business",
+        "translator" | "tutor" | "health-tracker" => "General",
+        "personal-finance" | "travel-planner" | "home-automation" => "General",
+        _ => "General",
+    }
 }
 
 fn outcome_to_result(id: &str, o: &DelegationOutcome) -> DelegationResult {
@@ -9896,6 +10127,165 @@ mod tests {
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
     }
 
+    /// When a hand is activated with a `caller`, and neither the hand's
+    /// `[agent]` block nor its `[[settings]]` resolve to a concrete
+    /// provider/model, the spawned hand must inherit the caller's
+    /// resolved provider/model (parent-overlay) rather than falling
+    /// through to the daemon default. Reproduces issue #?: demiurg
+    /// activates hands but they still ran on the daemon default model.
+    /// `agent_send` must allocate a fresh session by default so an
+    /// orchestrator dispatching independent subtasks to the same agent
+    /// doesn't cross-contaminate history. The "default" sentinel still
+    /// reuses the agent's registered session for channel-style flows.
+    #[test]
+    fn test_resolve_session_for_send_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-session-routing");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("boot");
+
+        let manifest = test_manifest("target", "session routing target", vec![]);
+        let agent_id = kernel
+            .spawn_agent_with_parent(manifest, None, None)
+            .expect("spawn target");
+        let registered_session = kernel
+            .registry
+            .get(agent_id)
+            .expect("entry")
+            .session_id;
+
+        // None → fresh session distinct from the registered one.
+        let s_none = kernel
+            .resolve_session_for_send(agent_id, None)
+            .expect("None resolves");
+        assert_ne!(
+            s_none, registered_session,
+            "None must allocate a fresh session, not reuse the agent's default"
+        );
+
+        // "new" → another fresh session, distinct from both.
+        let s_new = kernel
+            .resolve_session_for_send(agent_id, Some("new"))
+            .expect("'new' resolves");
+        assert_ne!(s_new, registered_session);
+        assert_ne!(s_new, s_none, "each 'new' must mint a unique session");
+
+        // "default" → the agent's registered session.
+        let s_default = kernel
+            .resolve_session_for_send(agent_id, Some("default"))
+            .expect("'default' resolves");
+        assert_eq!(
+            s_default, registered_session,
+            "'default' must route to the agent's registered session"
+        );
+
+        // Explicit UUID → that exact session id.
+        let pinned = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+        let s_pinned = kernel
+            .resolve_session_for_send(agent_id, Some(&pinned.0.to_string()))
+            .expect("uuid resolves");
+        assert_eq!(s_pinned, pinned);
+
+        // Garbage UUID → error rather than silent fresh-session.
+        assert!(kernel
+            .resolve_session_for_send(agent_id, Some("not-a-uuid-xyz"))
+            .is_err());
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_hand_activation_inherits_caller_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-hand-inherit-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let mut config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        // Daemon default that the hand would fall through to with the old
+        // behaviour. The test asserts the hand does NOT take this.
+        config.default_model.provider = "lmstudio".to_string();
+        config.default_model.model = "qwen/qwen3.6-27b".to_string();
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("boot");
+
+        // Spawn a "caller" agent with an explicit, concrete model — this
+        // stands in for demiurg with a user-configured provider/model.
+        let mut caller_manifest = test_manifest("caller-demiurg", "demiurg-like", vec![]);
+        caller_manifest.model.provider = "ollama_cloud".to_string();
+        caller_manifest.model.model = "deepseek-v4-flash:cloud".to_string();
+        let caller_id = kernel
+            .spawn_agent_with_parent(caller_manifest, None, None)
+            .expect("spawn caller");
+
+        // Activate the bundled `browser` hand with the caller threaded
+        // through — the new code path must propagate caller's model.
+        let instance = kernel
+            .activate_hand(
+                "browser",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+                Some(caller_id),
+            )
+            .expect("browser activate");
+        let agent_id = instance.agent_id.expect("agent id");
+        let entry = kernel.registry.get(agent_id).expect("entry");
+
+        assert_eq!(
+            entry.manifest.model.provider, "ollama_cloud",
+            "hand should inherit caller's provider, not daemon default"
+        );
+        assert_eq!(
+            entry.manifest.model.model, "deepseek-v4-flash:cloud",
+            "hand should inherit caller's model, not daemon default"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Without a caller (e.g. activated from the HTTP /api/hands/{id}/activate
+    /// endpoint), a hand whose [agent] / [[settings]] are all `default`
+    /// must still resolve to the daemon default — preserves existing
+    /// behaviour for non-orchestrated activations.
+    #[test]
+    fn test_hand_activation_without_caller_falls_back_to_daemon_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-hand-fallback-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let mut config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        config.default_model.provider = "lmstudio".to_string();
+        config.default_model.model = "qwen/qwen3.6-27b".to_string();
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("boot");
+
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None, None, None, None, None)
+            .expect("browser activate");
+        let agent_id = instance.agent_id.expect("agent id");
+        let entry = kernel.registry.get(agent_id).expect("entry");
+
+        assert_eq!(entry.manifest.model.provider, "lmstudio");
+        assert_eq!(entry.manifest.model.model, "qwen/qwen3.6-27b");
+
+        kernel.shutdown();
+    }
+
     #[test]
     fn test_hand_activation_does_not_seed_runtime_tool_filters() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9910,7 +10300,7 @@ mod tests {
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
         let instance = kernel
-            .activate_hand("browser", HashMap::new(), None, None, None, None)
+            .activate_hand("browser", HashMap::new(), None, None, None, None, None)
             .expect("browser hand should activate");
         let agent_id = instance.agent_id.expect("browser hand agent id");
         let entry = kernel

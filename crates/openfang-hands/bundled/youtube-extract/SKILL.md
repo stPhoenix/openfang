@@ -7,7 +7,8 @@ runtime: prompt_only
 
 # YouTube Info Extraction — Expert Knowledge
 
-This hand pulls **text** out of YouTube videos: transcripts, metadata, summaries, Q&A, knowledge-graph entities. It does NOT produce video files or clips — for that, use the `clip` hand.
+This hand pulls **text** out of YouTube videos: transcripts, metadata, summaries, Q&A, and (on explicit request)
+knowledge-graph entities. It does NOT produce video files or clips — for that, use the `clip` hand.
 
 Subtitles are the **only** transcription source — manual (uploader-provided) preferred when present, auto-captions used as fallback. There is no Whisper / STT fallback by design. If a video has neither manual subs nor auto-captions, the hand fails fast and clearly.
 

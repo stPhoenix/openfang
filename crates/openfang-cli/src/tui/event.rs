@@ -2364,6 +2364,7 @@ pub fn spawn_activate_hand(
                 None,
                 None,
                 instance_name,
+                None,
             ) {
                 Ok(instance) => {
                     // Start the background loop for autonomous hands, mirroring the

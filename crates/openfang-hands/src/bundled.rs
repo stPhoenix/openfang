@@ -575,7 +575,7 @@ mod tests {
         assert!(metric_keys.contains(&"youtube_extract_summaries"));
         // Agent config
         assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
-        assert_eq!(def.agent.max_iterations, Some(25));
+        assert_eq!(def.agent.max_iterations, Some(60));
     }
 
     #[test]

@@ -393,7 +393,7 @@ fn host_agent_send(state: &GuestState, params: &serde_json::Value) -> serde_json
     };
     match state
         .tokio_handle
-        .block_on(kernel.send_to_agent(target, message))
+        .block_on(kernel.send_to_agent(target, message, None))
     {
         Ok(response) => json!({"ok": response}),
         Err(e) => json!({"error": e}),

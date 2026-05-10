@@ -970,7 +970,7 @@ pub async fn run_agent_loop(
                 session
                     .messages
                     .push(Message::assistant_with_blocks(assistant_blocks.clone()));
-                messages.push(Message::assistant_with_blocks(assistant_blocks));
+                messages.push(Message::assistant_with_blocks(assistant_blocks.clone()));
 
                 // Build allowed tool names list for capability enforcement
                 let mut allowed_tool_names: Vec<String> =
@@ -1001,6 +1001,20 @@ pub async fn run_agent_loop(
                     match &verdict {
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered");
+                            // Pair every assistant tool_use with a tool_result
+                            // before persisting — otherwise the next turn sees a
+                            // dangling tool_use and the provider 400s.
+                            let synthetic = synthesize_missing_tool_results(
+                                &assistant_blocks,
+                                &tool_result_blocks,
+                                &format!("Tool execution skipped: {msg}"),
+                            );
+                            if !synthetic.is_empty() {
+                                tool_result_blocks.extend(synthetic);
+                                session.messages.push(Message::user_with_blocks(
+                                    tool_result_blocks.clone(),
+                                ));
+                            }
                             // Save session before bailing
                             if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
@@ -2281,7 +2295,7 @@ pub async fn run_agent_loop_streaming(
                 session
                     .messages
                     .push(Message::assistant_with_blocks(assistant_blocks.clone()));
-                messages.push(Message::assistant_with_blocks(assistant_blocks));
+                messages.push(Message::assistant_with_blocks(assistant_blocks.clone()));
 
                 let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
@@ -2311,6 +2325,20 @@ pub async fn run_agent_loop_streaming(
                     match &verdict {
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered (streaming)");
+                            // Pair every assistant tool_use with a tool_result
+                            // before persisting — otherwise the next turn sees a
+                            // dangling tool_use and the provider 400s.
+                            let synthetic = synthesize_missing_tool_results(
+                                &assistant_blocks,
+                                &tool_result_blocks,
+                                &format!("Tool execution skipped: {msg}"),
+                            );
+                            if !synthetic.is_empty() {
+                                tool_result_blocks.extend(synthetic);
+                                session.messages.push(Message::user_with_blocks(
+                                    tool_result_blocks.clone(),
+                                ));
+                            }
                             if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
@@ -3462,6 +3490,38 @@ fn try_parse_bare_json_tool_call(
     parse_json_tool_call_object(&text[..end], tool_names)
 }
 
+/// Build synthetic error ToolResult blocks for every ToolUse in `assistant_blocks`
+/// that has no matching entry in `existing_results`. Used on circuit-break / abort
+/// paths so the persisted session keeps tool_use ↔ tool_result parity (Anthropic
+/// rejects assistant turns whose tool_use blocks lack paired tool_results).
+fn synthesize_missing_tool_results(
+    assistant_blocks: &[ContentBlock],
+    existing_results: &[ContentBlock],
+    reason: &str,
+) -> Vec<ContentBlock> {
+    let have: std::collections::HashSet<&str> = existing_results
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for b in assistant_blocks {
+        if let ContentBlock::ToolUse { id, name, .. } = b {
+            if !have.contains(id.as_str()) {
+                out.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    content: reason.to_string(),
+                    is_error: true,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Deduplicate tool calls from the response.
 /// Returns a reference to the deduplicated tool calls.
 pub fn deduplicate_tool_calls(response: &crate::llm_driver::CompletionResponse) -> Vec<&ToolCall> {
@@ -3487,6 +3547,87 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    /// Circuit-break must leave persisted state with tool_use ↔ tool_result
+    /// parity. Helper synthesizes error results for any tool_use without a
+    /// matching result, preserving order.
+    #[test]
+    fn test_synthesize_missing_tool_results_pairs_unmatched_uses() {
+        let assistant_blocks = vec![
+            ContentBlock::Text {
+                text: "calling three tools".to_string(),
+                provider_metadata: None,
+            },
+            ContentBlock::ToolUse {
+                id: "a".to_string(),
+                name: "shell_exec".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            },
+            ContentBlock::ToolUse {
+                id: "b".to_string(),
+                name: "knowledge_add_entity".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            },
+            ContentBlock::ToolUse {
+                id: "c".to_string(),
+                name: "knowledge_add_entity".to_string(),
+                input: serde_json::json!({}),
+                provider_metadata: None,
+            },
+        ];
+        let existing = vec![ContentBlock::ToolResult {
+            tool_use_id: "a".to_string(),
+            tool_name: "shell_exec".to_string(),
+            content: "ok".to_string(),
+            is_error: false,
+        }];
+        let synthetic = synthesize_missing_tool_results(
+            &assistant_blocks,
+            &existing,
+            "Tool execution skipped: circuit breaker",
+        );
+        assert_eq!(synthetic.len(), 2, "must pair the 2 unmatched tool_uses");
+        for (idx, expected_id) in ["b", "c"].iter().enumerate() {
+            match &synthetic[idx] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    content,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, expected_id);
+                    assert!(*is_error, "synthetic results must be flagged is_error");
+                    assert!(
+                        content.contains("circuit breaker"),
+                        "reason must propagate into content"
+                    );
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            }
+        }
+    }
+
+    /// Already-paired tool_uses must not be duplicated.
+    #[test]
+    fn test_synthesize_missing_tool_results_skips_paired() {
+        let assistant_blocks = vec![ContentBlock::ToolUse {
+            id: "x".to_string(),
+            name: "memory_store".to_string(),
+            input: serde_json::json!({}),
+            provider_metadata: None,
+        }];
+        let existing = vec![ContentBlock::ToolResult {
+            tool_use_id: "x".to_string(),
+            tool_name: "memory_store".to_string(),
+            content: "stored".to_string(),
+            is_error: false,
+        }];
+        let synthetic =
+            synthesize_missing_tool_results(&assistant_blocks, &existing, "any reason");
+        assert!(synthetic.is_empty());
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted

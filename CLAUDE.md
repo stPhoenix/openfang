@@ -11,8 +11,8 @@ OpenFang is an open-source Agent Operating System written in Rust (14 crates).
 After every feature implementation, run ALL THREE checks:
 ```bash
 make build    # Compile all workspace crates (lib only)
-make test     # Run full test suite (memory-aware parallelism)
 make clippy   # Lint with clippy (warnings are errors)
+run tests on updated crates
 ```
 Or run all three at once: `make check`
 
@@ -26,13 +26,8 @@ Daemon runs in Docker. Two compose files:
 ### Dev daemon
 
 ```bash
-make build-release                              # build host binary first
-docker compose -f docker-compose.dev.yml up -d  # start
-docker compose -f docker-compose.dev.yml logs -f
-docker compose -f docker-compose.dev.yml down   # stop
+make docker-dev-restart
 ```
-
-Rebuild loop: `make build-release && docker compose -f docker-compose.dev.yml restart`.
 
 ### Key Make Targets
 | Target | Description |

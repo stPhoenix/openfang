@@ -20,6 +20,16 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
 }
 
+/// Info about an installed agent template (a TOML manifest under
+/// `~/.openfang/agents/<name>/agent.toml`, or a bundled fallback). Templates
+/// are spawn-time blueprints — distinct from running agents and from hands.
+#[derive(Debug, Clone)]
+pub struct AgentTemplateInfo {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+}
+
 /// Handle to kernel operations, passed into the agent loop so agents
 /// can interact with each other via tools.
 #[allow(clippy::too_many_arguments)]
@@ -35,19 +45,33 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<(String, String), String>;
 
     /// Send a message to another agent and get the response.
-    async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
+    ///
+    /// `session_id` selects the conversation context on the target:
+    /// - `None`  → allocate a fresh session for this call (default —
+    ///             prevents cross-task history bleed when an orchestrator
+    ///             dispatches independent subtasks to the same agent).
+    /// - `Some(uuid)` → route the message into that existing session,
+    ///                  enabling explicit multi-turn conversations.
+    async fn send_to_agent(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String>;
 
     /// Send a message to another agent with a timeout in seconds.
     /// Returns an error if the target agent does not respond within the deadline.
+    /// `session_id` semantics match [`send_to_agent`].
     async fn send_to_agent_with_timeout(
         &self,
         agent_id: &str,
         message: &str,
         timeout_secs: u64,
+        session_id: Option<&str>,
     ) -> Result<String, String> {
         // Default: delegate to send_to_agent (no timeout enforcement)
         let _ = timeout_secs;
-        self.send_to_agent(agent_id, message).await
+        self.send_to_agent(agent_id, message, session_id).await
     }
 
     /// List all running agents.
@@ -171,12 +195,18 @@ pub trait KernelHandle: Send + Sync {
     }
 
     /// Activate a Hand — spawns a specialized autonomous agent.
+    ///
+    /// `caller_agent_id` is the id of the agent that invoked the
+    /// `hand_activate` tool (when known). Used so the spawned hand can
+    /// inherit its parent's resolved provider/model rather than falling
+    /// through to the daemon default.
     async fn hand_activate(
         &self,
         hand_id: &str,
         config: std::collections::HashMap<String, serde_json::Value>,
+        caller_agent_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let _ = (hand_id, config);
+        let _ = (hand_id, config, caller_agent_id);
         Err("Hands system not available".to_string())
     }
 
@@ -346,4 +376,24 @@ pub trait KernelHandle: Send + Sync {
         Err("delegation_await not available".to_string())
     }
 
+    /// List installed agent templates (TOML manifests under
+    /// `~/.openfang/agents/<name>/agent.toml`, plus bundled fallbacks).
+    /// Distinct from `list_agents` (running agents) and `hand_list` (hand
+    /// templates) — these are dormant blueprints that demiurg can spawn on
+    /// demand when no running agent or hand fits the subtask.
+    fn list_agent_templates(&self) -> Vec<AgentTemplateInfo> {
+        vec![]
+    }
+
+    /// Spawn an agent from an installed template by name. `instance_name`
+    /// overrides the manifest's `name` field so multiple instances can
+    /// coexist. Returns (agent_id, agent_name) on success.
+    async fn spawn_agent_from_template(
+        &self,
+        template_name: &str,
+        instance_name: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let _ = (template_name, instance_name);
+        Err("Agent templates not available".to_string())
+    }
 }

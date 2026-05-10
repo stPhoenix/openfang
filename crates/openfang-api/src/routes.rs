@@ -412,6 +412,7 @@ pub async fn send_message(
             req.sender_id,
             req.sender_name,
             None, // sender_role: API callers don't have RBAC role yet
+            None, // session_id_override: HTTP /agents/:id/message uses agent default session
         )
         .await
     {
@@ -4678,7 +4679,7 @@ pub async fn activate_hand(
         None => (std::collections::HashMap::new(), None, None, None),
     };
 
-    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override, None, instance_name) {
+    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override, None, instance_name, None) {
         Ok(instance) => {
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
@@ -6795,13 +6796,23 @@ pub async fn a2a_send_task(
         .unwrap_or(&agents[0]);
     let agent_id = agent.id;
     let workspace = agent.manifest.workspace.clone();
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let session_id = request["params"]["sessionId"].as_str().map(String::from);
+    let task_uuid = uuid::Uuid::new_v4();
+    let task_id = task_uuid.to_string();
+    let session_id_str = request["params"]["sessionId"].as_str().map(String::from);
+
+    // Per-task session: caller-provided sessionId takes precedence (so multi-turn
+    // A2A clients can continue a conversation by reusing the same UUID); fall back
+    // to the task UUID so each one-shot call gets its own isolated session.
+    let session_uuid = session_id_str
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or(task_uuid);
+    let kernel_session_id = openfang_types::agent::SessionId(session_uuid);
 
     // Create the task in the store as Working — caller will poll for completion.
     let task = openfang_runtime::a2a::A2aTask {
         id: task_id.clone(),
-        session_id: session_id.clone(),
+        session_id: session_id_str.clone(),
         status: openfang_runtime::a2a::A2aTaskStatus::Working.into(),
         messages: vec![openfang_runtime::a2a::A2aMessage {
             role: "user".to_string(),
@@ -6822,8 +6833,12 @@ pub async fn a2a_send_task(
     let bg_state = state.clone();
     let bg_task_id = task_id.clone();
     let bg_message = message_text.clone();
-    tokio::spawn(async move {
-        match bg_state.kernel.send_message(agent_id, &bg_message).await {
+    let join_handle = tokio::spawn(async move {
+        match bg_state
+            .kernel
+            .send_message_with_session(agent_id, kernel_session_id, &bg_message)
+            .await
+        {
             Ok(result) => {
                 let (clean_text, artifacts) = extract_a2a_artifacts(
                     &result.response,
@@ -6849,7 +6864,19 @@ pub async fn a2a_send_task(
                 bg_state.kernel.a2a_task_store.fail(&bg_task_id, error_msg);
             }
         }
+        // Drop the abort handle once the future has returned naturally so
+        // a later cancel call returns 404 rather than aborting nothing.
+        bg_state.kernel.a2a_task_handles.remove(&bg_task_id);
     });
+
+    // Register the abort handle so a subsequent `tasks/cancel` can drop the
+    // running future. The future tree includes any in-flight `agent_send`
+    // / `hand_activate` calls demiurg made, so aborting here propagates
+    // cancellation down to children that are still awaiting.
+    state
+        .kernel
+        .a2a_task_handles
+        .insert(task_id.clone(), join_handle.abort_handle());
 
     match working_task {
         Some(t) => (
@@ -7066,10 +7093,21 @@ pub async fn a2a_get_artifact(
 }
 
 /// POST /a2a/tasks/{id}/cancel — Cancel a tracked task.
+///
+/// Flips the task store to `Cancelled` AND aborts the in-flight tokio task
+/// (if any). Aborting drops the future tree, which propagates through every
+/// `.await` inside `send_message_with_session` → `run_agent_loop` → tool
+/// calls — so demiurg's nested `agent_send` / `hand_activate` calls also
+/// stop. `complete`/`fail` no-op when the status is already `Cancelled`,
+/// preventing a finished-just-before-abort race from overwriting the
+/// terminal state.
 pub async fn a2a_cancel_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some((_, handle)) = state.kernel.a2a_task_handles.remove(&task_id) {
+        handle.abort();
+    }
     if state.kernel.a2a_task_store.cancel(&task_id) {
         match state.kernel.a2a_task_store.get(&task_id) {
             Some(task) => (

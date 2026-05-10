@@ -292,9 +292,16 @@ impl A2aTaskStore {
     }
 
     /// Complete a task with a response message and optional artifacts.
+    ///
+    /// No-op when the task is already in `Cancelled` terminal state — guards
+    /// against a race where the agent loop returns just before the cancel
+    /// abort fires.
     pub fn complete(&self, task_id: &str, response: A2aMessage, artifacts: Vec<A2aArtifact>) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(task) = tasks.get_mut(task_id) {
+            if *task.status.state() == A2aTaskStatus::Cancelled {
+                return;
+            }
             task.messages.push(response);
             task.artifacts.extend(artifacts);
             task.status = A2aTaskStatus::Completed.into();
@@ -302,9 +309,15 @@ impl A2aTaskStore {
     }
 
     /// Fail a task with an error message.
+    ///
+    /// No-op when the task is already `Cancelled` (see `complete` for the
+    /// race condition this guards).
     pub fn fail(&self, task_id: &str, error_message: A2aMessage) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(task) = tasks.get_mut(task_id) {
+            if *task.status.state() == A2aTaskStatus::Cancelled {
+                return;
+            }
             task.messages.push(error_message);
             task.status = A2aTaskStatus::Failed.into();
         }

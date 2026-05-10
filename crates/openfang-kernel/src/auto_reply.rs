@@ -100,7 +100,10 @@ impl AutoReplyEngine {
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
-                kernel_handle.send_to_agent(&agent_id.to_string(), &message),
+                // Channel auto-reply must keep one continuous conversation per
+                // agent — pass the "default" sentinel so the message lands on
+                // the agent's registered session, not a fresh isolated one.
+                kernel_handle.send_to_agent(&agent_id.to_string(), &message, Some("default")),
             )
             .await;
 
