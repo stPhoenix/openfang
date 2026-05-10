@@ -5,9 +5,15 @@ WORKDIR /app
 # System dependencies (same as production + mold linker)
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev perl make mold \
+    curl \
     python3 python3-pip python3-venv \
     nodejs npm \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp standalone binary (used by youtube-extract and clip hands).
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+        -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 # Cargo tools for dev workflow
 RUN cargo install cargo-watch

@@ -18,12 +18,20 @@ RUN cargo build --release --bin openfang
 FROM rust:1-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     python3 \
     python3-pip \
     python3-venv \
     nodejs \
     npm \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp standalone binary (used by youtube-extract and clip hands).
+# Per upstream wiki, the standalone binary is the preferred install for containers.
+# Update with `yt-dlp -U` or rebuild the image.
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+        -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 COPY --from=builder /build/target/release/openfang /usr/local/bin/
 COPY --from=builder /build/agents /opt/openfang/agents

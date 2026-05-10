@@ -60,6 +60,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/demiurg/HAND.toml"),
             include_str!("../bundled/demiurg/SKILL.md"),
         ),
+        (
+            "youtube-extract",
+            include_str!("../bundled/youtube-extract/HAND.toml"),
+            include_str!("../bundled/youtube-extract/SKILL.md"),
+        ),
     ]
 }
 
@@ -91,7 +96,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 11);
+        assert_eq!(hands.len(), 12);
     }
 
     #[test]
@@ -524,6 +529,53 @@ mod tests {
             def.agent.temperature < 0.2,
             "security hand should use low temperature"
         );
+    }
+
+    #[test]
+    fn parse_youtube_extract_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "youtube-extract")
+            .expect("youtube-extract hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "youtube-extract");
+        assert_eq!(def.name, "YouTube Extract Hand");
+        assert_eq!(def.category, crate::HandCategory::Content);
+        assert!(def.skill_content.is_some());
+        // Single yt-dlp binary requirement
+        assert_eq!(def.requires.len(), 1);
+        assert_eq!(def.requires[0].key, "yt-dlp");
+        // Tools — text-only, needs shell for yt-dlp + file ops + KG
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        assert!(def.tools.contains(&"file_read".to_string()));
+        assert!(def.tools.contains(&"file_write".to_string()));
+        assert!(def.tools.contains(&"file_list".to_string()));
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        assert!(def.tools.contains(&"knowledge_add_entity".to_string()));
+        assert!(def.tools.contains(&"knowledge_add_relation".to_string()));
+        assert!(def.tools.contains(&"knowledge_query".to_string()));
+        // Settings
+        assert!(def.settings.iter().any(|s| s.key == "output_mode"));
+        assert!(def.settings.iter().any(|s| s.key == "summary_style"));
+        assert!(def.settings.iter().any(|s| s.key == "language"));
+        assert!(def.settings.iter().any(|s| s.key == "chunk_long_videos"));
+        assert!(def.settings.iter().any(|s| s.key == "save_transcript_file"));
+        // Dashboard
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"youtube_extract_videos_done"));
+        assert!(metric_keys.contains(&"youtube_extract_transcripts_saved"));
+        assert!(metric_keys.contains(&"youtube_extract_total_seconds"));
+        assert!(metric_keys.contains(&"youtube_extract_summaries"));
+        // Agent config
+        assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
+        assert_eq!(def.agent.max_iterations, Some(25));
     }
 
     #[test]

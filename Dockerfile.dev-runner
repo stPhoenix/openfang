@@ -5,3 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl nodejs npm \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp standalone binary (used by youtube-extract and clip hands).
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+        -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
