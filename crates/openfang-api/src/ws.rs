@@ -641,6 +641,11 @@ async fn handle_agent_ws(
         let mut last_hash: u64 = 0;
         loop {
             interval.tick().await;
+            // Mirror the union used by GET /api/agents (routes.rs) so the
+            // sidebar `is_generating` badge stays consistent across the
+            // WebSocket push and the HTTP poll.
+            let mut generating = agents_currently_generating();
+            generating.extend(state_clone.kernel.active_loop_agents());
             let agents: Vec<serde_json::Value> = state_clone
                 .kernel
                 .registry
@@ -653,6 +658,7 @@ async fn handle_agent_ws(
                         "state": format!("{:?}", e.state),
                         "model_provider": e.manifest.model.provider,
                         "model_name": e.manifest.model.model,
+                        "is_generating": generating.contains(&e.id),
                     })
                 })
                 .collect();
@@ -835,16 +841,17 @@ async fn handle_text_message(
             // Echo the user message to every socket for this agent so other
             // tabs see what was just asked. The originating socket already
             // pushed a local bubble in sendMessage(); the client dedupes by
-            // recent-content match.
-            let _ = broadcast_to_ws(
-                agent_id,
-                serde_json::json!({
-                    "type": "message",
-                    "source": "user",
-                    "content": content.clone(),
-                }),
-            )
-                .await;
+            // `client_msg_id` when present, falling back to a recent-content
+            // match for echoes that lack one (e.g. cron-injected messages).
+            let mut user_echo = serde_json::json!({
+                "type": "message",
+                "source": "user",
+                "content": content.clone(),
+            });
+            if let Some(cid) = parsed.get("client_msg_id").and_then(|v| v.as_str()) {
+                user_echo["client_msg_id"] = serde_json::Value::String(cid.to_string());
+            }
+            let _ = broadcast_to_ws(agent_id, user_echo).await;
 
             // Resolve file attachments into image content blocks
             let mut has_images = false;

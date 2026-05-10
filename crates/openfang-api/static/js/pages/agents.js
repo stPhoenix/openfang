@@ -243,6 +243,26 @@ function agentsPage() {
           self.activeChatAgent = agent;
         }
       });
+
+        // Restore the previously-active chat across reloads. Sources, in order
+        // of precedence: deep link `#chat/<id>` (parsed in app.js handleHash),
+        // then localStorage. Resolve the id against the just-loaded agents
+        // list — silently skip if the agent was deleted in the meantime.
+        var deepLinkId = store.pendingAgentId;
+        var savedId = localStorage.getItem('openfang-active-agent');
+        var restoreId = deepLinkId || savedId;
+        if (restoreId && !this.activeChatAgent) {
+            var found = (store.agents || []).find(function (a) {
+                return a.id === restoreId;
+            });
+            if (found) {
+                this.chatWithAgent(found);
+            } else if (savedId === restoreId) {
+                // Stale id — agent gone. Clear so we don't keep retrying.
+                localStorage.removeItem('openfang-active-agent');
+            }
+        }
+        store.pendingAgentId = null;
     },
 
     async loadData() {
@@ -339,11 +359,26 @@ function agentsPage() {
     chatWithAgent(agent) {
       Alpine.store('app').pendingAgent = agent;
       this.activeChatAgent = agent;
+        try {
+            localStorage.setItem('openfang-active-agent', agent.id);
+        } catch (e) {
+        }
+        // Deep link: `#chat/<id>` survives reload and is shareable.
+        if (agent && agent.id && location.hash !== '#chat/' + agent.id) {
+            history.replaceState(null, '', '#chat/' + agent.id);
+        }
     },
 
     closeChat() {
       this.activeChatAgent = null;
       OpenFangAPI.wsDisconnect();
+        try {
+            localStorage.removeItem('openfang-active-agent');
+        } catch (e) {
+        }
+        if (location.hash.indexOf('#chat/') === 0) {
+            history.replaceState(null, '', '#agents');
+        }
     },
 
     async showDetail(agent) {

@@ -557,6 +557,10 @@
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" style="animation:spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
                   Generating...
                 </span>
+                  <span class="badge badge-warn" style="animation:fadeIn 0.2s"
+                        x-show="$store.app.connectionState === 'reconnecting'">Reconnecting…</span>
+                  <span class="badge badge-error" style="animation:fadeIn 0.2s"
+                        x-show="$store.app.connectionState === 'disconnected'">Offline</span>
                 <span class="queue-badge" x-show="messageQueue.length > 0" x-text="'+' + messageQueue.length + ' queued'"></span>
                 <!-- Session switcher -->
                 <div style="position:relative">
@@ -810,7 +814,9 @@
                           :class="{ 'streaming-active': sending }"></textarea>
                 <!-- Send button (normal) or Stop button (during streaming) -->
                 <template x-if="!sending">
-                  <button class="btn-send" @click="sendMessage()" :disabled="!inputText.trim() && !attachments.length">
+                    <button :disabled="(!inputText.trim() && !attachments.length) || $store.app.connectionState === 'disconnected'" :title="$store.app.connectionState === 'disconnected' ? 'Disconnected — daemon unreachable' : ''"
+                            @click="sendMessage()"
+                            class="btn-send">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
                   </button>
                 </template>

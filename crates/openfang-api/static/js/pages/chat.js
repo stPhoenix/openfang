@@ -201,7 +201,23 @@ function chatPage() {
         }
       });
 
-      // Watch for slash commands + model autocomplete
+        // Per-agent draft persistence: debounced 300 ms write so a reload
+        // doesn't eat what the user was typing. Cleared on send (sendMessage).
+        var _draftTimer = null;
+        this.$watch('inputText', function (val) {
+            if (_draftTimer) clearTimeout(_draftTimer);
+            _draftTimer = setTimeout(function () {
+                if (!self.currentAgent) return;
+                var key = 'openfang-draft-' + self.currentAgent.id;
+                try {
+                    if (val && val.length) localStorage.setItem(key, val);
+                    else localStorage.removeItem(key);
+                } catch (e) {
+                }
+            }, 300);
+        });
+
+        // Watch for slash commands + model autocomplete
       this.$watch('inputText', function(val) {
         var modelMatch = val.match(/^\/model\s+(.*)$/i);
         if (modelMatch) {
@@ -588,6 +604,13 @@ function chatPage() {
       this.currentAgent = agent;
       this.messages = [];
       this.connectWs(agent.id);
+        // Restore any draft the user was typing for this agent before reload.
+        try {
+            var draft = localStorage.getItem('openfang-draft-' + agent.id);
+            this.inputText = draft || '';
+        } catch (e) {
+            this.inputText = '';
+        }
       var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       // Show welcome tips on first use
       if (!localStorage.getItem('of-chat-tips-seen')) {
@@ -752,25 +775,47 @@ function chatPage() {
         case 'message':
           if (data.content) {
             // Dedupe: the originating tab already pushed this user message
-            // in sendMessage() before the WS round-trip. The thinking
-            // placeholder is now at the tail, so scan back through recent
-            // messages to find the matching user bubble.
+              // before the WS round-trip. Prefer server-stamped `client_msg_id`
+              // (set by sendMessage when present); fall back to a recent-text
+              // heuristic for cron-injected messages that have no id.
             if (data.source === 'user') {
-              var nowTs = Date.now();
               var foundDup = false;
-              for (var di = this.messages.length - 1; di >= 0 && di >= this.messages.length - 5; di--) {
-                var m = this.messages[di];
-                if (!m || m.role !== 'user') continue;
-                if (nowTs - (m.ts || 0) > 5000) break;
-                if ((m.text || '').indexOf(data.content) !== -1) {
-                  foundDup = true;
-                  break;
+                if (data.client_msg_id) {
+                    for (var dj = this.messages.length - 1; dj >= 0; dj--) {
+                        var mm = this.messages[dj];
+                        if (mm && mm.client_msg_id === data.client_msg_id) {
+                            foundDup = true;
+                            break;
+                        }
+                    }
+                } else {
+                    var nowTs = Date.now();
+                    for (var di = this.messages.length - 1; di >= 0 && di >= this.messages.length - 5; di--) {
+                        var m = this.messages[di];
+                        if (!m || m.role !== 'user') continue;
+                        if (nowTs - (m.ts || 0) > 5000) break;
+                        if ((m.text || '').indexOf(data.content) !== -1) {
+                            foundDup = true;
+                            break;
+                        }
                 }
               }
               if (foundDup) break;
             }
             var meta = data.source === 'cron' ? '[Scheduled: ' + (data.job_name || data.job_id || '') + ']' : '';
-            this.messages.push({ id: ++msgId, role: 'user', text: data.content, meta: meta, tools: [], images: [], ts: Date.now() });
+              this.messages.push({
+                  id: ++msgId,
+                  role: 'user',
+                  text: data.content,
+                  meta: meta,
+                  tools: [],
+                  images: [],
+                  ts: Date.now(),
+                  client_msg_id: data.client_msg_id || null
+              });
+              // Cross-tab observer: a streamed reply is on the way. Reveal the
+              // "Generating…" pill until a terminal event clears it.
+              if (data.source === 'user') this.sending = true;
             this.scrollToBottom();
           }
           break;
@@ -795,6 +840,7 @@ function chatPage() {
         // New typing lifecycle
         case 'typing':
           if (data.state === 'start') {
+              this.sending = true;
             if (!this.messages.length || !this.messages[this.messages.length - 1].thinking) {
               this.messages.push({ id: ++msgId, role: 'agent', text: 'Processing...', meta: '', thinking: true, streaming: true, tools: [] });
               this.scrollToBottom();
@@ -820,6 +866,9 @@ function chatPage() {
             this.messages.push({ id: ++msgId, role: 'system', text: acDetail, meta: '', tools: [] });
             break;
           }
+            // Any phase other than terminal `done` proves a stream is live —
+            // observer tabs (and post-reload originator) should show the pill.
+            if (data.phase !== 'done') this.sending = true;
           // Show tool/phase progress so the user sees the agent is working
           var phaseIdx = this.messages.length - 1;
           var phaseMsg = phaseIdx >= 0 ? this.messages[phaseIdx] : null;
@@ -929,6 +978,7 @@ function chatPage() {
           break;
 
         case 'thinking_delta':
+            this.sending = true;
           var tlast = this._findOrCreateStreaming();
           var tlastIdx = this.messages.length - 1;
           if (!tlast.reasoning) tlast.reasoning = '';
@@ -941,6 +991,7 @@ function chatPage() {
           break;
 
         case 'text_delta':
+            this.sending = true;
           var last = this._findOrCreateStreaming();
           var lastIdx = this.messages.length - 1;
           // If we already detected a text-based tool call, skip further text
@@ -980,6 +1031,7 @@ function chatPage() {
           break;
 
         case 'tool_start':
+            this.sending = true;
           var lastMsg = this._findOrCreateStreaming();
           var tsIdx = this.messages.length - 1;
           this._appendTool(lastMsg, {
@@ -1319,7 +1371,7 @@ function chatPage() {
     _processQueue: function() {
       if (!this.messageQueue.length || this.sending) return;
       var next = this.messageQueue.shift();
-      this._sendPayload(next.text, next.files, next.images);
+        this._sendPayload(next.text, next.files, next.images, next.clientMsgId);
     },
 
     async sendMessage() {
@@ -1376,26 +1428,49 @@ function chatPage() {
       // Collect image references for inline rendering
       var msgImages = uploadedFiles.filter(function(f) { return f.content_type && f.content_type.startsWith('image/'); });
 
-      // Always show user message immediately
-      this.messages.push({ id: ++msgId, role: 'user', text: finalText, meta: '', tools: [], images: msgImages, ts: Date.now() });
+        // Server stamps this id back on the user-echo broadcast so other tabs
+        // (and this one, after a reload) can dedupe by id instead of by text.
+        var clientMsgId = (window.crypto && crypto.randomUUID)
+            ? 'cm-' + crypto.randomUUID()
+            : 'cm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+
+        // Always show user message immediately
+        this.messages.push({
+            id: ++msgId,
+            role: 'user',
+            text: finalText,
+            meta: '',
+            tools: [],
+            images: msgImages,
+            ts: Date.now(),
+            client_msg_id: clientMsgId
+        });
       this.scrollToBottom();
       localStorage.setItem('of-first-msg', 'true');
+        // Sent — clear any persisted draft for this agent.
+        if (this.currentAgent) {
+            try {
+                localStorage.removeItem('openfang-draft-' + this.currentAgent.id);
+            } catch (e) {
+            }
+        }
 
       // If already streaming, queue this message
       if (this.sending) {
-        this.messageQueue.push({ text: finalText, files: uploadedFiles, images: msgImages });
+          this.messageQueue.push({text: finalText, files: uploadedFiles, images: msgImages, clientMsgId: clientMsgId});
         return;
       }
 
-      this._sendPayload(finalText, uploadedFiles, msgImages);
+        this._sendPayload(finalText, uploadedFiles, msgImages, clientMsgId);
     },
 
-    async _sendPayload(finalText, uploadedFiles, msgImages) {
+      async _sendPayload(finalText, uploadedFiles, msgImages, clientMsgId) {
       this.sending = true;
 
       // Try WebSocket first
       var wsPayload = { type: 'message', content: finalText, thinking_mode: this.thinkingMode };
       if (uploadedFiles && uploadedFiles.length) wsPayload.attachments = uploadedFiles;
+          if (clientMsgId) wsPayload.client_msg_id = clientMsgId;
       if (OpenFangAPI.wsSend(wsPayload)) {
         this.messages.push({ id: ++msgId, role: 'agent', text: '', meta: '', thinking: true, streaming: true, tools: [], ts: Date.now() });
         this.scrollToBottom();

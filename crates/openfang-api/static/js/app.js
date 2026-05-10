@@ -137,6 +137,7 @@ document.addEventListener('alpine:init', function() {
     pendingApprovalCount: 0,
     lastPendingApprovalSignature: '',
     pendingAgent: null,
+      pendingAgentId: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
     showAuthPrompt: false,
@@ -329,10 +330,24 @@ function app() {
         'approval': 'approvals'
       };
       function handleHash() {
-        var hash = window.location.hash.replace('#', '') || 'agents';
+          var raw = window.location.hash.replace('#', '') || 'agents';
+          var parts = raw.split('/');
+          var head = parts[0];
+          // Deep link: #chat/<agentId> opens chat for that agent. Stash the
+          // id on the app store so agentsPage.init() can resolve it once the
+          // agents list arrives. Keep `head = 'chat'` so the redirect below
+          // still routes to the agents page where the chat panel lives.
+          if (head === 'chat' && parts[1]) {
+              Alpine.store('app').pendingAgentId = parts[1];
+          }
+          var hash = head;
         if (pageRedirects[hash]) {
           hash = pageRedirects[hash];
-          window.location.hash = hash;
+            // Don't clobber `#chat/<id>` with a bare `#agents` redirect —
+            // that would lose the agent id before agentsPage.init() reads it.
+            if (head !== 'chat' || !parts[1]) {
+                window.location.hash = hash;
+            }
         }
         if (validPages.indexOf(hash) >= 0) self.page = hash;
       }

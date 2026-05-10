@@ -210,7 +210,25 @@ var OpenFangAPI = (function() {
   var _wsAgentId = null;
   var _reconnectTimer = null;
   var _reconnectAttempts = 0;
+    var _heartbeatTimer = null;
+    var HEARTBEAT_MS = 30000;
   var MAX_RECONNECT = 5;
+
+    function _stopHeartbeat() {
+        if (_heartbeatTimer) {
+            clearInterval(_heartbeatTimer);
+            _heartbeatTimer = null;
+        }
+    }
+
+    function _startHeartbeat() {
+        _stopHeartbeat();
+        _heartbeatTimer = setInterval(function () {
+            // wsSend returns false if readyState !== OPEN; the next event will
+            // surface the failure and trigger reconnect via socket.onclose.
+            wsSend({type: 'ping'});
+        }, HEARTBEAT_MS);
+    }
 
     // Tracks the in-flight LLM stream id (set by stream_snapshot, cleared by
     // response/silent_complete/error). Lets chat.js match terminal events
@@ -247,6 +265,7 @@ var OpenFangAPI = (function() {
         _wsConnected = true;
         _reconnectAttempts = 0;
         setConnectionState('connected');
+          _startHeartbeat();
         if (_reconnectAttempt > 0) {
           OpenFangToast.success('Reconnected');
           _reconnectAttempt = 0;
@@ -270,6 +289,7 @@ var OpenFangAPI = (function() {
         if (_ws !== socket) return;
         _wsConnected = false;
         _ws = null;
+          _stopHeartbeat();
         if (_wsAgentId && _reconnectAttempts < MAX_RECONNECT && e.code !== 1000) {
           _reconnectAttempts++;
           _reconnectAttempt = _reconnectAttempts;
@@ -303,6 +323,7 @@ var OpenFangAPI = (function() {
     _wsAgentId = null;
     _reconnectAttempts = MAX_RECONNECT;
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      _stopHeartbeat();
     if (_ws) { _ws.close(1000); _ws = null; }
     _wsConnected = false;
   }
