@@ -1,13 +1,17 @@
 .PHONY: help build build-release test test-quick clippy check install reinstall \
-       start start-detach stop restart clean kill-port mem-check \
+       start start-detach stop restart clean clean-stale kill-port mem-check \
        docker-dev docker-dev-up docker-dev-stop docker-dev-restart docker-dev-logs docker-dev-clean
 
 # Memory-aware parallelism to avoid OOM on Linux (systemd-oomd)
 # [profile.test] in Cargo.toml uses debug=false to keep test binaries small (~4MB vs ~250MB)
 # .cargo/config.toml caps build jobs; TEST_THREADS limits parallel test execution
+# Hard caps on test path (TEST_JOBS=4, TEST_THREADS_CAP=2) bound concurrent mold link
+# spikes that previously triggered nvidia-modeset display-engine timeouts under load.
 AVAILABLE_GB := $(shell awk '/MemAvailable/ {printf "%d", $$2/1048576}' /proc/meminfo)
 JOBS ?= $(shell echo $$(( $(AVAILABLE_GB) > 48 ? 8 : $(AVAILABLE_GB) > 24 ? 4 : 2 )))
 TEST_THREADS ?= $(shell echo $$(( $(AVAILABLE_GB) > 32 ? 4 : $(AVAILABLE_GB) > 16 ? 2 : 1 )))
+TEST_JOBS ?= 4
+TEST_THREADS_CAP ?= 2
 
 # Default target: show help
 .DEFAULT_GOAL := help
@@ -26,13 +30,14 @@ build-release: ## Build optimized release binary
 
 mem-check: ## Show current memory and recommended parallelism
 	@echo "Available: $(AVAILABLE_GB) GB | JOBS=$(JOBS) | TEST_THREADS=$(TEST_THREADS)"
+	@echo "Test caps: TEST_JOBS=$(TEST_JOBS) | TEST_THREADS_CAP=$(TEST_THREADS_CAP)"
 	@echo "Swap: $$(swapon --show=SIZE --noheadings 2>/dev/null || echo 'none')"
 
 test: ## Run full test suite (nextest: process-per-test)
-	cargo nextest run --workspace --test-threads $(TEST_THREADS)
+	cargo nextest run --workspace --build-jobs $(TEST_JOBS) --test-threads $(TEST_THREADS_CAP)
 
 test-quick: ## Run lib-only tests (faster, no integration tests)
-	cargo nextest run --workspace --lib --test-threads $(TEST_THREADS)
+	cargo nextest run --workspace --lib --build-jobs $(TEST_JOBS) --test-threads $(TEST_THREADS_CAP)
 
 clippy: ## Lint with clippy (warnings are errors)
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -93,3 +98,9 @@ docker-dev-clean: ## Remove dev volumes
 
 clean: ## Remove all build artifacts
 	cargo clean
+
+clean-stale: ## Periodic deep clean: drop debug artifacts to avoid 10s of GB accumulation
+	@before=$$(du -sh target/debug 2>/dev/null | cut -f1); \
+	  rm -rf target/debug; \
+	  echo "Removed target/debug (was $${before:-absent})."
+	@echo "Tip: run monthly or after rustup updates (mixed-toolchain rlibs accumulate)."
