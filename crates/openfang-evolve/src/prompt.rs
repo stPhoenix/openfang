@@ -1,6 +1,7 @@
 //! Prompt construction for the execution analyzer LLM call.
 
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
+use openfang_types::truncate_str;
 
 /// Maximum number of messages to include in the analysis prompt.
 /// If a session exceeds this, we keep the first 1/4 and last 3/4.
@@ -146,7 +147,7 @@ pub fn build_user_message(
 
     // Phase 4: Hard-truncate as last resort
     if result.len() > char_budget && char_budget > 20 {
-        let mut truncated = result[..char_budget - 15].to_string();
+        let mut truncated = truncate_str(&result, char_budget - 15).to_string();
         truncated.push_str("\n[TRUNCATED]\n");
         return truncated;
     }
@@ -242,7 +243,7 @@ fn extract_text_from_blocks(content: &[ContentBlock], limits: &FieldLimits) -> S
                     serde_json::to_string(input).unwrap_or_default()
                 };
                 let truncated = if input_str.len() > limits.tool_input {
-                    format!("{}... [truncated]", &input_str[..limits.tool_input])
+                    format!("{}... [truncated]", truncate_str(&input_str, limits.tool_input))
                 } else {
                     input_str
                 };
@@ -256,7 +257,7 @@ fn extract_text_from_blocks(content: &[ContentBlock], limits: &FieldLimits) -> S
             } => {
                 let error_tag = if *is_error { " ERROR" } else { "" };
                 let truncated = if result_content.len() > limits.tool_result {
-                    format!("{}... [truncated]", &result_content[..limits.tool_result])
+                    format!("{}... [truncated]", truncate_str(result_content, limits.tool_result))
                 } else {
                     result_content.clone()
                 };
@@ -269,7 +270,7 @@ fn extract_text_from_blocks(content: &[ContentBlock], limits: &FieldLimits) -> S
                     continue;
                 }
                 let preview = if thinking.len() > limits.thinking {
-                    format!("{}...", &thinking[..limits.thinking])
+                    format!("{}...", truncate_str(thinking, limits.thinking))
                 } else {
                     thinking.clone()
                 };
@@ -286,11 +287,7 @@ const SKILL_CONTENT_MAX_CHARS: usize = 16000;
 
 /// Truncate skill content to fit in prompts.
 fn truncate_content(content: &str) -> &str {
-    if content.len() <= SKILL_CONTENT_MAX_CHARS {
-        content
-    } else {
-        &content[..SKILL_CONTENT_MAX_CHARS]
-    }
+    truncate_str(content, SKILL_CONTENT_MAX_CHARS)
 }
 
 /// Build the system prompt for the evolution evolver agent.
@@ -732,5 +729,81 @@ mod tests {
         let result = retry_prompt("search text not found", "# Current content");
         assert!(result.contains("search text not found"));
         assert!(result.contains("# Current content"));
+    }
+
+    // Regression: prompt.rs:259 panicked when a multibyte char (e.g. '°' from
+    // a weather-forecast tool result) straddled the byte-truncation point.
+    // '°' (U+00B0) is 2 bytes (0xC2 0xB0); placing it at bytes 999..1001 with
+    // a 1000-byte limit reproduces the original `byte index 1000 is not a
+    // char boundary` panic when raw byte slicing is used.
+
+    #[test]
+    fn tool_result_with_multibyte_char_no_panic() {
+        let content = format!("{}°C extra", "x".repeat(999));
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "tu_1".into(),
+            tool_name: String::new(),
+            content,
+            is_error: false,
+        };
+        let limits = FieldLimits {
+            tool_input: 100,
+            tool_result: 1000,
+            thinking: 0,
+        };
+        let out = extract_text_from_blocks(&[block], &limits);
+        assert!(out.contains("[truncated]"));
+        assert!(out.contains("Tool Result"));
+    }
+
+    #[test]
+    fn tool_input_with_multibyte_char_no_panic() {
+        let payload = format!("{}°C extra", "x".repeat(999));
+        let block = ContentBlock::ToolUse {
+            id: "tu_2".into(),
+            name: "weather".into(),
+            input: serde_json::Value::String(payload),
+            provider_metadata: None,
+        };
+        let limits = FieldLimits {
+            tool_input: 1000,
+            tool_result: 100,
+            thinking: 0,
+        };
+        let out = extract_text_from_blocks(&[block], &limits);
+        assert!(out.contains("[truncated]"));
+        assert!(out.contains("Tool Call"));
+    }
+
+    #[test]
+    fn thinking_with_multibyte_char_no_panic() {
+        let block = ContentBlock::Thinking {
+            thinking: format!("{}°C extra", "x".repeat(999)),
+            signature: None,
+            provider_metadata: None,
+        };
+        let limits = FieldLimits {
+            tool_input: 100,
+            tool_result: 100,
+            thinking: 1000,
+        };
+        let out = extract_text_from_blocks(&[block], &limits);
+        assert!(out.contains("Thinking"));
+        assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn hard_truncate_phase4_with_multibyte_no_panic() {
+        // Force Phase-4 hard-truncate (line 149) by giving a tiny budget that
+        // still passes `char_budget > 20`, with messages full of multibyte
+        // chars. Sweep several budgets so at least one slice point lands on
+        // a non-boundary byte if `truncate_str` is missing.
+        let msgs: Vec<Message> = (0..200)
+            .map(|_| test_msg(&"°".repeat(200)))
+            .collect();
+        for context_window in [4006usize, 4008, 4010, 4015, 4020, 4030] {
+            let out = build_user_message(&msgs, &[], context_window);
+            assert!(out.contains("[TRUNCATED]") || out.len() <= context_window * CHARS_PER_TOKEN);
+        }
     }
 }
