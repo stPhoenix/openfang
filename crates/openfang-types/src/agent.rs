@@ -908,11 +908,13 @@ mod tests {
                 name: "file_read".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "shell_exec".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
         ];
         let filtered = AgentMode::Observe.filter_tools(tools);
@@ -926,26 +928,31 @@ mod tests {
                 name: "file_read".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "file_write".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "shell_exec".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "web_fetch".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "memory_recall".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
         ];
         let filtered = AgentMode::Assist.filter_tools(tools);
@@ -965,11 +972,13 @@ mod tests {
                 name: "file_read".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
             ToolDefinition {
                 name: "shell_exec".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
+                ..Default::default()
             },
         ];
         let filtered = AgentMode::Full.filter_tools(tools);

@@ -383,8 +383,16 @@ pub async fn run_agent_loop(
     sender_role: Option<openfang_types::sender::SenderRole>,
     thinking_override: Option<openfang_types::config::ThinkingConfig>,
     already_persisted: bool,
+    tool_search_config: Option<&openfang_types::config::ToolSearchConfig>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
+    let default_tool_search_cfg = openfang_types::config::ToolSearchConfig::default();
+    let tool_search_cfg = tool_search_config.unwrap_or(&default_tool_search_cfg);
+    let is_subagent_for_tool_search = manifest
+        .metadata
+        .get("is_subagent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -681,13 +689,34 @@ pub async fn run_agent_loop(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        // Compute the set of deferred tools the model has already pulled in
+        // via `ToolSearch`. Drives both the tool filtering below and the
+        // pending-tools section appended to the system prompt.
+        let discovered = crate::tool_search::extract_discovered(&messages);
+        let pending = crate::tool_search::pending_names(available_tools, &discovered);
+        let iter_system_prompt = if pending.is_empty() {
+            system_prompt.clone()
+        } else {
+            let mut s = system_prompt.clone();
+            s.push_str("\n\n");
+            s.push_str(&crate::prompt_builder::build_deferred_tools_section(&pending));
+            s
+        };
+
         // For Viewer role, strip all tools from the LLM request so the model
         // responds conversationally without attempting tool calls.
         let request_tools =
             if sender_role == Some(openfang_types::sender::SenderRole::Viewer) {
                 vec![]
             } else {
-                available_tools.to_vec()
+                crate::tool_search::filter_for_request(
+                    available_tools,
+                    &discovered,
+                    tool_search_cfg,
+                    &manifest.model.model,
+                    is_subagent_for_tool_search,
+                    &manifest.model.provider,
+                )
             };
 
         let request = CompletionRequest {
@@ -696,7 +725,7 @@ pub async fn run_agent_loop(
             tools: request_tools,
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
-            system: Some(system_prompt.clone()),
+            system: Some(iter_system_prompt),
             thinking: thinking_override.clone(),
         };
 
@@ -732,7 +761,22 @@ pub async fn run_agent_loop(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered = recover_text_tool_calls(&response.text(), available_tools);
+            let mut recovered = recover_text_tool_calls(&response.text(), available_tools);
+            // Drop recovered calls that target deferred-undiscovered tools.
+            // The model is guessing args without the schema — refuse and let
+            // it route through ToolSearch on the next turn.
+            recovered.retain(|tc| {
+                let is_deferred_undiscovered = available_tools.iter().any(|t| {
+                    t.name == tc.name && t.defer && !discovered.contains(&t.name)
+                });
+                if is_deferred_undiscovered {
+                    warn!(
+                        tool = %tc.name,
+                        "Refusing recovered text-form call for deferred tool — model must call ToolSearch first"
+                    );
+                }
+                !is_deferred_undiscovered
+            });
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -1110,49 +1154,61 @@ pub async fn run_agent_loop(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
-                    let timeout = tool_timeout_for(&tool_call.name);
-                    let timeout_secs = timeout.as_secs();
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        tool_runner::execute_tool(
+                    // ToolSearch is a built-in discovery meta-tool that operates
+                    // purely on the available tool list. Skip the approval /
+                    // timeout / capability machinery and execute inline.
+                    let result = if tool_call.name == crate::tool_search::TOOL_SEARCH_NAME {
+                        crate::tool_search::execute_tool_search(
                             &tool_call.id,
-                            &tool_call.name,
                             &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                            Some(&manifest.capabilities),
-                            Some(&manifest.prompt_guard),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, timeout_secs
-                                ),
-                                is_error: true,
+                            available_tools,
+                            tool_search_cfg,
+                        )
+                    } else {
+                        // Timeout-wrapped execution
+                        let timeout = tool_timeout_for(&tool_call.name);
+                        let timeout_secs = timeout.as_secs();
+                        match tokio::time::timeout(
+                            timeout,
+                            tool_runner::execute_tool(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &tool_call.input,
+                                kernel.as_ref(),
+                                Some(&allowed_tool_names),
+                                Some(&caller_id_str),
+                                skill_registry,
+                                mcp_connections,
+                                web_ctx,
+                                browser_ctx,
+                                if hand_allowed_env.is_empty() {
+                                    None
+                                } else {
+                                    Some(&hand_allowed_env)
+                                },
+                                workspace_root,
+                                media_engine,
+                                effective_exec_policy,
+                                tts_engine,
+                                docker_config,
+                                process_manager,
+                                Some(&manifest.capabilities),
+                                Some(&manifest.prompt_guard),
+                            ),
+                        )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
+                                openfang_types::tool::ToolResult {
+                                    tool_use_id: tool_call.id.clone(),
+                                    content: format!(
+                                        "Tool '{}' timed out after {}s.",
+                                        tool_call.name, timeout_secs
+                                    ),
+                                    is_error: true,
+                                }
                             }
                         }
                     };
@@ -1730,8 +1786,16 @@ pub async fn run_agent_loop_streaming(
     sender_role: Option<openfang_types::sender::SenderRole>,
     thinking_override: Option<openfang_types::config::ThinkingConfig>,
     already_persisted: bool,
+    tool_search_config: Option<&openfang_types::config::ToolSearchConfig>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
+    let default_tool_search_cfg = openfang_types::config::ToolSearchConfig::default();
+    let tool_search_cfg = tool_search_config.unwrap_or(&default_tool_search_cfg);
+    let is_subagent_for_tool_search = manifest
+        .metadata
+        .get("is_subagent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -2052,12 +2116,33 @@ pub async fn run_agent_loop_streaming(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        // Compute the set of deferred tools the model has already pulled in
+        // via `ToolSearch`. Drives both the tool filtering below and the
+        // pending-tools section appended to the system prompt.
+        let discovered = crate::tool_search::extract_discovered(&messages);
+        let pending = crate::tool_search::pending_names(available_tools, &discovered);
+        let iter_system_prompt = if pending.is_empty() {
+            system_prompt.clone()
+        } else {
+            let mut s = system_prompt.clone();
+            s.push_str("\n\n");
+            s.push_str(&crate::prompt_builder::build_deferred_tools_section(&pending));
+            s
+        };
+
         // For Viewer role, strip all tools from the streaming LLM request
         let request_tools =
             if sender_role == Some(openfang_types::sender::SenderRole::Viewer) {
                 vec![]
             } else {
-                available_tools.to_vec()
+                crate::tool_search::filter_for_request(
+                    available_tools,
+                    &discovered,
+                    tool_search_cfg,
+                    &manifest.model.model,
+                    is_subagent_for_tool_search,
+                    &manifest.model.provider,
+                )
             };
 
         let request = CompletionRequest {
@@ -2066,7 +2151,7 @@ pub async fn run_agent_loop_streaming(
             tools: request_tools,
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
-            system: Some(system_prompt.clone()),
+            system: Some(iter_system_prompt),
             thinking: thinking_override.clone(),
         };
 
@@ -2108,7 +2193,19 @@ pub async fn run_agent_loop_streaming(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered = recover_text_tool_calls(&response.text(), available_tools);
+            let mut recovered = recover_text_tool_calls(&response.text(), available_tools);
+            recovered.retain(|tc| {
+                let is_deferred_undiscovered = available_tools.iter().any(|t| {
+                    t.name == tc.name && t.defer && !discovered.contains(&t.name)
+                });
+                if is_deferred_undiscovered {
+                    warn!(
+                        tool = %tc.name,
+                        "Refusing recovered text-form call for deferred tool (streaming) — model must call ToolSearch first"
+                    );
+                }
+                !is_deferred_undiscovered
+            });
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -2452,49 +2549,59 @@ pub async fn run_agent_loop_streaming(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
-                    let timeout = tool_timeout_for(&tool_call.name);
-                    let timeout_secs = timeout.as_secs();
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        tool_runner::execute_tool(
+                    // ToolSearch short-circuit (see non-streaming loop for rationale).
+                    let result = if tool_call.name == crate::tool_search::TOOL_SEARCH_NAME {
+                        crate::tool_search::execute_tool_search(
                             &tool_call.id,
-                            &tool_call.name,
                             &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                            Some(&manifest.capabilities),
-                            Some(&manifest.prompt_guard),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, timeout_secs
-                                ),
-                                is_error: true,
+                            available_tools,
+                            tool_search_cfg,
+                        )
+                    } else {
+                        // Timeout-wrapped execution
+                        let timeout = tool_timeout_for(&tool_call.name);
+                        let timeout_secs = timeout.as_secs();
+                        match tokio::time::timeout(
+                            timeout,
+                            tool_runner::execute_tool(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &tool_call.input,
+                                kernel.as_ref(),
+                                Some(&allowed_tool_names),
+                                Some(&caller_id_str),
+                                skill_registry,
+                                mcp_connections,
+                                web_ctx,
+                                browser_ctx,
+                                if hand_allowed_env.is_empty() {
+                                    None
+                                } else {
+                                    Some(&hand_allowed_env)
+                                },
+                                workspace_root,
+                                media_engine,
+                                effective_exec_policy,
+                                tts_engine,
+                                docker_config,
+                                process_manager,
+                                Some(&manifest.capabilities),
+                                Some(&manifest.prompt_guard),
+                            ),
+                        )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
+                                openfang_types::tool::ToolResult {
+                                    tool_use_id: tool_call.id.clone(),
+                                    content: format!(
+                                        "Tool '{}' timed out after {}s.",
+                                        tool_call.name, timeout_secs
+                                    ),
+                                    is_error: true,
+                                }
                             }
                         }
                     };
@@ -4054,6 +4161,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should complete without error");
@@ -4112,6 +4220,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should complete without error");
@@ -4172,6 +4281,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should complete without error");
@@ -4230,6 +4340,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should complete without error");
@@ -4281,6 +4392,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4410,6 +4522,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should recover via retry");
@@ -4462,6 +4575,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4522,6 +4636,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4544,6 +4659,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text =
             r#"Let me search for that. <function=web_search>{"query":"rust async"}</function>"#;
@@ -4560,6 +4676,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function=shell_exec><parameter=command>python3 "/tmp/run.py" --flag value</parameter></function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4577,6 +4694,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<tool_call>
 <function=shell_exec>
@@ -4598,6 +4716,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function=hack_system>{"cmd":"rm -rf /"}</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4610,6 +4729,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function=web_search>not valid json</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4623,11 +4743,13 @@ mod tests {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
         ];
         let text = r#"<function=web_search>{"query":"hello"}</function> then <function=read_file>{"path":"a.txt"}</function>"#;
@@ -4643,6 +4765,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "Just a normal response with no tool calls.";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4664,6 +4787,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function=web_search>{"query":"rust","filters":{"lang":"en","year":2024}}</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4677,6 +4801,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "Sure, let me search that for you.\n\n<function=web_search>{\"query\":\"rust async programming\"}</function>\n\nI'll get back to you with results.";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4690,6 +4815,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Some models emit pretty-printed JSON
         let text = "<function=web_search>\n  {\"query\": \"hello world\"}\n</function>";
@@ -4704,6 +4830,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Missing </function> — should gracefully skip
         let text = r#"<function=web_search>{"query":"test"}"#;
@@ -4717,6 +4844,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Missing > after tool name
         let text = r#"<function=web_search{"query":"test"}</function>"#;
@@ -4733,6 +4861,7 @@ mod tests {
             name: "list_files".into(),
             description: "List".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function=list_files>{}</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4748,11 +4877,13 @@ mod tests {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "read_file".into(),
                 description: "Read".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
         ];
         // First: valid, second: unknown tool, third: valid
@@ -4771,6 +4902,7 @@ mod tests {
             name: "web_fetch".into(),
             description: "Fetch".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function>web_fetch{"url":"https://example.com"}</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4785,6 +4917,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function>unknown_tool{"q":"test"}</function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4797,6 +4930,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"Let me search for that. <function>web_search{"query":"rust lang"}</function> I'll find the answer."#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4811,11 +4945,13 @@ mod tests {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "web_fetch".into(),
                 description: "Fetch".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
         ];
         // Mix of variant 1 and variant 2
@@ -4832,6 +4968,7 @@ mod tests {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"I'll run that for you. <tool>exec{"command":"ls -la"}</tool>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4846,6 +4983,7 @@ mod tests {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "I'll execute that command:\n```\nexec {\"command\": \"ls -la\"}\n```";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4860,6 +4998,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "```json\nweb_search {\"query\": \"rust\"}\n```";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4873,6 +5012,7 @@ mod tests {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"Let me run `exec {"command":"pwd"}` for you."#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4887,6 +5027,7 @@ mod tests {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"Try `unknown_tool {"key":"val"}` instead."#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -4899,6 +5040,7 @@ mod tests {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Same call in both function tag and tool tag — should only appear once
         let text =
@@ -4915,6 +5057,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute shell command".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n[/TOOL_CALL]";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4929,6 +5072,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute shell command".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Exact format from issue #354
         let text = "[TOOL_CALL]\n{tool => \"shell_exec\", args => {\n--command \"ls -F /\"\n}}\n[/TOOL_CALL]";
@@ -4944,6 +5088,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "[TOOL_CALL]\n{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}\n[/TOOL_CALL]";
         let calls = recover_text_tool_calls(text, &tools);
@@ -4957,11 +5102,13 @@ mod tests {
                 name: "shell_exec".into(),
                 description: "Execute".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "file_read".into(),
                 description: "Read".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
         ];
         let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}\n[/TOOL_CALL]\nSome text.\n[TOOL_CALL]\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n[/TOOL_CALL]";
@@ -4977,6 +5124,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         // Unclosed [TOOL_CALL] — pattern 6 skips it, but pattern 8 (bare JSON)
         // still finds the valid JSON tool call object.
@@ -4994,6 +5142,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_call>\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5008,6 +5157,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "I'll search for that.\n\n<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust async\"}}\n</tool_call>\n\nLet me get results.";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5022,6 +5172,7 @@ mod tests {
             name: "file_read".into(),
             description: "Read".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_call>{\"function\": \"file_read\", \"arguments\": {\"path\": \"/etc/hosts\"}}</tool_call>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5035,6 +5186,7 @@ mod tests {
             name: "web_fetch".into(),
             description: "Fetch".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_call>{\"name\": \"web_fetch\", \"parameters\": {\"url\": \"https://example.com\"}}</tool_call>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5049,6 +5201,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": \"{\\\"command\\\": \\\"pwd\\\"}\"}</tool_call>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5063,6 +5216,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_call>{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}</tool_call>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5076,11 +5230,13 @@ mod tests {
                 name: "shell_exec".into(),
                 description: "Execute".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             },
         ];
         let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}</tool_call>\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}</tool_call>";
@@ -5098,6 +5254,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text =
             "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
@@ -5113,6 +5270,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "The config looks like {\"debug\": true, \"level\": \"info\"}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5125,6 +5283,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<function=shell_exec>{\"command\":\"ls\"}</function> {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"pwd\"}}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5140,6 +5299,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function name="web_search" parameters="{&quot;query&quot;: &quot;best crypto 2024&quot;}" />"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -5154,6 +5314,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function name="unknown_tool" parameters="{&quot;x&quot;: 1}" />"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -5166,6 +5327,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = r#"<function name="shell_exec" parameters="{&quot;command&quot;: &quot;ls&quot;}"></function>"#;
         let calls = recover_text_tool_calls(text, &tools);
@@ -5181,6 +5343,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<|plugin|>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}\n<|endofblock|>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5195,6 +5358,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text =
             "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
@@ -5210,6 +5374,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "Action: web_search\nAction Input: {\"query\": \"rust programming\"}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5224,6 +5389,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "Action: unknown_tool\nAction Input: {\"key\": \"value\"}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5238,6 +5404,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "shell_exec\n{\"command\": \"ls -la\"}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5252,6 +5419,7 @@ mod tests {
             name: "shell_exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "unknown_tool\n{\"command\": \"ls\"}";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5266,6 +5434,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text =
             "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
@@ -5280,6 +5449,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
         let text = "<tool_use>{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}</tool_use>";
         let calls = recover_text_tool_calls(text, &tools);
@@ -5474,6 +5644,7 @@ mod tests {
                     "query": {"type": "string"}
                 }
             }),
+            ..Default::default()
         }];
 
         let result = run_agent_loop(
@@ -5503,6 +5674,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Agent loop should complete");
@@ -5549,6 +5721,7 @@ mod tests {
                     "query": {"type": "string"}
                 }
             }),
+            ..Default::default()
         }];
 
         let result = run_agent_loop(
@@ -5578,6 +5751,7 @@ mod tests {
             None,
             None,
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Agent loop should recover nested XML tool calls");
@@ -5626,6 +5800,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
+            ..Default::default()
         }];
 
         let result = run_agent_loop(
@@ -5655,6 +5830,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Normal loop should complete");
@@ -5691,6 +5867,7 @@ mod tests {
                     "query": {"type": "string"}
                 }
             }),
+            ..Default::default()
         }];
 
         let (tx, mut rx) = mpsc::channel(64);
@@ -5723,6 +5900,7 @@ mod tests {
             None, // sender_role
             None, // thinking_override
             false, // already_persisted
+            None, // tool_search_config
         )
         .await
         .expect("Streaming loop should complete");

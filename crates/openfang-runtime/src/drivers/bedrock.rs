@@ -826,6 +826,7 @@ mod tests {
             name: "search".to_string(),
             description: "Search the web".to_string(),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            ..Default::default()
         }];
         let result = convert_tools(&tools);
         assert!(result.is_some());

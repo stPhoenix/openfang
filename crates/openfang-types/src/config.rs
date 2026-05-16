@@ -1261,6 +1261,42 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+    /// Deferred-tool loading configuration (ToolSearch meta-tool).
+    #[serde(default)]
+    pub tool_search: ToolSearchConfig,
+}
+
+/// Deferred-tool loading configuration.
+///
+/// When enabled, skill-provided and MCP tools are sent to the LLM as
+/// names-only (in the system prompt) rather than full JSON schemas in
+/// `request.tools`. The model uses the built-in `ToolSearch` meta-tool
+/// to fetch schemas on demand. Discovered tools become available with
+/// full schemas on subsequent turns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolSearchConfig {
+    /// Master switch. Disable to send all tool schemas every turn (legacy).
+    pub enabled: bool,
+    /// When true, MCP tools (`mcp__server__action`) are deferred by default.
+    pub always_defer_mcp: bool,
+    /// When true, skill-provided tools are deferred by default.
+    pub always_defer_skills: bool,
+    /// Model name substrings that lack support for ToolSearch (the discovery
+    /// round-trip is too lossy on short-context models). Match is
+    /// case-insensitive substring. Default: `["haiku"]`.
+    pub unsupported_model_substrings: Vec<String>,
+}
+
+impl Default for ToolSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            always_defer_mcp: true,
+            always_defer_skills: true,
+            unsupported_model_substrings: vec!["haiku".to_string()],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,6 +1742,7 @@ impl Default for KernelConfig {
             compaction: CompactionSettings::default(),
             evolve: EvolveConfig::default(),
             skills: HashMap::new(),
+            tool_search: ToolSearchConfig::default(),
         }
     }
 }

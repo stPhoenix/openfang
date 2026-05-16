@@ -115,11 +115,13 @@ mod tests {
                 name: "file_read".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                ..Default::default()
             },
             ToolDefinition {
                 name: "web_fetch".to_string(),
                 description: "Fetch a URL".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
         ]
     }

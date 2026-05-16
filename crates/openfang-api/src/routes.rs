@@ -3663,6 +3663,9 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 Some(openfang_skills::SkillSource::Bundled) => {
                     serde_json::json!({"type": "bundled"})
                 }
+                Some(openfang_skills::SkillSource::Evolution { parents }) => {
+                    serde_json::json!({"type": "evolution", "parents": parents})
+                }
                 Some(openfang_skills::SkillSource::Native) | None => {
                     serde_json::json!({"type": "local"})
                 }
@@ -7323,6 +7326,7 @@ pub async fn mcp_http(
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
                 input_schema: skill_tool.input_schema.clone(),
+                ..Default::default()
             });
         }
     }

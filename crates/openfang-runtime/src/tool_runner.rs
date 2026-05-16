@@ -1179,6 +1179,31 @@ pub async fn execute_tool(
                         }
                         Err(e) => Err(format!("Skill execution failed: {e}")),
                     }
+                } else if let Some(skill) = registry
+                    .get(other)
+                    .filter(|s| s.enabled && s.manifest.tools.provided.is_empty())
+                {
+                    // Fallback 2b: Prompt-only skill persona stub. The kernel
+                    // surfaces each such skill as a deferred zero-arg tool;
+                    // calling it returns the persona's prompt context so the
+                    // model can adopt the persona on demand without paying
+                    // for it in every turn's system prompt.
+                    debug!(
+                        tool = other,
+                        skill = %skill.manifest.skill.name,
+                        "Loading prompt-only skill persona"
+                    );
+                    match skill.manifest.prompt_context.as_deref() {
+                        Some(ctx) if !ctx.is_empty() => Ok(format!(
+                            "## {name} persona loaded\n\n{ctx}",
+                            name = skill.manifest.skill.name,
+                            ctx = ctx
+                        )),
+                        _ => Ok(format!(
+                            "Skill '{}' has no prompt context to load.",
+                            skill.manifest.skill.name
+                        )),
+                    }
                 } else {
                     Err(format!("Unknown tool: {other}"))
                 }
@@ -1216,6 +1241,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "file_write".to_string(),
@@ -1228,6 +1254,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "content"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "file_list".to_string(),
@@ -1239,6 +1266,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "apply_patch".to_string(),
@@ -1253,6 +1281,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["patch"]
             }),
+            ..Default::default()
         },
         // --- Web tools ---
         ToolDefinition {
@@ -1268,6 +1297,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["url"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "web_search".to_string(),
@@ -1280,6 +1310,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         },
         // --- Shell tool ---
         ToolDefinition {
@@ -1293,6 +1324,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["command"]
             }),
+            ..Default::default()
         },
         // --- Inter-agent tools ---
         ToolDefinition {
@@ -1311,6 +1343,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["agent_id", "message"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_spawn".to_string(),
@@ -1325,6 +1358,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["manifest_toml"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_list".to_string(),
@@ -1333,6 +1367,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_template_list".to_string(),
@@ -1344,6 +1379,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_template_spawn".to_string(),
@@ -1365,6 +1401,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["template_name"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_kill".to_string(),
@@ -1376,6 +1413,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["agent_id"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_delegate".to_string(),
@@ -1393,6 +1431,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["manifest_toml", "message"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_delegate_async".to_string(),
@@ -1415,6 +1454,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["manifest_toml", "message"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "delegation_await".to_string(),
@@ -1437,6 +1477,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["delegation_ids"]
             }),
+            ..Default::default()
         },
         // --- Self-inspection / self-modification tools ---
         ToolDefinition {
@@ -1446,6 +1487,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "agent_self_modify".to_string(),
@@ -1466,6 +1508,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "reason": { "type": "string", "description": "Explain why you want to change your manifest (shown to human approver)" }
                 }
             }),
+            ..Default::default()
         },
         // --- Shared memory tools ---
         ToolDefinition {
@@ -1479,6 +1522,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["key", "value"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
@@ -1490,6 +1534,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["key"]
             }),
+            ..Default::default()
         },
         // --- Collaboration tools ---
         ToolDefinition {
@@ -1502,6 +1547,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "task_post".to_string(),
@@ -1515,6 +1561,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["title", "description"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "task_claim".to_string(),
@@ -1523,6 +1570,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "task_complete".to_string(),
@@ -1535,6 +1583,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["task_id", "result"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "task_list".to_string(),
@@ -1545,6 +1594,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed (optional)" }
                 }
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "event_publish".to_string(),
@@ -1557,6 +1607,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["event_type"]
             }),
+            ..Default::default()
         },
         // --- Knowledge graph tools ---
         ToolDefinition {
@@ -1571,6 +1622,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["name", "entity_type"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "knowledge_add_relation".to_string(),
@@ -1586,6 +1638,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["source", "relation", "target"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "knowledge_query".to_string(),
@@ -1599,6 +1652,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "max_depth": { "type": "integer", "description": "Maximum traversal depth (default: 1)" }
                 }
             }),
+            ..Default::default()
         },
         // --- Image analysis tool ---
         ToolDefinition {
@@ -1612,6 +1666,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         // --- Location tool ---
         ToolDefinition {
@@ -1621,6 +1676,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         // --- Browser automation tools ---
         ToolDefinition {
@@ -1633,6 +1689,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["url"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_click".to_string(),
@@ -1644,6 +1701,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["selector"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_type".to_string(),
@@ -1656,6 +1714,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["selector", "text"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_screenshot".to_string(),
@@ -1664,6 +1723,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_read_page".to_string(),
@@ -1672,6 +1732,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_close".to_string(),
@@ -1680,6 +1741,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_scroll".to_string(),
@@ -1691,6 +1753,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "amount": { "type": "integer", "description": "Pixels to scroll (default: 600)" }
                 }
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_wait".to_string(),
@@ -1703,6 +1766,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["selector"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_run_js".to_string(),
@@ -1714,6 +1778,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["expression"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "browser_back".to_string(),
@@ -1722,6 +1787,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         // --- Media understanding tools ---
         ToolDefinition {
@@ -1735,6 +1801,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "media_transcribe".to_string(),
@@ -1747,6 +1814,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         // --- Image generation tool ---
         ToolDefinition {
@@ -1763,6 +1831,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["prompt"]
             }),
+            ..Default::default()
         },
         // --- Cron scheduling tools ---
         ToolDefinition {
@@ -1787,6 +1856,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["name", "schedule", "action"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "cron_list".to_string(),
@@ -1795,6 +1865,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "cron_cancel".to_string(),
@@ -1806,6 +1877,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["job_id"]
             }),
+            ..Default::default()
         },
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
@@ -1826,6 +1898,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["channel", "recipient"]
             }),
+            ..Default::default()
         },
         // --- Hand tools (curated autonomous capability packages) ---
         ToolDefinition {
@@ -1835,6 +1908,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "hand_activate".to_string(),
@@ -1847,6 +1921,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["hand_id"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "hand_status".to_string(),
@@ -1858,6 +1933,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["hand_id"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "hand_deactivate".to_string(),
@@ -1869,6 +1945,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["instance_id"]
             }),
+            ..Default::default()
         },
         // --- A2A outbound tools ---
         ToolDefinition {
@@ -1881,6 +1958,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["url"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "a2a_send".to_string(),
@@ -1895,6 +1973,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["message"]
             }),
+            ..Default::default()
         },
         // --- TTS/STT tools ---
         ToolDefinition {
@@ -1909,6 +1988,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["text"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "speech_to_text".to_string(),
@@ -1921,6 +2001,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            ..Default::default()
         },
         // --- Docker sandbox tool ---
         ToolDefinition {
@@ -1933,6 +2014,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["command"]
             }),
+            ..Default::default()
         },
         // --- Persistent process tools ---
         ToolDefinition {
@@ -1950,6 +2032,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["command"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "process_poll".to_string(),
@@ -1961,6 +2044,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["process_id"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "process_write".to_string(),
@@ -1973,6 +2057,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["process_id", "data"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "process_kill".to_string(),
@@ -1984,6 +2069,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["process_id"]
             }),
+            ..Default::default()
         },
         ToolDefinition {
             name: "process_list".to_string(),
@@ -1992,6 +2078,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {}
             }),
+            ..Default::default()
         },
         // --- System time tool ---
         ToolDefinition {
@@ -2002,6 +2089,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {},
                 "required": []
             }),
+            ..Default::default()
         },
         // --- Canvas / A2UI tool ---
         ToolDefinition {
@@ -2015,6 +2103,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["html"]
             }),
+            ..Default::default()
         },
     ]
 }

@@ -1573,6 +1573,7 @@ mod tests {
             name: "mcp__serena__find_symbol".into(),
             description: "Find a symbol".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            ..Default::default()
         }];
         let (_, infos) = count_mcp_tool_tokens(&tools);
         assert_eq!(infos[0].server_name, "serena");

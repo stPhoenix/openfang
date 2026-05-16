@@ -151,6 +151,8 @@ impl McpConnection {
                 name: namespaced,
                 description: format!("[MCP:{server_name}] {description}"),
                 input_schema,
+                is_mcp: true,
+                ..Default::default()
             });
         }
 

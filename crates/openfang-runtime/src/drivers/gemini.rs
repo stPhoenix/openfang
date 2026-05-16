@@ -1335,6 +1335,7 @@ mod tests {
                         "query": {"type": "string"}
                     }
                 }),
+                ..Default::default()
             }],
             max_tokens: 1024,
             temperature: 0.7,

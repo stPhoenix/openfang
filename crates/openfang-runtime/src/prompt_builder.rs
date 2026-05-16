@@ -293,6 +293,37 @@ pub fn build_tools_section(granted_tools: &[String]) -> String {
     out
 }
 
+/// Build the "Available On-Demand Tools" section listing names of deferred
+/// tools whose full schemas are NOT currently in `request.tools`. The model
+/// is told to call `ToolSearch` to fetch a schema before invoking a deferred
+/// tool. Returns an empty string when there are no pending names.
+///
+/// Used by the agent loop to append a fresh section to the cached base
+/// system prompt each iteration. Kept stable across turns when the
+/// discovered set doesn't change, so prompt caching still hits on later
+/// turns even after the first ToolSearch.
+pub fn build_deferred_tools_section(pending: &[String]) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "## Available On-Demand Tools\n\
+         Schemas for the tools below are not loaded. Before invoking one, call \
+         `ToolSearch({\"query\":\"...\"})` to fetch its schema; on the next turn \
+         the tool becomes callable.\n\
+         Query forms:\n\
+         - `select:Name1,Name2` — load specific tools by exact name\n\
+         - `mcp__server_` — load all tools from an MCP server\n\
+         - `slack post` — keyword search\n\n",
+    );
+    for n in pending {
+        s.push_str("- ");
+        s.push_str(n);
+        s.push('\n');
+    }
+    s
+}
+
 /// Build canonical context as a standalone user message (instead of system prompt).
 ///
 /// This keeps the system prompt stable across turns, enabling provider prompt caching

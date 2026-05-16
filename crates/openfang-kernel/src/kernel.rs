@@ -2606,6 +2606,7 @@ impl OpenFangKernel {
                 sender_role,
                 thinking_override,
                 already_persisted,
+                Some(&kernel_clone.config.tool_search),
             )
             .await;
 
@@ -3288,6 +3289,7 @@ impl OpenFangKernel {
             sender_role,
             self.config.thinking.clone(),
             already_persisted,
+            Some(&self.config.tool_search),
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -6560,6 +6562,75 @@ impl OpenFangKernel {
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
                 input_schema: skill_tool.input_schema.clone(),
+                ..Default::default()
+            });
+        }
+
+        // Step 2b: Add deferred stub tools for prompt-only skill personas.
+        // Each enabled skill that ships no `provided` tools is exposed as a
+        // zero-arg deferred tool. Until the model calls `ToolSearch` to fetch
+        // the schema (and then calls the tool itself), the persona's prompt
+        // context stays out of the conversation. When `enabled = false` (i.e.
+        // `tool_search.enabled` is off in config) all personas are surfaced
+        // as full tools, which the deferral classifier in Step 6 will skip.
+        let collect_personas =
+            |reg: &openfang_skills::registry::SkillRegistry| -> Vec<(String, String, Vec<String>)> {
+                reg.list()
+                    .into_iter()
+                    .filter(|s| s.enabled)
+                    .filter(|s| s.manifest.tools.provided.is_empty())
+                    .filter(|s| {
+                        skill_allowlist.is_empty()
+                            || skill_allowlist.contains(&s.manifest.skill.name)
+                    })
+                    .map(|s| {
+                        (
+                            s.manifest.skill.name.clone(),
+                            s.manifest.skill.description.clone(),
+                            s.manifest.skill.tags.clone(),
+                        )
+                    })
+                    .collect()
+            };
+        let persona_personas: Vec<(String, String, Vec<String>)> =
+            if let Some(snap) = skill_snapshot {
+                collect_personas(snap)
+            } else {
+                let registry = self
+                    .skill_registry
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                collect_personas(&registry)
+            };
+        let existing_names: std::collections::HashSet<String> =
+            all_tools.iter().map(|t| t.name.clone()).collect();
+        for (name, desc, tags) in persona_personas {
+            if existing_names.contains(&name) {
+                continue;
+            }
+            // Persona stubs follow the skills allowlist (already applied when
+            // collecting `persona_personas`), NOT `capabilities.tools` —
+            // they're not capability-gated builtins.
+            let blurb = if desc.is_empty() {
+                format!("{name} persona — call to load its full instructions.")
+            } else {
+                format!(
+                    "{desc} (Call this tool to load the full {name} persona instructions into the conversation.)"
+                )
+            };
+            let search_hint = if tags.is_empty() {
+                None
+            } else {
+                Some(tags.join(" "))
+            };
+            all_tools.push(ToolDefinition {
+                name,
+                description: blurb,
+                input_schema: serde_json::json!({"type":"object","properties":{}}),
+                defer: true,
+                search_hint,
+                is_mcp: false,
+                always_load: false,
             });
         }
 
@@ -6628,6 +6699,45 @@ impl OpenFangKernel {
         });
         if exec_blocks_shell {
             all_tools.retain(|t| t.name != "shell_exec");
+        }
+
+        // Step 6: Classify each tool for deferred loading. Skipped for
+        // subagents (their tool list is already tight) and when ToolSearch
+        // is disabled in config. Built-in tools (file_read, shell_exec, …)
+        // are never deferred — the model needs them on every turn.
+        let is_subagent = entry
+            .as_ref()
+            .and_then(|e| e.manifest.metadata.get("is_subagent"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !is_subagent && openfang_runtime::tool_search::is_enabled(&self.config.tool_search) {
+            let builtin_names: std::collections::HashSet<String> =
+                builtin_tool_definitions().into_iter().map(|t| t.name).collect();
+            for t in &mut all_tools {
+                if t.name == openfang_runtime::tool_search::TOOL_SEARCH_NAME {
+                    t.defer = false;
+                    t.always_load = true;
+                    continue;
+                }
+                if builtin_names.contains(&t.name) {
+                    t.defer = false;
+                    continue;
+                }
+                if t.always_load {
+                    t.defer = false;
+                    continue;
+                }
+                if openfang_runtime::mcp::extract_mcp_server(&t.name).is_some() {
+                    t.is_mcp = true;
+                }
+                t.defer = openfang_runtime::tool_search::classify_deferral(
+                    t,
+                    &self.config.tool_search,
+                );
+            }
+            if all_tools.iter().any(|t| t.defer) {
+                all_tools.push(openfang_runtime::tool_search::tool_search_definition());
+            }
         }
 
         all_tools
@@ -7264,6 +7374,23 @@ impl OpenFangKernel {
         let result =
             openfang_evolve::evolver::evolve(&context, &skill_dir, send_fn).await?;
 
+        // Stamp the skill manifest source as Evolution for DERIVED/CAPTURED so
+        // the UI badges it correctly instead of inheriting a parent's source
+        // (e.g. ClawHub) that copy_dir carried over in skill.toml.
+        if matches!(
+            context.evolution_type,
+            SuggestionKind::Derived | SuggestionKind::Captured
+        ) {
+            let parents: Vec<String> = context
+                .target_skills
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            if let Err(e) = stamp_evolution_source(&skill_dir, parents) {
+                warn!(skill_dir = %skill_dir.display(), error = %e, "failed to stamp evolution source");
+            }
+        }
+
         // --- Persist the evolution result ---
 
         let parent_ids: Vec<String> = context
@@ -7757,6 +7884,37 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
         disk.exec_policy = entry.exec_policy.clone();
     }
     disk
+}
+
+/// Rewrite the manifest of an evolved skill so its provenance shows as
+/// `SkillSource::Evolution`. Single-parent DERIVED copies the parent dir
+/// wholesale, so the parent's `skill.toml` (with its own source field) was
+/// carried over verbatim — without this stamp, the UI would badge a
+/// ClawHub-parented evolution as "ClawHub".
+fn stamp_evolution_source(
+    skill_dir: &std::path::Path,
+    parents: Vec<String>,
+) -> Result<(), String> {
+    use openfang_skills::openclaw_compat;
+    use openfang_skills::SkillSource;
+
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        return Err("SKILL.md missing — cannot stamp evolution source".into());
+    }
+
+    let _ = std::fs::remove_file(skill_dir.join("skill.toml"));
+    let _ = std::fs::remove_file(skill_dir.join("prompt_context.md"));
+
+    let mut converted = openclaw_compat::convert_skillmd(skill_dir)
+        .map_err(|e| format!("convert_skillmd: {e}"))?;
+    converted.manifest.source = Some(SkillSource::Evolution { parents });
+
+    openclaw_compat::write_openfang_manifest(skill_dir, &converted.manifest)
+        .map_err(|e| format!("write skill.toml: {e}"))?;
+    openclaw_compat::write_prompt_context(skill_dir, &converted.prompt_context)
+        .map_err(|e| format!("write prompt_context.md: {e}"))?;
+    Ok(())
 }
 
 fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {

@@ -226,6 +226,7 @@ mod tests {
                 name: format!("tool_{i}"),
                 description: "A test tool".to_string(),
                 input_schema: serde_json::json!({}),
+                ..Default::default()
             })
             .collect();
         let request = make_request(

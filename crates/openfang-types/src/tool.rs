@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Definition of a tool that an agent can use.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// Unique tool identifier.
     pub name: String,
@@ -11,6 +11,26 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for the tool's input parameters.
     pub input_schema: serde_json::Value,
+    /// When `true`, the tool's schema is not sent in `request.tools`;
+    /// the model only sees its name and must call `ToolSearch` to fetch
+    /// the schema before invoking it. Client-internal hint — never
+    /// serialized to a provider API.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer: bool,
+    /// Optional 3–10 word capability phrase used by `ToolSearch` keyword
+    /// scoring. Prefer terms NOT already in the tool name (e.g.
+    /// "jupyter" for `NotebookEdit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_hint: Option<String>,
+    /// Flag set automatically for tools sourced from MCP servers
+    /// (`name` matches `mcp__server__action`). Used by deferral classifier
+    /// and the keyword scorer to bias weights toward MCP naming.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_mcp: bool,
+    /// Hard opt-out from deferral. Set on tools the model must see on
+    /// every turn (the discovery tool itself, agent-spawn tools, etc.).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_load: bool,
 }
 
 /// A tool call requested by the LLM.
@@ -303,6 +323,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("web_search"));

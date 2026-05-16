@@ -84,6 +84,8 @@ function skillsPage() {
         case 'clawhub': return { text: 'ClawHub', cls: 'badge-info' };
         case 'openclaw': return { text: 'OpenClaw', cls: 'badge-info' };
         case 'bundled': return { text: 'Built-in', cls: 'badge-success' };
+          case 'evolution':
+              return {text: 'Evolution', cls: 'badge-warn'};
         default: return { text: 'Local', cls: 'badge-dim' };
       }
     },
