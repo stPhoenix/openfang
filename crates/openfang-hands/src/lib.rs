@@ -441,10 +441,19 @@ pub struct HandInstance {
     /// Model override chosen at activation time (persisted for restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Whether the periodic `[AUTONOMOUS TICK]` background loop runs for this
+    /// instance. Only meaningful for autonomous hands (`max_iterations` set).
+    /// Default true so existing hands keep ticking.
+    #[serde(default = "default_true")]
+    pub autonomous_tick_enabled: bool,
     /// When activated.
     pub activated_at: DateTime<Utc>,
     /// Last status change.
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl HandInstance {
@@ -470,6 +479,7 @@ impl HandInstance {
             config,
             provider_override: None,
             model_override: None,
+            autonomous_tick_enabled: true,
             activated_at: now,
             updated_at: now,
         }
@@ -492,6 +502,10 @@ pub struct ActivateHandRequest {
     /// hand to coexist as long as each name is distinct.
     #[serde(default)]
     pub instance_name: Option<String>,
+    /// Opt-out of the autonomous tick loop. `None` ⇒ use default (true).
+    /// Has no effect on Reactive hands.
+    #[serde(default)]
+    pub autonomous_tick_enabled: Option<bool>,
 }
 
 #[cfg(test)]

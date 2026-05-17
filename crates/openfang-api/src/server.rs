@@ -481,6 +481,10 @@ pub async fn build_router(
             axum::routing::delete(routes::deactivate_hand),
         )
         .route(
+            "/api/hands/instances/{id}/autonomous-tick",
+            axum::routing::post(routes::set_hand_autonomous_tick),
+        )
+        .route(
             "/api/hands/instances/{id}/stats",
             axum::routing::get(routes::hand_stats),
         )

@@ -67,6 +67,7 @@ impl HandRegistry {
                     "agent_id": e.agent_id,
                     "provider": e.provider_override,
                     "model": e.model_override,
+                    "autonomous_tick_enabled": e.autonomous_tick_enabled,
                 })
             })
             .collect();
@@ -95,6 +96,7 @@ impl HandRegistry {
         Option<String>,
         HashMap<String, serde_json::Value>,
         Option<AgentId>,
+        Option<bool>,
     )> {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
@@ -124,7 +126,16 @@ impl HandRegistry {
                 let old_agent_id: Option<AgentId> = e
                     .get("agent_id")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
-                Some((hand_id, instance_id, instance_name, config, old_agent_id))
+                let autonomous_tick_enabled: Option<bool> =
+                    e.get("autonomous_tick_enabled").and_then(|v| v.as_bool());
+                Some((
+                    hand_id,
+                    instance_id,
+                    instance_name,
+                    config,
+                    old_agent_id,
+                    autonomous_tick_enabled,
+                ))
             })
             .collect()
     }
@@ -324,6 +335,7 @@ impl HandRegistry {
         config: HashMap<String, serde_json::Value>,
         instance_id_override: Option<Uuid>,
         instance_name: Option<String>,
+        autonomous_tick_enabled: Option<bool>,
     ) -> HandResult<HandInstance> {
         let def = self
             .definitions
@@ -347,13 +359,16 @@ impl HandRegistry {
             }
         }
 
-        let instance = HandInstance::new(
+        let mut instance = HandInstance::new(
             hand_id,
             &def.agent.name,
             config,
             instance_id_override,
             instance_name.clone(),
         );
+        if let Some(enabled) = autonomous_tick_enabled {
+            instance.autonomous_tick_enabled = enabled;
+        }
         let id = instance.instance_id;
         self.instances.insert(id, instance.clone());
         info!(hand = %hand_id, instance = %id, instance_name = ?instance_name, "Hand activated");
@@ -495,6 +510,23 @@ impl HandRegistry {
         entry.config = config;
         entry.updated_at = chrono::Utc::now();
         Ok(())
+    }
+
+    /// Flip the autonomous-tick flag on a hand instance. Returns the previous
+    /// value so callers can decide whether to start/stop the background loop.
+    pub fn set_autonomous_tick_enabled(
+        &self,
+        instance_id: Uuid,
+        enabled: bool,
+    ) -> HandResult<bool> {
+        let mut entry = self
+            .instances
+            .get_mut(&instance_id)
+            .ok_or(HandError::InstanceNotFound(instance_id))?;
+        let previous = entry.autonomous_tick_enabled;
+        entry.autonomous_tick_enabled = enabled;
+        entry.updated_at = chrono::Utc::now();
+        Ok(previous)
     }
 
     /// Mark an instance as errored.
@@ -809,12 +841,12 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let inst1 = reg.activate("clip", HashMap::new(), None, None).unwrap();
+        let inst1 = reg.activate("clip", HashMap::new(), None, None, None).unwrap();
         assert_eq!(inst1.hand_id, "clip");
         assert_eq!(inst1.status, HandStatus::Active);
 
         // Second unnamed activation of same hand succeeds (multi-instance allowed when name is None).
-        let inst2 = reg.activate("clip", HashMap::new(), None, None).unwrap();
+        let inst2 = reg.activate("clip", HashMap::new(), None, None, None).unwrap();
         assert_eq!(inst2.hand_id, "clip");
         assert_ne!(inst1.instance_id, inst2.instance_id);
 
@@ -823,9 +855,9 @@ mod tests {
 
         // Named uniqueness: re-activating the same name fails.
         let inst3 = reg
-            .activate("clip", HashMap::new(), None, Some("a".to_string()))
+            .activate("clip", HashMap::new(), None, Some("a".to_string()), None)
             .unwrap();
-        let dup = reg.activate("clip", HashMap::new(), None, Some("a".to_string()));
+        let dup = reg.activate("clip", HashMap::new(), None, Some("a".to_string()), None);
         assert!(dup.is_err());
 
         // Deactivate first
@@ -843,7 +875,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None, None, None).unwrap();
         let id = instance.instance_id;
 
         reg.pause(id).unwrap();
@@ -862,7 +894,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None, None, None).unwrap();
         let id = instance.instance_id;
         let agent_id = AgentId::new();
 
@@ -893,7 +925,7 @@ mod tests {
     fn not_found_errors() {
         let reg = HandRegistry::new();
         assert!(reg.get_definition("nonexistent").is_none());
-        assert!(reg.activate("nonexistent", HashMap::new(), None, None).is_err());
+        assert!(reg.activate("nonexistent", HashMap::new(), None, None, None).is_err());
         assert!(reg.check_requirements("nonexistent").is_err());
         assert!(reg.deactivate(Uuid::new_v4()).is_err());
         assert!(reg.pause(Uuid::new_v4()).is_err());
@@ -905,7 +937,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("clip", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("clip", HashMap::new(), None, None, None).unwrap();
         let id = instance.instance_id;
 
         reg.set_error(id, "something broke".to_string()).unwrap();
@@ -978,7 +1010,7 @@ mod tests {
         reg.load_bundled();
 
         // Lead hand has no requirements — activate it
-        let instance = reg.activate("lead", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("lead", HashMap::new(), None, None, None).unwrap();
         let r = reg.readiness("lead").unwrap();
         assert!(r.requirements_met);
         assert!(r.active);
@@ -993,7 +1025,7 @@ mod tests {
         reg.load_bundled();
 
         // Browser hand requires chromium (non-optional) for native CDP automation.
-        let instance = reg.activate("browser", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("browser", HashMap::new(), None, None, None).unwrap();
         let r = reg.readiness("browser").unwrap();
         assert!(r.active);
 
@@ -1019,7 +1051,7 @@ mod tests {
         let reg = HandRegistry::new();
         reg.load_bundled();
 
-        let instance = reg.activate("lead", HashMap::new(), None, None).unwrap();
+        let instance = reg.activate("lead", HashMap::new(), None, None, None).unwrap();
         reg.pause(instance.instance_id).unwrap();
 
         let r = reg.readiness("lead").unwrap();
@@ -1152,10 +1184,10 @@ metrics = []
     fn test_activate_same_hand_twice_with_different_instance_names_succeeds() {
         let reg = test_registry_with_dummy_hand("test-hand");
         let a = reg
-            .activate("test-hand", HashMap::new(), None, Some("instance-a".into()))
+            .activate("test-hand", HashMap::new(), None, Some("instance-a".into()), None)
             .unwrap();
         let b = reg
-            .activate("test-hand", HashMap::new(), None, Some("instance-b".into()))
+            .activate("test-hand", HashMap::new(), None, Some("instance-b".into()), None)
             .unwrap();
         assert_ne!(a.instance_id, b.instance_id);
         assert_eq!(a.instance_name, Some("instance-a".into()));
@@ -1171,10 +1203,10 @@ metrics = []
     #[test]
     fn test_activate_same_hand_same_instance_name_rejects() {
         let reg = test_registry_with_dummy_hand("test-hand");
-        reg.activate("test-hand", HashMap::new(), None, Some("same".into()))
+        reg.activate("test-hand", HashMap::new(), None, Some("same".into()), None)
             .unwrap();
         let err = reg
-            .activate("test-hand", HashMap::new(), None, Some("same".into()))
+            .activate("test-hand", HashMap::new(), None, Some("same".into()), None)
             .unwrap_err();
         assert!(matches!(err, HandError::AlreadyActive(_)));
     }
@@ -1184,8 +1216,8 @@ metrics = []
         // Local behavior: unnamed multi-instance allowed (single-instance restriction
         // only applies to named instances).
         let reg = test_registry_with_dummy_hand("test-hand");
-        let a = reg.activate("test-hand", HashMap::new(), None, None).unwrap();
-        let b = reg.activate("test-hand", HashMap::new(), None, None).unwrap();
+        let a = reg.activate("test-hand", HashMap::new(), None, None, None).unwrap();
+        let b = reg.activate("test-hand", HashMap::new(), None, None, None).unwrap();
         assert_ne!(a.instance_id, b.instance_id);
     }
 
@@ -1197,7 +1229,7 @@ metrics = []
     #[test]
     fn test_hand_config_round_trip_via_registry() {
         let reg = test_registry_with_dummy_hand("browser");
-        let inst = reg.activate("browser", HashMap::new(), None, None).unwrap();
+        let inst = reg.activate("browser", HashMap::new(), None, None, None).unwrap();
 
         // Read-modify-write cycle mirroring the CLI's --set behavior.
         let mut cfg = reg.get_instance(inst.instance_id).unwrap().config;
@@ -1237,7 +1269,7 @@ metrics = []
         reg.persist_state(&state_file).unwrap();
         let reloaded = HandRegistry::load_state(&state_file);
         assert_eq!(reloaded.len(), 1);
-        let (hand_id, _instance_id, _instance_name, config, _agent_id) = &reloaded[0];
+        let (hand_id, _instance_id, _instance_name, config, _agent_id, _tick) = &reloaded[0];
         assert_eq!(hand_id, "browser");
         assert_eq!(
             config.get("headless"),
@@ -1257,6 +1289,7 @@ metrics = []
             HashMap::new(),
             None,
             Some("test".to_string()),
+            None,
         )
         .unwrap();
 
@@ -1266,7 +1299,7 @@ metrics = []
 
         let reloaded = HandRegistry::load_state(&state_file);
         assert_eq!(reloaded.len(), 1);
-        let (hand_id, _instance_id, instance_name, _config, _agent_id) = &reloaded[0];
+        let (hand_id, _instance_id, instance_name, _config, _agent_id, _tick) = &reloaded[0];
         assert_eq!(hand_id, "researcher");
         assert_eq!(instance_name.as_deref(), Some("test"));
     }
@@ -1289,7 +1322,7 @@ metrics = []
 
         let reloaded = HandRegistry::load_state(&state_file);
         assert_eq!(reloaded.len(), 1);
-        let (_hand_id, _instance_id, instance_name, _config, _agent_id) = &reloaded[0];
+        let (_hand_id, _instance_id, instance_name, _config, _agent_id, _tick) = &reloaded[0];
         assert!(instance_name.is_none());
     }
 }

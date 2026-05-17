@@ -3101,6 +3101,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     </div>
                     <div class="text-xs text-dim" x-text="'Activated: ' + new Date(inst.activated_at).toLocaleString()"></div>
                     <div class="text-xs text-dim" x-show="inst.agent_id" x-text="'Agent: ' + inst.agent_id"></div>
+                      <label class="flex items-center gap-2 text-xs mt-2" style="cursor:pointer"
+                             x-show="inst.has_autonomous">
+                          <input :checked="inst.autonomous_tick_enabled" @change="toggleAutonomousTick(inst, $event.target.checked)"
+                                 type="checkbox">
+                          <span class="text-dim">Autonomous tick</span>
+                      </label>
 
                     <!-- Stats (loaded on demand) -->
                     <div class="mt-3" x-show="inst._stats">
@@ -3416,8 +3422,23 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <div class="text-xs text-dim mb-2">Leave empty for a single instance of this hand. Set a name to run multiple instances in parallel.</div>
                       <input type="text" class="form-input" x-model="setupWizard.instanceName" placeholder="e.g. clip-youtube, lead-q4-outreach" style="width:100%">
                     </div>
+                      <!-- Autonomous tick opt-out (only for hands that have a periodic loop) -->
+                      <template x-if="setupWizard.agent && setupWizard.agent.max_iterations">
+                          <div class="mb-4">
+                              <div class="text-xs text-dim mb-1" style="letter-spacing:0.5px;text-transform:uppercase">
+                                  Autonomous tick
+                              </div>
+                              <label class="flex items-center gap-2" style="cursor:pointer">
+                                  <input type="checkbox" x-model="setupWizard.autonomousTickEnabled">
+                                  <span class="text-sm"
+                                        x-text="setupWizard.autonomousTickEnabled ? 'On — hand runs on a periodic tick' : 'Off — hand only responds when messaged'"></span>
+                              </label>
+                          </div>
+                      </template>
                     <template x-if="!setupHasSettings">
-                      <div class="text-sm text-dim" style="text-align:center;padding:20px 0">No configuration needed for this hand. Click Next to continue.</div>
+                        <div class="text-sm text-dim" style="text-align:center;padding:20px 0">No extra configuration
+                            needed for this hand. Click Next to continue.
+                        </div>
                     </template>
                     <template x-for="setting in (setupWizard.settings || [])" :key="setting.key">
                       <div class="mb-4">

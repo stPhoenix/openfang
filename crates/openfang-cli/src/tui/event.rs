@@ -2365,29 +2365,32 @@ pub fn spawn_activate_hand(
                 None,
                 instance_name,
                 None,
+                None,
             ) {
                 Ok(instance) => {
                     // Start the background loop for autonomous hands, mirroring the
                     // API handler logic in routes.rs.  Without this, the hand agent
                     // is registered but never receives its first tick, so no cron
                     // jobs are created and the collector never runs.
-                    if let Some(agent_id) = instance.agent_id {
-                        let entry = kernel
-                            .registry
-                            .list()
-                            .into_iter()
-                            .find(|e| e.id == agent_id);
-                        if let Some(entry) = entry {
-                            if !matches!(
-                                entry.manifest.schedule,
-                                openfang_types::agent::ScheduleMode::Reactive
-                            ) {
-                                kernel.start_background_for_agent(
-                                    agent_id,
-                                    &entry.name,
-                                    &entry.manifest.schedule,
-                                    true,
-                                );
+                    if instance.autonomous_tick_enabled {
+                        if let Some(agent_id) = instance.agent_id {
+                            let entry = kernel
+                                .registry
+                                .list()
+                                .into_iter()
+                                .find(|e| e.id == agent_id);
+                            if let Some(entry) = entry {
+                                if !matches!(
+                                    entry.manifest.schedule,
+                                    openfang_types::agent::ScheduleMode::Reactive
+                                ) {
+                                    kernel.start_background_for_agent(
+                                        agent_id,
+                                        &entry.name,
+                                        &entry.manifest.schedule,
+                                        true,
+                                    );
+                                }
                             }
                         }
                     }

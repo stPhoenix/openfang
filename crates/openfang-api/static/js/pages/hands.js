@@ -131,6 +131,8 @@ function handsPage() {
         }
         // Initialize optional instance name (for multi-instance hands).
         data.instanceName = '';
+          // Autonomous tick defaults on; only meaningful for hands with max_iterations.
+          data.autonomousTickEnabled = true;
         this.setupWizard = data;
         // Pre-populate provider/model from hand definition
         this.handProvider = (data.agent && data.agent.provider) || '';
@@ -483,6 +485,9 @@ function handsPage() {
         if (name) {
           payload.instance_name = name;
         }
+          if (this.setupWizard && this.setupWizard.agent && this.setupWizard.agent.max_iterations) {
+              payload.autonomous_tick_enabled = !!this.setupWizard.autonomousTickEnabled;
+          }
         var data = await OpenFangAPI.post('/api/hands/' + handId + '/activate', payload);
         var label = data.instance_name || data.agent_name || data.instance_id;
         this.showToast('Hand "' + handId + '" activated as ' + label);
@@ -532,7 +537,19 @@ function handsPage() {
       }
     },
 
-    async deactivate(inst) {
+      async toggleAutonomousTick(inst, enabled) {
+          try {
+              await OpenFangAPI.post('/api/hands/instances/' + inst.instance_id + '/autonomous-tick', {enabled: enabled});
+              inst.autonomous_tick_enabled = enabled;
+              this.showToast('Autonomous tick ' + (enabled ? 'enabled' : 'disabled'));
+          } catch (e) {
+              // Revert the optimistic flip so the checkbox reflects server state.
+              inst.autonomous_tick_enabled = !enabled;
+              this.showToast('Toggle failed: ' + (e.message || 'unknown error'));
+          }
+      },
+
+      async deactivate(inst) {
       var self = this;
       var handName = inst.agent_name || inst.hand_id;
       OpenFangToast.confirm('Deactivate Hand', 'Deactivate hand "' + handName + '"? This will kill its agent.', async function() {

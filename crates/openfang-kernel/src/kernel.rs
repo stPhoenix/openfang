@@ -4202,6 +4202,7 @@ impl OpenFangKernel {
         model_override: Option<String>,
         instance_id_override: Option<uuid::Uuid>,
         instance_name: Option<String>,
+        autonomous_tick_enabled: Option<bool>,
         caller: Option<AgentId>,
     ) -> KernelResult<openfang_hands::HandInstance> {
         let provider_override = provider_override.filter(|s| !s.is_empty());
@@ -4220,7 +4221,7 @@ impl OpenFangKernel {
         // Create the instance in the registry
         let instance = self
             .hand_registry
-            .activate(hand_id, config.clone(), instance_id_override, instance_name.clone())
+            .activate(hand_id, config.clone(), instance_id_override, instance_name.clone(), autonomous_tick_enabled)
             .map_err(|e| match e {
                 openfang_hands::HandError::AlreadyActive(id) => KernelError::OpenFang(OpenFangError::Internal(
                     format!("Hand already active: {id}"),
@@ -4584,6 +4585,56 @@ impl OpenFangKernel {
             .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e.to_string())))
     }
 
+    /// Enable or disable the autonomous tick loop for a hand instance.
+    /// Live: aborts the background task on disable, spawns it on re-enable.
+    /// No-op on Reactive hands (they have no background loop to control).
+    pub fn set_hand_autonomous_tick(
+        self: &Arc<Self>,
+        instance_id: uuid::Uuid,
+        enabled: bool,
+    ) -> KernelResult<()> {
+        let previous = self
+            .hand_registry
+            .set_autonomous_tick_enabled(instance_id, enabled)
+            .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e.to_string())))?;
+        // Persist so the choice survives restarts.
+        self.persist_hand_state();
+
+        if previous == enabled {
+            return Ok(());
+        }
+
+        let instance = match self.hand_registry.get_instance(instance_id) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let agent_id = match instance.agent_id {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+        let entry = match self.registry.get(agent_id) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
+            return Ok(());
+        }
+
+        if enabled {
+            // Re-enable: spawn the loop. Skip the immediate first tick so users
+            // toggling the flag don't pay for a surprise LLM call.
+            self.start_background_for_agent(
+                agent_id,
+                &entry.name,
+                &entry.manifest.schedule,
+                false,
+            );
+        } else {
+            self.background.stop_agent(agent_id);
+        }
+        Ok(())
+    }
+
     /// Set the weak self-reference for trigger dispatch.
     ///
     /// Must be called once after the kernel is wrapped in `Arc`.
@@ -4913,7 +4964,7 @@ impl OpenFangKernel {
         let saved_hands = openfang_hands::registry::HandRegistry::load_state(&state_path);
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
-            for (hand_id, saved_instance_id, saved_instance_name, config, old_agent_id) in saved_hands {
+            for (hand_id, saved_instance_id, saved_instance_name, config, old_agent_id, saved_autonomous_tick_enabled) in saved_hands {
                 // If the agent was already restored from SQLite (by load_all_agents),
                 // preserve its user-configured model so activate_hand doesn't reset
                 // it to the HAND.toml defaults (which are typically "default"/"default").
@@ -4937,7 +4988,7 @@ impl OpenFangKernel {
                     }
                     _ => (None, None),
                 };
-                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, saved_instance_name, None) {
+                match self.activate_hand(&hand_id, config, provider_override, model_override, saved_instance_id, saved_instance_name, saved_autonomous_tick_enabled, None) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
                         // Reassign cron jobs and triggers from the pre-restart
@@ -4992,6 +5043,13 @@ impl OpenFangKernel {
         for entry in &agents {
             if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
                 continue;
+            }
+            // Hand agents whose user disabled autonomous tick should stay quiet
+            // across restarts. Non-hand agents are unaffected.
+            if let Some(inst) = self.hand_registry.find_by_agent(entry.id) {
+                if !inst.autonomous_tick_enabled {
+                    continue;
+                }
             }
             bg_agents.push((
                 entry.id,
@@ -9155,7 +9213,7 @@ impl KernelHandle for OpenFangKernel {
     ) -> Result<serde_json::Value, String> {
         let caller: Option<AgentId> = caller_agent_id.and_then(|s| s.parse().ok());
         let instance = self
-            .activate_hand(hand_id, config, None, None, None, None, caller)
+            .activate_hand(hand_id, config, None, None, None, None, None, caller)
             .map_err(|e| format!("{e}"))?;
 
         Ok(serde_json::json!({
@@ -10498,6 +10556,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(caller_id),
             )
             .expect("browser activate");
@@ -10537,7 +10596,7 @@ mod tests {
         let kernel = OpenFangKernel::boot_with_config(config).expect("boot");
 
         let instance = kernel
-            .activate_hand("browser", HashMap::new(), None, None, None, None, None)
+            .activate_hand("browser", HashMap::new(), None, None, None, None, None, None)
             .expect("browser activate");
         let agent_id = instance.agent_id.expect("agent id");
         let entry = kernel.registry.get(agent_id).expect("entry");
@@ -10562,7 +10621,7 @@ mod tests {
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
         let instance = kernel
-            .activate_hand("browser", HashMap::new(), None, None, None, None, None)
+            .activate_hand("browser", HashMap::new(), None, None, None, None, None, None)
             .expect("browser hand should activate");
         let agent_id = instance.agent_id.expect("browser hand agent id");
         let entry = kernel

@@ -4264,6 +4264,15 @@ pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoR
                 .instance_name
                 .clone()
                 .unwrap_or_else(|| i.agent_name.clone());
+            // Tell the UI whether the underlying hand is autonomous (has
+            // `max_iterations`) so the tick toggle is only rendered when it
+            // would have an effect.
+            let has_autonomous = state
+                .kernel
+                .hand_registry
+                .get_definition(&i.hand_id)
+                .map(|d| d.agent.max_iterations.is_some())
+                .unwrap_or(false);
             serde_json::json!({
                 "instance_id": i.instance_id,
                 "hand_id": i.hand_id,
@@ -4273,6 +4282,8 @@ pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoR
                 "agent_name": effective_agent_name,
                 "activated_at": i.activated_at.to_rfc3339(),
                 "updated_at": i.updated_at.to_rfc3339(),
+                "autonomous_tick_enabled": i.autonomous_tick_enabled,
+                "has_autonomous": has_autonomous,
             })
         })
         .collect();
@@ -4343,6 +4354,7 @@ pub async fn get_hand(
                         "model": if def.agent.model == "default" {
                             &state.kernel.config.default_model.model
                         } else { &def.agent.model },
+                        "max_iterations": def.agent.max_iterations,
                     },
                     "dashboard": def.dashboard.metrics.iter().map(|m| serde_json::json!({
                         "label": m.label,
@@ -4734,33 +4746,52 @@ pub async fn activate_hand(
     Path(hand_id): Path<String>,
     body: Option<Json<openfang_hands::ActivateHandRequest>>,
 ) -> impl IntoResponse {
-    let (config, provider_override, model_override, instance_name) = match body.map(|b| b.0) {
-        Some(r) => (r.config, r.provider, r.model, r.instance_name),
-        None => (std::collections::HashMap::new(), None, None, None),
-    };
+    let (config, provider_override, model_override, instance_name, autonomous_tick_enabled) =
+        match body.map(|b| b.0) {
+            Some(r) => (
+                r.config,
+                r.provider,
+                r.model,
+                r.instance_name,
+                r.autonomous_tick_enabled,
+            ),
+            None => (std::collections::HashMap::new(), None, None, None, None),
+        };
 
-    match state.kernel.activate_hand(&hand_id, config, provider_override, model_override, None, instance_name, None) {
+    match state.kernel.activate_hand(
+        &hand_id,
+        config,
+        provider_override,
+        model_override,
+        None,
+        instance_name,
+        autonomous_tick_enabled,
+        None,
+    ) {
         Ok(instance) => {
-            // If the hand agent has a non-reactive schedule (autonomous hands),
-            // start its background loop so it begins running immediately.
-            if let Some(agent_id) = instance.agent_id {
-                let entry = state
-                    .kernel
-                    .registry
-                    .list()
-                    .into_iter()
-                    .find(|e| e.id == agent_id);
-                if let Some(entry) = entry {
-                    if !matches!(
-                        entry.manifest.schedule,
-                        openfang_types::agent::ScheduleMode::Reactive
-                    ) {
-                        state.kernel.start_background_for_agent(
-                            agent_id,
-                            &entry.name,
-                            &entry.manifest.schedule,
-                            true,
-                        );
+            // If the hand agent has a non-reactive schedule (autonomous hands)
+            // AND the user did not opt out of the autonomous tick, start its
+            // background loop so it begins running immediately.
+            if instance.autonomous_tick_enabled {
+                if let Some(agent_id) = instance.agent_id {
+                    let entry = state
+                        .kernel
+                        .registry
+                        .list()
+                        .into_iter()
+                        .find(|e| e.id == agent_id);
+                    if let Some(entry) = entry {
+                        if !matches!(
+                            entry.manifest.schedule,
+                            openfang_types::agent::ScheduleMode::Reactive
+                        ) {
+                            state.kernel.start_background_for_agent(
+                                agent_id,
+                                &entry.name,
+                                &entry.manifest.schedule,
+                                true,
+                            );
+                        }
                     }
                 }
             }
@@ -4778,6 +4809,7 @@ pub async fn activate_hand(
                     "agent_id": instance.agent_id.map(|a| a.to_string()),
                     "agent_name": effective_agent_name,
                     "activated_at": instance.activated_at.to_rfc3339(),
+                    "autonomous_tick_enabled": instance.autonomous_tick_enabled,
                 })),
             )
         }
@@ -4814,6 +4846,33 @@ pub async fn resume_hand(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "resumed", "instance_id": id})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// POST /api/hands/instances/{id}/autonomous-tick — Toggle autonomous tick loop.
+#[derive(serde::Deserialize)]
+pub struct SetAutonomousTickRequest {
+    pub enabled: bool,
+}
+
+pub async fn set_hand_autonomous_tick(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<SetAutonomousTickRequest>,
+) -> impl IntoResponse {
+    match state.kernel.set_hand_autonomous_tick(id, body.enabled) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "instance_id": id,
+                "autonomous_tick_enabled": body.enabled,
+            })),
         ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
