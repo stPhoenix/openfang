@@ -4320,17 +4320,22 @@ impl OpenFangKernel {
             },
             skills: def.skills.clone(),
             mcp_servers: def.mcp_servers.clone(),
-            // Hands are curated packages — if they declare shell_exec, grant full exec access
-            exec_policy: if def.tools.iter().any(|t| t == "shell_exec") {
-                Some(openfang_types::config::ExecPolicy {
-                    mode: openfang_types::config::ExecSecurityMode::Full,
-                    timeout_secs: 300, // hands may run long commands (ffmpeg, yt-dlp)
-                    no_output_timeout_secs: 120,
-                    ..Default::default()
-                })
-            } else {
-                None
-            },
+            // Per-hand exec policy: prefer the HandDefinition override when set
+            // (lets a hand restrict shell_exec to a narrow allowlist), else fall
+            // back to the curated-package default of Full mode when shell_exec is
+            // declared without an explicit policy.
+            exec_policy: def.exec_policy.clone().or_else(|| {
+                if def.tools.iter().any(|t| t == "shell_exec") {
+                    Some(openfang_types::config::ExecPolicy {
+                        mode: openfang_types::config::ExecSecurityMode::Full,
+                        timeout_secs: 300, // hands may run long commands (ffmpeg, yt-dlp)
+                        no_output_timeout_secs: 120,
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                }
+            }),
             tool_blocklist: Vec::new(),
             // Custom profile avoids ToolProfile-based expansion overriding the
             // explicit tool list.

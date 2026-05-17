@@ -386,6 +386,12 @@ pub struct HandDefinition {
     /// Requirements that must be satisfied before activation.
     #[serde(default)]
     pub requires: Vec<HandRequirement>,
+    /// Optional per-hand exec policy override. When set, replaces the
+    /// kernel's default "shell_exec → Full mode" behavior at hand-load
+    /// time. Use this to restrict shell_exec to a narrow allowlist
+    /// (e.g. yt-dlp only) instead of granting unrestricted shell access.
+    #[serde(default)]
+    pub exec_policy: Option<openfang_types::config::ExecPolicy>,
     /// Configurable settings (shown in activation modal).
     #[serde(default)]
     pub settings: Vec<HandSetting>,

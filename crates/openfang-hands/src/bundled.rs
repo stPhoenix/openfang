@@ -158,17 +158,29 @@ mod tests {
         assert_eq!(def.name, "Pro Researcher Hand");
         assert_eq!(def.category, crate::HandCategory::Productivity);
         assert!(def.skill_content.is_some());
-        assert!(def.requires.is_empty());
+        // yt-dlp binary is required so the yt-extractor subagent can pull
+        // YouTube captions when search results include a YouTube URL.
+        assert!(def.requires.iter().any(|r| r.check_value == "yt-dlp"));
         // Pro-researcher is long_running — orchestrators must dispatch via async-poll path.
         assert!(def.long_running);
-        // Orchestrator: shell_exec must stay out — there is no reason for it
-        // and subagents don't need it either. web_search and web_fetch ARE
-        // declared on the parent (kernel privilege-subset rule requires it
-        // for delegation), but the system prompt forbids the orchestrator
-        // from calling them directly.
-        assert!(!def.tools.contains(&"shell_exec".to_string()));
+        // web_search / web_fetch / shell_exec are whitelisted ONLY so the
+        // kernel privilege-subset rule lets us delegate subagents that use
+        // them. The system prompt forbids the orchestrator from calling any
+        // of them directly. shell_exec is further locked down by the hand's
+        // exec_policy (allowlist=[yt-dlp]) — see the assertions below.
         assert!(def.tools.contains(&"web_search".to_string()));
         assert!(def.tools.contains(&"web_fetch".to_string()));
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        let policy = def
+            .exec_policy
+            .as_ref()
+            .expect("pro-researcher must declare hand-level exec_policy");
+        assert!(matches!(
+            policy.mode,
+            openfang_types::config::ExecSecurityMode::Allowlist
+        ));
+        assert_eq!(policy.allowed_commands, vec!["yt-dlp".to_string()]);
+        assert_eq!(policy.timeout_secs, 300);
         // Must have delegation + workspace tools.
         assert!(def.tools.contains(&"agent_delegate".to_string()));
         assert!(def.tools.contains(&"file_read".to_string()));
