@@ -95,10 +95,11 @@ def test_budget_reflects_llm_usage(
 
 def test_pro_researcher_hand_registered(client: httpx.Client) -> None:
     """pro-researcher must be in the bundled-hands list with delegation +
-    workspace tools. web_search/web_fetch are whitelisted for the kernel's
-    privilege-subset rule (so the orchestrator can delegate children that
-    use them); the system prompt forbids the orchestrator from calling them
-    directly. shell_exec must stay absent."""
+    workspace tools. web_search/web_fetch/shell_exec are listed only so the
+    kernel's privilege-subset rule lets the orchestrator delegate children
+    that use them; the system prompt forbids the orchestrator from calling
+    them directly, and the HAND.toml [exec_policy] restricts shell_exec to
+    `yt-dlp` only (commit 6ef8481)."""
     r = client.get("/api/hands")
     assert r.status_code == 200
     data = r.json()
@@ -114,11 +115,9 @@ def test_pro_researcher_hand_registered(client: httpx.Client) -> None:
         "memory_store",
         "web_search",
         "web_fetch",
+        "shell_exec",
     ):
         assert needed in tools, f"pro-researcher missing required tool {needed}; tools={tools}"
-    assert "shell_exec" not in tools, (
-        f"pro-researcher must NOT have shell_exec; tools={tools}"
-    )
     # long_running flag must be surfaced so demiurg can route via async-poll.
     assert pro.get("long_running") is True, (
         f"pro-researcher must report long_running=true in /api/hands; got {pro.get('long_running')!r}"

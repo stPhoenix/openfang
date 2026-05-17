@@ -66,7 +66,7 @@ fn validate_command(command: &str) -> Result<(), String> {
     if command.is_empty() {
         return Err("Command cannot be empty".into());
     }
-    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command, &[]) {
         return Err(format!(
             "Command blocked: contains {reason} — potential injection"
         ));

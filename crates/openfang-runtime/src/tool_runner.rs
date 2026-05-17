@@ -37,10 +37,12 @@ fn is_shell_tool(name: &str) -> bool {
 /// Layer 2: Heuristic patterns for injected external data (piped curl, base64, eval)
 ///
 /// This implements the TaintSink::shell_exec() policy from SOTA 2.
-fn check_taint_shell_exec(command: &str) -> Option<String> {
+fn check_taint_shell_exec(command: &str, allowed_meta: &[String]) -> Option<String> {
     // Layer 1: Block shell metacharacters that enable command injection.
     // Uses the same validator as subprocess_sandbox and docker_sandbox.
-    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+    if let Some(reason) =
+        crate::subprocess_sandbox::contains_shell_metacharacters(command, allowed_meta)
+    {
         return Some(format!("Shell metacharacter injection blocked: {reason}"));
     }
 
@@ -674,7 +676,14 @@ pub async fn execute_tool(
 
             // SECURITY: Always check for shell metacharacters, even in Full mode.
             // These enable command injection regardless of exec policy.
-            if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command)
+            // ExecPolicy.allowed_metacharacters can relax specific tokens
+            // (e.g. "|", ";", "&&") but never the security floor
+            // (backticks, $(), ${}, newlines, NUL).
+            let allowed_meta: &[String] = exec_policy
+                .map(|p| p.allowed_metacharacters.as_slice())
+                .unwrap_or(&[]);
+            if let Some(reason) =
+                crate::subprocess_sandbox::contains_shell_metacharacters(command, allowed_meta)
             {
                 return ToolResult {
                     tool_use_id: tool_use_id.to_string(),
@@ -706,7 +715,7 @@ pub async fn execute_tool(
             let is_full_exec = exec_policy
                 .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
             if !is_full_exec {
-                if let Some(violation) = check_taint_shell_exec(command) {
+                if let Some(violation) = check_taint_shell_exec(command, allowed_meta) {
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content: format!("Taint violation: {violation}"),
@@ -2468,6 +2477,18 @@ async fn tool_shell_exec(
                 stderr.to_string()
             };
 
+            // Fork-failure detection: an in-process fork() refusal exhausts
+            // the sandbox proc cap. Retrying is futile — surface a hard error
+            // so the agent stops looping and the operator can react.
+            if exit_code == 2 && is_fork_failure(&stderr_str) {
+                return Err(format!(
+                    "FATAL: sandbox process limit exhausted (RLIMIT_NPROC). \
+                     Stderr: {stderr_str}\n\
+                     Action: restart the hand; do NOT retry this command. \
+                     Operator: raise `[exec_policy.resource_limits] max_processes` in HAND.toml."
+                ));
+            }
+
             if exit_code == 0 && stdout_str.is_empty() {
                 stdout_str = "Command executed successfully".to_string();
             }
@@ -2478,6 +2499,53 @@ async fn tool_shell_exec(
         }
         Ok(Err(e)) => Err(format!("Failed to execute command: {e}")),
         Err(_) => Err(format!("Command timed out after {timeout_secs}s")),
+    }
+}
+
+/// Detect "Cannot fork" / fork-retry patterns emitted by sh/bash when
+/// RLIMIT_NPROC is exhausted. Triggers Step 5's hard-stop surface so the
+/// agent does not chew turns retrying the same command.
+fn is_fork_failure(stderr: &str) -> bool {
+    static FORK_RE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        // Anchor on distinctive phrases sh/bash emit when fork() fails.
+        // Prefixes like "sh: 1:" or "sh: fork:" vary, so we don't require them.
+        regex_lite::Regex::new(
+            r"(?i)(?:Cannot fork|fork: retry: Resource temporarily unavailable|fork failed|cannot allocate memory)",
+        )
+            .unwrap()
+    });
+    FORK_RE.is_match(stderr)
+}
+
+#[cfg(test)]
+mod fork_failure_tests {
+    use super::is_fork_failure;
+
+    #[test]
+    fn detects_cannot_fork() {
+        assert!(is_fork_failure("sh: 1: Cannot fork\n"));
+        assert!(is_fork_failure("bash: 12: Cannot fork"));
+        assert!(is_fork_failure("Cannot fork\n"));
+    }
+
+    #[test]
+    fn detects_eagain_retry() {
+        assert!(is_fork_failure(
+            "sh: fork: retry: Resource temporarily unavailable\n"
+        ));
+    }
+
+    #[test]
+    fn detects_fork_failed_and_oom() {
+        assert!(is_fork_failure("fork failed"));
+        assert!(is_fork_failure("cannot allocate memory"));
+    }
+
+    #[test]
+    fn ignores_normal_stderr() {
+        assert!(!is_fork_failure("error: file not found"));
+        assert!(!is_fork_failure(""));
+        assert!(!is_fork_failure("yt-dlp: ERROR: video unavailable"));
     }
 }
 
@@ -4461,8 +4529,9 @@ async fn tool_process_start(
         .unwrap_or_default();
 
     // SECURITY: Reject shell metacharacters in the command name itself.
-    // The command field must be a single binary token.
-    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+    // The command field must be a single binary token. process_start does
+    // NOT honor allowed_metacharacters — args here are not shell-interpreted.
+    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command, &[]) {
         return Err(format!(
             "process_start blocked: command contains {reason}. \
              Shell metacharacters are never allowed in the command field."
@@ -4472,7 +4541,7 @@ async fn tool_process_start(
     // spawn does not interpret these, blocking them prevents an LLM from
     // smuggling a chained command past the allowlist via an argument.
     for arg in &args {
-        if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(arg) {
+        if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(arg, &[]) {
             return Err(format!(
                 "process_start blocked: argument contains {reason}. \
                  Shell metacharacters are not allowed in process arguments."

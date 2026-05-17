@@ -56,6 +56,7 @@ pub fn tool_search_definition() -> ToolDefinition {
         search_hint: None,
         is_mcp: false,
         always_load: true,
+        kind: openfang_types::tool::ToolKind::Action,
     }
 }
 
@@ -474,11 +475,22 @@ pub fn render_result(matches: &[String], all: &[ToolDefinition]) -> String {
         let Some(tool) = all.iter().find(|t| &t.name == name) else {
             continue;
         };
+        let is_persona = tool.kind == openfang_types::tool::ToolKind::PersonaLoader;
+        let description = if is_persona {
+            format!("[PERSONA LOADER] {}", tool.description)
+        } else {
+            tool.description.clone()
+        };
         let json = serde_json::json!({
             "name": tool.name,
-            "description": tool.description,
+            "description": description,
             "parameters": tool.input_schema,
         });
+        if is_persona {
+            out.push_str(
+                "<!-- persona loader: calling this LOADS instructions, does not perform an action -->\n",
+            );
+        }
         out.push_str("<function>");
         out.push_str(&serde_json::to_string(&json).unwrap_or_default());
         out.push_str("</function>\n");
@@ -771,6 +783,28 @@ mod tests {
         assert!(out.contains("<functions>"));
         assert!(out.contains("<function>"));
         assert!(out.contains("\"name\":\"Foo\""));
+    }
+
+    #[test]
+    fn render_result_tags_persona_loaders() {
+        let mut persona = tool("searxng");
+        persona.kind = openfang_types::tool::ToolKind::PersonaLoader;
+        let action = tool("shell_exec");
+        let out = render_result(
+            &["searxng".to_string(), "shell_exec".to_string()],
+            &[persona, action],
+        );
+        assert!(
+            out.contains("[PERSONA LOADER]"),
+            "persona description must carry [PERSONA LOADER] prefix"
+        );
+        assert!(
+            out.contains("<!-- persona loader:"),
+            "persona must precede its <function> with an HTML comment"
+        );
+        // Action tool unchanged.
+        assert!(out.contains("\"description\":\"Description for shell_exec\""));
+        assert!(!out.contains("[PERSONA LOADER] Description for shell_exec"));
     }
 
     #[test]

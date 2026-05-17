@@ -6694,6 +6694,7 @@ impl OpenFangKernel {
                 search_hint,
                 is_mcp: false,
                 always_load: false,
+                kind: openfang_types::tool::ToolKind::PersonaLoader,
             });
         }
 

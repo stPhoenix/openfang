@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Whether a tool actually performs an action or only loads persona/skill
+/// instructions when called. Persona loaders must be tagged in `ToolSearch`
+/// output so the model does not call them expecting search/fetch results.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    #[default]
+    Action,
+    PersonaLoader,
+}
+
 /// Definition of a tool that an agent can use.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -31,6 +42,17 @@ pub struct ToolDefinition {
     /// every turn (the discovery tool itself, agent-spawn tools, etc.).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always_load: bool,
+    /// Whether calling this tool runs an action or only loads a persona /
+    /// skill prompt. `ToolSearch` tags `PersonaLoader` entries so the model
+    /// does not retry-call them as if they were action tools.
+    #[serde(default, skip_serializing_if = "ToolKind::is_action")]
+    pub kind: ToolKind,
+}
+
+impl ToolKind {
+    fn is_action(&self) -> bool {
+        matches!(self, ToolKind::Action)
+    }
 }
 
 /// A tool call requested by the LLM.

