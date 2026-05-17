@@ -74,6 +74,25 @@ pub trait KernelHandle: Send + Sync {
         self.send_to_agent(agent_id, message, session_id).await
     }
 
+    /// Send a message to another agent, giving up only after `idle_secs` of
+    /// silence from the target (no `AgentActivity` events). `max_total_secs`
+    /// is a hard ceiling so a misbehaving target can't loop forever.
+    /// Use for long-running specialists whose total wall-clock time is
+    /// unknown but which produce steady per-iteration progress signals.
+    async fn send_to_agent_with_idle_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        idle_secs: u64,
+        max_total_secs: u64,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        // Default fallback: ignore idle_secs, fall back to absolute timeout.
+        let _ = idle_secs;
+        self.send_to_agent_with_timeout(agent_id, message, max_total_secs, session_id)
+            .await
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 
@@ -346,6 +365,23 @@ pub trait KernelHandle: Send + Sync {
             callback_event_type,
         );
         Err("Async agent delegation not available".to_string())
+    }
+
+    /// Send a message to an EXISTING agent asynchronously. Returns immediately
+    /// with `{delegation_id, agent_id, agent_name, callback_event_type}`. The
+    /// agent processes the message in the background; the completion event
+    /// (default type `delegation_completed`) lands in the same cache and
+    /// channel that `delegate_async` uses, so `delegation_await` correlates
+    /// both without changes. Use for hands marked `long_running=true`.
+    async fn send_to_agent_async(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (agent_id, message, session_id, callback_event_type);
+        Err("send_to_agent_async not available".to_string())
     }
 
     /// Spawn an agent with capability inheritance enforcement.

@@ -3,6 +3,7 @@ name = "Pro Researcher Hand"
 description = "Workspace-based deep researcher with subagent decomposition, plan approval, resumable state, and bounded context"
 category = "productivity"
 icon = "\U0001F52C"
+long_running = true
 tools = [
   "file_read",
   "file_write",

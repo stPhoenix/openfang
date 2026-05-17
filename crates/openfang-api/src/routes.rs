@@ -4233,6 +4233,7 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "description": d.description,
                 "category": d.category,
                 "icon": d.icon,
+                "long_running": d.long_running,
                 "tools": d.tools,
                 "requirements_met": requirements_met,
                 "active": active,

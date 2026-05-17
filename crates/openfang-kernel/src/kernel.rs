@@ -8265,6 +8265,19 @@ impl KernelHandle for ScopedKernelHandle {
             .await
     }
 
+    async fn send_to_agent_with_idle_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        idle_secs: u64,
+        max_total_secs: u64,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .send_to_agent_with_idle_timeout(agent_id, message, idle_secs, max_total_secs, session_id)
+            .await
+    }
+
     fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
         self.inner.list_agents()
     }
@@ -8501,6 +8514,18 @@ impl KernelHandle for ScopedKernelHandle {
     ) -> Result<String, String> {
         self.inner
             .delegate_async(manifest_toml, message, parent_id, parent_caps, callback_event_type)
+            .await
+    }
+
+    async fn send_to_agent_async(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        self.inner
+            .send_to_agent_async(agent_id, message, session_id, callback_event_type)
             .await
     }
 
@@ -8788,6 +8813,66 @@ impl KernelHandle for OpenFangKernel {
         }
     }
 
+    async fn send_to_agent_with_idle_timeout(
+        &self,
+        agent_id: &str,
+        message: &str,
+        idle_secs: u64,
+        max_total_secs: u64,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        use tokio::sync::broadcast::error::RecvError;
+        let id: AgentId = self.resolve_agent_id(agent_id)?;
+        let session = self.resolve_session_for_send(id, session_id)?;
+        let mut rx = self.event_bus.subscribe_agent(id);
+        let fut = self.send_message_with_session(id, session, message);
+        tokio::pin!(fut);
+        let start = tokio::time::Instant::now();
+        let mut last_activity = start;
+        let hard_deadline = start + std::time::Duration::from_secs(max_total_secs);
+        loop {
+            let idle_deadline = last_activity + std::time::Duration::from_secs(idle_secs);
+            let next_deadline = std::cmp::min(idle_deadline, hard_deadline);
+            tokio::select! {
+                result = &mut fut => {
+                    return match result {
+                        Ok(r) => Ok(r.response),
+                        Err(e) => Err(format!("Send failed: {e}")),
+                    };
+                }
+                ev = rx.recv() => match ev {
+                    Ok(event) => {
+                        if let EventPayload::System(SystemEvent::AgentActivity { agent_id: a }) = &event.payload {
+                            if *a == id {
+                                last_activity = tokio::time::Instant::now();
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        // Bus saturated — treat as activity ping rather than false idle-out.
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Err(RecvError::Closed) => {
+                        return Err("Event bus closed unexpectedly during idle-timeout wait".to_string());
+                    }
+                },
+                _ = tokio::time::sleep_until(next_deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= hard_deadline {
+                        return Err(format!(
+                            "agent_send hit max_total_secs ({max_total_secs}s) ceiling. \
+                             The target agent may still be processing."
+                        ));
+                    }
+                    return Err(format!(
+                        "agent_send idle: target produced no activity for {idle_secs}s. \
+                         The target agent may still be processing."
+                    ));
+                }
+            }
+        }
+    }
+
     fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
         self.registry
             .list()
@@ -8890,6 +8975,15 @@ impl KernelHandle for OpenFangKernel {
     fn touch_agent(&self, agent_id: &str) {
         if let Ok(id) = agent_id.parse::<AgentId>() {
             self.registry.touch(id);
+            // Fire-and-forget AgentActivity event. Idle-timeout waiters
+            // (`send_to_agent_with_idle_timeout`) subscribe per-agent and
+            // reset their clock on this signal.
+            let event = Event::new(
+                id,
+                EventTarget::Agent(id),
+                EventPayload::System(SystemEvent::AgentActivity { agent_id: id }),
+            );
+            self.event_bus.publish_sync(event);
         }
     }
 
@@ -9175,6 +9269,7 @@ impl KernelHandle for OpenFangKernel {
                 "description": def.description,
                 "status": status,
                 "tools": def.tools,
+                "long_running": def.long_running,
             });
             if let Some(iid) = instance_id {
                 entry["instance_id"] = serde_json::json!(iid);
@@ -9235,11 +9330,13 @@ impl KernelHandle for OpenFangKernel {
         let def = self.hand_registry.get_definition(hand_id);
         let def_name = def.as_ref().map(|d| d.name.clone()).unwrap_or_default();
         let def_icon = def.as_ref().map(|d| d.icon.clone()).unwrap_or_default();
+        let def_long_running = def.as_ref().map(|d| d.long_running).unwrap_or(false);
 
         Ok(serde_json::json!({
             "hand_id": hand_id,
             "name": def_name,
             "icon": def_icon,
+            "long_running": def_long_running,
             "instance_id": instance.instance_id.to_string(),
             "status": format!("{}", instance.status),
             "agent_id": instance.agent_id.map(|a| a.to_string()),
@@ -9715,6 +9812,97 @@ impl KernelHandle for OpenFangKernel {
             "callback_event_type": event_type_for_response,
         })
         .to_string())
+    }
+
+    async fn send_to_agent_async(
+        &self,
+        agent_id: &str,
+        message: &str,
+        session_id: Option<&str>,
+        callback_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        // Resolve target id + session up front so we fail fast on bad inputs.
+        let target_id: AgentId = self.resolve_agent_id(agent_id)?;
+        let session = self.resolve_session_for_send(target_id, session_id)?;
+        let agent_name = self
+            .registry
+            .get(target_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| target_id.to_string());
+
+        let delegation_id = uuid::Uuid::new_v4().to_string();
+        let event_type = callback_event_type
+            .unwrap_or("delegation_completed")
+            .to_string();
+        let event_type_for_response = event_type.clone();
+        let message_owned = message.to_string();
+        let delegation_id_clone = delegation_id.clone();
+        let agent_name_clone = agent_name.clone();
+
+        tracing::info!(
+            delegation_id = %delegation_id,
+            agent = %agent_name,
+            id = %target_id,
+            "agent_send_async: dispatched in background"
+        );
+
+        // Spawn background task: run send, cache outcome, publish completion event.
+        // NO kill_agent — we don't own the target.
+        if let Some(weak) = self.self_handle.get() {
+            if let Some(kernel) = weak.upgrade() {
+                tokio::spawn(async move {
+                    let result = kernel
+                        .send_message_with_session(target_id, session, &message_owned)
+                        .await;
+
+                    let (success, response) = match result {
+                        Ok(r) => (true, r.response),
+                        Err(e) => (false, format!("{e}")),
+                    };
+
+                    // Cache BEFORE publishing event so a racing awaiter still finds the entry.
+                    {
+                        let mut cache = kernel.delegation_outcomes.write().await;
+                        cache.put(
+                            delegation_id_clone.clone(),
+                            DelegationOutcome {
+                                success,
+                                result: response.clone(),
+                                agent_id: target_id.to_string(),
+                                agent_name: agent_name_clone.clone(),
+                                finished_at: std::time::Instant::now(),
+                            },
+                        );
+                    }
+
+                    let payload = serde_json::json!({
+                        "type": event_type,
+                        "data": {
+                            "delegation_id": delegation_id_clone,
+                            "agent_id": target_id.to_string(),
+                            "agent_name": agent_name_clone,
+                            "success": success,
+                            "result": response,
+                        }
+                    });
+                    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                    let event = Event::new(
+                        target_id,
+                        EventTarget::Broadcast,
+                        EventPayload::Custom(payload_bytes),
+                    );
+                    kernel.publish_event(event).await;
+                });
+            }
+        }
+
+        Ok(serde_json::json!({
+            "delegation_id": delegation_id,
+            "agent_id": target_id.to_string(),
+            "agent_name": agent_name,
+            "callback_event_type": event_type_for_response,
+        })
+            .to_string())
     }
 
     async fn await_delegations(

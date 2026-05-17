@@ -369,6 +369,11 @@ pub struct HandDefinition {
     /// Icon (emoji).
     #[serde(default)]
     pub icon: String,
+    /// Whether this hand routinely runs longer than a few minutes per request.
+    /// Orchestrators (e.g. demiurg) should dispatch via `agent_send_async` +
+    /// `delegation_await` rather than `agent_send`. Default false for back-compat.
+    #[serde(default)]
+    pub long_running: bool,
     /// Tools the agent needs access to.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -577,6 +582,30 @@ metrics = []
         assert_eq!(def.category, HandCategory::Content);
         assert_eq!(def.requires.len(), 1);
         assert_eq!(def.agent.name, "test-hand");
+        // Back-compat: HAND.toml without long_running parses with default false.
+        assert!(!def.long_running);
+    }
+
+    #[test]
+    fn hand_definition_long_running_flag() {
+        let toml_str = r#"
+id = "lr"
+name = "Long Running"
+description = "long"
+category = "productivity"
+long_running = true
+tools = []
+
+[agent]
+name = "lr-hand"
+description = "agent"
+system_prompt = "."
+
+[dashboard]
+metrics = []
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert!(def.long_running);
     }
 
     #[test]

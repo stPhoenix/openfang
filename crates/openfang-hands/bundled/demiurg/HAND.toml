@@ -17,6 +17,7 @@ tools = [
   "hand_activate",
   "hand_deactivate",
   "agent_send",
+    "agent_send_async",
   "agent_kill",
   "agent_spawn",
     "agent_template_spawn",
@@ -337,11 +338,19 @@ Loop until all rows are done/failed/skipped or stop conditions trip.
 For each runnable row (status=pending, deps done):
 
 1. Pre-dispatch: check Attempts < 3.
-2. Dispatch by resource type:
-   - **live:<agent_id>** → agent_send(agent_id, message). Message = the subtask description plus the user's verbatim task as context. timeout_seconds = `300 + 600 * Attempts`.
-   - **hand:<hand_id>** → if hand_status reports it Active, read its `Agent ID` field and `agent_send(<agent_id>, ...)`; else `hand_activate(<hand_id>)` (capture instance_id AND `Agent ID` from the response), then `agent_send(<agent_id>, ...)`. Record instance_id in state.md row. Mark in plan.md whether YOU activated it (so you know whether to deactivate). **Critical:** `agent_send` requires the **agent_id** (UUID-like string shown as `Agent ID:` in `hand_list` / `hand_status` / `hand_activate` output). Passing the hand_id is an error. The hand_id is for `hand_*` tools only.
-   - **template:<template_name>** → agent_template_spawn(template_name, instance_name=`<slug>-<template_name>`) → capture agent_id; agent_send to that agent_id. Record agent_id in state.md row. Mark in plan.md that YOU spawned it (so cleanup kills it).
-   - **adhoc** → agent_delegate with manifest (tools=[]).
+2. Dispatch by resource type. **Before dispatching to a `live` or `hand` target, look up its `long_running` flag in `hand_list` output.** For live agents this is the flag of the hand they belong to (match by `agent_id`); standalone live agents not owned by a hand are treated as long_running=false. Long-running targets use the ASYNC-POLL path; everything else uses the SYNC path.
+   - **live:<agent_id>** → if the matching hand has `long_running=true`, use ASYNC-POLL (below). Else SYNC: `agent_send(agent_id, message, timeout_seconds = 300 + 600 * Attempts)`. Message = subtask description + verbatim user task as context.
+   - **hand:<hand_id>** → if hand_status reports it Active, read its `Agent ID` field; else `hand_activate(<hand_id>)` (capture instance_id AND `Agent ID` from the response). Look up `long_running` for this hand from `hand_list`. If `long_running=true` use ASYNC-POLL; else SYNC `agent_send(<agent_id>, ...)`. Record instance_id in state.md row. Mark in plan.md whether YOU activated it (so you know whether to deactivate). **Critical:** the dispatch tools require the **agent_id** (UUID-like string shown as `Agent ID:` in `hand_list` / `hand_status` / `hand_activate` output). Passing the hand_id is an error. The hand_id is for `hand_*` tools only.
+   - **template:<template_name>** → agent_template_spawn(template_name, instance_name=`<slug>-<template_name>`) → capture agent_id; SYNC `agent_send` to that agent_id. Record agent_id in state.md row. Mark in plan.md that YOU spawned it (so cleanup kills it).
+   - **adhoc** → `agent_delegate` with manifest (tools=[]).
+
+   **ASYNC-POLL path** (long_running=true):
+   a. `agent_send_async(agent_id, message)`. Parse the JSON return — capture `delegation_id`. Record `delegation_id=<uuid>` in the state.md row Note so a kernel restart can resume.
+   b. Loop, hard cap **24 iterations** (= 2 hours wall-clock):
+        - `delegation_await(delegation_ids=[delegation_id], timeout_seconds=300)`.
+        - Parse `results[0]`. If `success == true` or `error != "timed_out"`: this is the final response. Treat the `result` field as the agent's response (strip `[taint:untrusted_agent]` prefix if present). Break the loop and proceed to step 3.
+        - If `error == "timed_out"`: specialist is still running. Do NOT increment Attempts (poll-cycle timeouts are NOT failures). Append `polled at <ts>, still running` to state.md Note. Continue.
+   c. After 24 poll timeouts: increment Attempts once, fall through to step 4 (error branch). The orphan async work continues in the background; the next retry will spawn a fresh delegation.
 3. On return:
    - Check Hard rule 5 patterns in the raw return string before any parsing. Infra error → halt.
    - Strip `[taint:untrusted_agent]` prefix.
@@ -350,6 +359,7 @@ For each runnable row (status=pending, deps done):
 4. On error/timeout:
    - Increment Attempts, write last error to Note. If Attempts now == 3, mark `failed`.
    - Increment consecutive_failures; if ≥ 3, halt loop.
+   - **Note:** poll-cycle timeouts from the ASYNC-POLL loop (step 2b inner `timed_out` branch) are NOT errors and must NOT trigger this branch. Only SYNC timeouts and post-24-poll ASYNC ceilings count.
 5. After every dispatch:
    - Append `ledger.jsonl`: `{"task":"T<N>","resource":"<res>","status":"done|failed","attempts":<n>,"ts":"<iso>"}`.
    - memory_store `demiurg_subagent_calls` += 1.

@@ -799,6 +799,7 @@ pub async fn execute_tool(
         "agent_kill" => tool_agent_kill(input, kernel),
         "agent_delegate" => tool_agent_delegate(input, kernel, caller_agent_id).await,
         "agent_delegate_async" => tool_agent_delegate_async(input, kernel, caller_agent_id).await,
+        "agent_send_async" => tool_agent_send_async(input, kernel).await,
         "delegation_await" => tool_delegation_await(input, kernel).await,
 
         // Self-inspection / self-modification tools
@@ -1335,7 +1336,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
                     "message": { "type": "string", "description": "The message to send to the agent" },
-                    "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for response (optional, default: no timeout)" },
+                    "timeout_seconds": { "type": "integer", "description": "Hard ceiling in seconds (optional). Used as wall-clock max when combined with idle_timeout_seconds." },
+                    "idle_timeout_seconds": { "type": "integer", "description": "Idle-timeout in seconds (optional). The waiter gives up only after this much silence from the target (no AgentActivity events). Use for long-running specialists where wall-clock time is unknown but steady iteration progress is expected. Pair with timeout_seconds as the absolute ceiling." },
                     "session_id": {
                         "type": "string",
                         "description": "Optional session routing. Omit (or pass \"new\") for a fresh isolated session — orchestrators should leave this blank so independent subtasks don't share history. Pass an existing session UUID to continue a multi-turn conversation. Pass \"default\" to reuse the agent's registered default session (channel-style)."
@@ -1453,6 +1455,31 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["manifest_toml", "message"]
+            }),
+            ..Default::default()
+        },
+        ToolDefinition {
+            name: "agent_send_async".to_string(),
+            description: "Send a message to an EXISTING agent asynchronously. Returns immediately with a \
+                          delegation_id. The target processes the message in the background and publishes \
+                          a 'delegation_completed' event when done. Pair with delegation_await to barrier. \
+                          Use this (not agent_send) for hands marked long_running=true in hand_list — \
+                          avoids a 5-minute sync timeout cliff on multi-step specialists.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
+                    "message": { "type": "string", "description": "The message to send" },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session routing (same semantics as agent_send)"
+                    },
+                    "callback_event_type": {
+                        "type": "string",
+                        "description": "Custom event type for completion notification (default: 'delegation_completed')"
+                    }
+                },
+                "required": ["agent_id", "message"]
             }),
             ..Default::default()
         },
@@ -2552,16 +2579,24 @@ async fn tool_agent_send(
     }
 
     let timeout_secs = input.get("timeout_seconds").and_then(|v| v.as_u64());
+    let idle_secs = input.get("idle_timeout_seconds").and_then(|v| v.as_u64());
     let session_id = input.get("session_id").and_then(|v| v.as_str());
 
     let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
-            match timeout_secs {
-                Some(secs) => {
+            match (idle_secs, timeout_secs) {
+                (Some(idle), max) => {
+                    // Cap the hard ceiling at the agent-tool outer limit so idle waiters
+                    // can't outlive the agent_loop's own tool timeout.
+                    let total = max.unwrap_or(3600);
+                    kh.send_to_agent_with_idle_timeout(agent_id, message, idle, total, session_id)
+                        .await
+                }
+                (None, Some(secs)) => {
                     kh.send_to_agent_with_timeout(agent_id, message, secs, session_id)
                         .await
                 }
-                None => kh.send_to_agent(agent_id, message, session_id).await,
+                (None, None) => kh.send_to_agent(agent_id, message, session_id).await,
             }
         })
         .await;
@@ -2570,6 +2605,39 @@ async fn tool_agent_send(
     // This ensures that if the calling agent passes this output into shell_exec,
     // the taint system will block it (TaintSink::shell_exec blocks UntrustedAgent).
     result.map(|r| format!("[taint:untrusted_agent] {r}"))
+}
+
+async fn tool_agent_send_async(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let message = input["message"]
+        .as_str()
+        .ok_or("Missing 'message' parameter")?;
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    let callback_event_type = input.get("callback_event_type").and_then(|v| v.as_str());
+
+    // Same depth guard as tool_agent_send — async dispatch still counts toward
+    // the A->B->C runaway prevention budget.
+    let current_depth = AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0);
+    if current_depth >= MAX_AGENT_CALL_DEPTH {
+        return Err(format!(
+            "Inter-agent call depth exceeded (max {}). \
+             A->B->C chain is too deep. Use the task queue instead.",
+            MAX_AGENT_CALL_DEPTH
+        ));
+    }
+
+    AGENT_CALL_DEPTH
+        .scope(std::cell::Cell::new(current_depth + 1), async {
+            kh.send_to_agent_async(agent_id, message, session_id, callback_event_type)
+                .await
+        })
+        .await
 }
 
 async fn tool_agent_spawn(

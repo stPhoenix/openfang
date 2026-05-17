@@ -314,6 +314,13 @@ pub enum SystemEvent {
         /// Whether the result was delivered to a channel (e.g. Telegram).
         delivered_to_channel: bool,
     },
+    /// An agent advanced an iteration of its loop (touch_agent fired).
+    /// Idle-timeout barriers (`agent_send` with `idle_timeout_seconds`) consume
+    /// this to verify the target is still making progress.
+    AgentActivity {
+        /// The agent that made progress.
+        agent_id: AgentId,
+    },
 }
 
 /// A complete event in the OpenFang event system.
@@ -424,5 +431,17 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.ttl, Some(Duration::from_millis(60_000)));
+    }
+
+    #[test]
+    fn test_agent_activity_roundtrip() {
+        let agent_id = AgentId::new();
+        let original = SystemEvent::AgentActivity { agent_id };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: SystemEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SystemEvent::AgentActivity { agent_id: a } => assert_eq!(a, agent_id),
+            _ => panic!("expected AgentActivity, got {:?}", parsed),
+        }
     }
 }

@@ -119,6 +119,29 @@ def test_pro_researcher_hand_registered(client: httpx.Client) -> None:
     assert "shell_exec" not in tools, (
         f"pro-researcher must NOT have shell_exec; tools={tools}"
     )
+    # long_running flag must be surfaced so demiurg can route via async-poll.
+    assert pro.get("long_running") is True, (
+        f"pro-researcher must report long_running=true in /api/hands; got {pro.get('long_running')!r}"
+    )
+
+
+def test_demiurg_hand_has_async_dispatch_tools(client: httpx.Client) -> None:
+    """Demiurg must carry agent_send_async + delegation_await so it can dispatch
+    long_running hands (e.g. pro-researcher) via the async-poll path instead of
+    the 5-minute sync timeout cliff."""
+    r = client.get("/api/hands")
+    assert r.status_code == 200
+    data = r.json()
+    items = data if isinstance(data, list) else data.get("hands", [])
+    demiurg = next((h for h in items if h.get("id") == "demiurg"), None)
+    assert demiurg is not None, "demiurg hand missing from /api/hands"
+    tools = demiurg.get("tools") or []
+    for needed in ("agent_send", "agent_send_async", "agent_delegate_async", "delegation_await"):
+        assert needed in tools, f"demiurg missing {needed}; tools={tools}"
+    # Demiurg itself is NOT long_running — it orchestrates short-lived dispatches.
+    assert demiurg.get("long_running") is False, (
+        f"demiurg should not flag long_running; got {demiurg.get('long_running')!r}"
+    )
 
 
 # ── Hand lifecycle (multi-instance + named uniqueness) ────────────────────────

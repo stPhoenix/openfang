@@ -466,6 +466,9 @@ fn describe_event(event: &Event) -> String {
             } => {
                 format!("Cron job executed: {job_name} ({job_id}) for agent {agent_id}")
             }
+            SystemEvent::AgentActivity { agent_id } => {
+                format!("Agent activity: {agent_id}")
+            }
         },
         EventPayload::Task(te) => match te {
             TaskEvent::Posted { task_id, title } => {

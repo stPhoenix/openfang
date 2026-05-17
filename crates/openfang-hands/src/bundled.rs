@@ -120,7 +120,10 @@ mod tests {
         assert!(def.tools.contains(&"hand_activate".to_string()));
         assert!(def.tools.contains(&"hand_deactivate".to_string()));
         assert!(def.tools.contains(&"agent_send".to_string()));
+        assert!(def.tools.contains(&"agent_send_async".to_string()));
         assert!(def.tools.contains(&"agent_delegate".to_string()));
+        assert!(def.tools.contains(&"agent_delegate_async".to_string()));
+        assert!(def.tools.contains(&"delegation_await".to_string()));
         // Workspace + persistence.
         assert!(def.tools.contains(&"file_read".to_string()));
         assert!(def.tools.contains(&"file_write".to_string()));
@@ -156,6 +159,8 @@ mod tests {
         assert_eq!(def.category, crate::HandCategory::Productivity);
         assert!(def.skill_content.is_some());
         assert!(def.requires.is_empty());
+        // Pro-researcher is long_running — orchestrators must dispatch via async-poll path.
+        assert!(def.long_running);
         // Orchestrator: shell_exec must stay out — there is no reason for it
         // and subagents don't need it either. web_search and web_fetch ARE
         // declared on the parent (kernel privilege-subset rule requires it

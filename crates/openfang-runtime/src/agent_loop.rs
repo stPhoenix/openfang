@@ -66,9 +66,11 @@ const AGENT_TOOL_TIMEOUT_SECS: u64 = 3700;
 /// (and in the case of `agent_delegate*`, may include grandchild delegations).
 fn tool_timeout_for(tool_name: &str) -> Duration {
     match tool_name {
-        "agent_send" | "agent_spawn" | "agent_delegate" | "agent_delegate_async" => {
-            Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS)
-        }
+        "agent_send"
+        | "agent_send_async"
+        | "agent_spawn"
+        | "agent_delegate"
+        | "agent_delegate_async" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
         _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
     }
 }
@@ -129,7 +131,12 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
 fn is_high_risk_tool_result(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "web_fetch" | "web_search" | "agent_send" | "agent_delegate" | "agent_delegate_async"
+        "web_fetch"
+            | "web_search"
+            | "agent_send"
+            | "agent_send_async"
+            | "agent_delegate"
+            | "agent_delegate_async"
     ) || tool_name.starts_with("mcp_")
 }
 
@@ -3918,6 +3925,10 @@ mod tests {
     #[test]
     fn test_tool_timeout_for_agent_tools() {
         assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(3700));
+        assert_eq!(
+            tool_timeout_for("agent_send_async"),
+            Duration::from_secs(3700)
+        );
         assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(3700));
         assert_eq!(tool_timeout_for("agent_delegate"), Duration::from_secs(3700));
         assert_eq!(

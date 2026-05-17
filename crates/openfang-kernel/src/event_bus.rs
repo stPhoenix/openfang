@@ -72,6 +72,29 @@ impl EventBus {
         }
     }
 
+    /// Publish an event without awaiting the history write.
+    /// Routes to the target's broadcast channel synchronously; skips ring-buffer
+    /// persistence. Used by hot-path emitters (e.g. `touch_agent`) that can't
+    /// `.await` and don't need the event in the history snapshot.
+    pub fn publish_sync(&self, event: Event) {
+        match &event.target {
+            EventTarget::Agent(agent_id) => {
+                if let Some(sender) = self.agent_channels.get(agent_id) {
+                    let _ = sender.send(event);
+                }
+            }
+            EventTarget::Broadcast => {
+                let _ = self.sender.send(event.clone());
+                for entry in self.agent_channels.iter() {
+                    let _ = entry.value().send(event.clone());
+                }
+            }
+            EventTarget::Pattern(_) | EventTarget::System => {
+                let _ = self.sender.send(event);
+            }
+        }
+    }
+
     /// Subscribe to events for a specific agent.
     pub fn subscribe_agent(&self, agent_id: AgentId) -> broadcast::Receiver<Event> {
         let entry = self.agent_channels.entry(agent_id).or_insert_with(|| {
@@ -144,6 +167,28 @@ mod tests {
                 assert_eq!(status, "ok");
             }
             _ => panic!("Wrong payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_sync_delivers_to_agent_subscriber() {
+        let bus = EventBus::new();
+        let agent_id = AgentId::new();
+        let mut rx = bus.subscribe_agent(agent_id);
+
+        let event = Event::new(
+            agent_id,
+            EventTarget::Agent(agent_id),
+            EventPayload::System(SystemEvent::AgentActivity { agent_id }),
+        );
+        bus.publish_sync(event);
+
+        let received = rx.recv().await.expect("event should arrive");
+        match received.payload {
+            EventPayload::System(SystemEvent::AgentActivity { agent_id: a }) => {
+                assert_eq!(a, agent_id);
+            }
+            _ => panic!("expected AgentActivity"),
         }
     }
 }
