@@ -32,8 +32,8 @@ document.addEventListener('alpine:init', function() {
       _stripRootPrefix: function(rootName, absPath) {
         var root = this.roots.find(function(r) { return r.name === rootName; });
         if (!root || !root.path) return '';
-        var base = root.path.replace(/\/+$/, '');
-        var p = absPath.replace(/\/+$/, '');
+        var base = root.path.replace(/\/+$/, ''); // safe: simple trailing-slash strip on bounded OS path
+        var p = absPath.replace(/\/+$/, ''); // safe: simple trailing-slash strip on bounded OS path
         if (p === base) return '';
         if (p.indexOf(base + '/') === 0) return p.slice(base.length + 1);
         return ''; // not under this root; fall back to root listing
@@ -59,7 +59,7 @@ document.addEventListener('alpine:init', function() {
       },
 
       async navigateTo(relPath) {
-        this.currentPath = (relPath || '').replace(/^\/+|\/+$/g, '');
+        this.currentPath = (relPath || '').replace(/^\/+|\/+$/g, ''); // safe: leading/trailing-slash strip on bounded OS path
         this.viewingFile = null;
         await this._loadDir();
       },

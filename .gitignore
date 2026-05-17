@@ -51,3 +51,4 @@ Thumbs.db
 
 # Personal deploy scripts
 scripts/deploy-remote.sh
+.sonarqube-reports/

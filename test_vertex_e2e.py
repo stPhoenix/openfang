@@ -68,6 +68,7 @@ def test_vertex_ai():
     
     try:
         ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
             response = json.loads(resp.read().decode())
             text = response["candidates"][0]["content"]["parts"][0]["text"]
@@ -137,6 +138,7 @@ def test_streaming():
     
     try:
         ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
             print("✅ Streaming response:")
             full_text = ""

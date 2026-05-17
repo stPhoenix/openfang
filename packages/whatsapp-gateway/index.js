@@ -16,7 +16,7 @@ const __dirname = path.dirname(__filename);
 // Config from environment
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
-const OPENFANG_URL = (process.env.OPENFANG_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
+const OPENFANG_URL = (process.env.OPENFANG_URL || 'http://127.0.0.1:4200').replace(/\/+$/, ''); // safe: trailing-slash strip on bounded env-supplied URL
 const DEFAULT_AGENT = process.env.OPENFANG_DEFAULT_AGENT || 'assistant';
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ async function startConnection() {
 
       // For groups: real sender is in participant; for DMs: it's remoteJid
       const senderJid = isGroup ? (msg.key.participant || '') : remoteJid;
-      const phone = '+' + senderJid.replace(/@.*$/, '');
+      const phone = '+' + senderJid.replace(/@.*$/, ''); // safe: strip on bounded WhatsApp JID
       const pushName = msg.pushName || phone;
 
       const metadata = {
@@ -166,7 +166,7 @@ async function startConnection() {
         const response = await forwardToOpenFang(text, phone, pushName, metadata);
         if (response && sock) {
           // Reply in the same context: group → group, DM → DM
-          const replyJid = isGroup ? remoteJid : senderJid.replace(/@.*$/, '') + '@s.whatsapp.net';
+          const replyJid = isGroup ? remoteJid : senderJid.replace(/@.*$/, '') + '@s.whatsapp.net'; // safe: strip on bounded WhatsApp JID
           await sock.sendMessage(replyJid, { text: response });
           console.log(`[gateway] Replied to ${pushName}${isGroup ? ' in group ' + remoteJid : ''}`);
         }
@@ -275,6 +275,7 @@ function jsonResponse(res, status, data) {
 const server = http.createServer(async (req, res) => {
   // CORS preflight
   if (req.method === 'OPTIONS') {
+    // safe: gateway intentionally exposes preflight to any origin; bind on loopback in prod and gate via reverse proxy
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',

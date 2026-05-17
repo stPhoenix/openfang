@@ -367,7 +367,7 @@ var OpenFangAPI = (function() {
           }
               var exp = Math.min(_reconnectAttempts - 1, 5);
               var delay = Math.min(1000 * Math.pow(2, exp), RECONNECT_CAP_MS);
-              delay = delay + Math.floor(Math.random() * 1000); // jitter
+              delay = delay + Math.floor(Math.random() * 1000); // safe: non-crypto reconnect-backoff jitter
               _reconnectTimer = setTimeout(function () {
                   if (_wsAgentId) _doConnect(_wsAgentId);
               }, delay);
@@ -390,7 +390,7 @@ var OpenFangAPI = (function() {
             _reconnectAttempts++;
             var expE = Math.min(_reconnectAttempts - 1, 5);
             var delayE = Math.min(1000 * Math.pow(2, expE), RECONNECT_CAP_MS);
-            delayE = delayE + Math.floor(Math.random() * 1000);
+            delayE = delayE + Math.floor(Math.random() * 1000); // safe: non-crypto reconnect-backoff jitter
             _reconnectTimer = setTimeout(function () {
                 if (_wsAgentId) _doConnect(_wsAgentId);
             }, delayE);

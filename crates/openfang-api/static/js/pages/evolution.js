@@ -801,7 +801,7 @@ function evolutionPage() {
 
     shortLabel(skillId) {
       // Extract version part: v{gen} or imp
-      var m = skillId.match(/__(.+)$/);
+      var m = skillId.match(/__(.+)$/); // safe: internal skillId, anchored to '__' separator, result truncated to 10 chars
       return m ? m[1].substring(0, 10) : skillId.substring(0, 10);
     },
 

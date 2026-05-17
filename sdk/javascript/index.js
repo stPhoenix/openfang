@@ -33,7 +33,7 @@ class OpenFang {
    * @param {Record<string, string>} [opts.headers] - Extra headers for every request
    */
   constructor(baseUrl, opts) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.baseUrl = baseUrl.replace(/\/+$/, ""); // safe: trailing-slash strip on caller-supplied base URL
     this._headers = Object.assign({ "Content-Type": "application/json" }, (opts && opts.headers) || {});
     this.agents = new AgentResource(this);
     this.sessions = new SessionResource(this);

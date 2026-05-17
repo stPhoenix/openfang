@@ -219,7 +219,7 @@ function chatPage() {
 
         // Watch for slash commands + model autocomplete
       this.$watch('inputText', function(val) {
-        var modelMatch = val.match(/^\/model\s+(.*)$/i);
+        var modelMatch = val.match(/^\/model\s+(.*)$/i); // safe: bounded textarea input, regex anchored to /model prefix
         if (modelMatch) {
           self.showSlashMenu = false;
           self.modelPickerFilter = modelMatch[1].toLowerCase();
@@ -1055,7 +1055,7 @@ function chatPage() {
               var snapSelf = this;
               (data.tools || []).forEach(function (t) {
                 snapSelf._appendTool(snap, {
-                  id: t.id || ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)),
+                  id: t.id || ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)), // safe: non-crypto tool-id uniqueness
                   name: t.name || 'tool',
                   running: !t.finished,
                   expanded: false,
@@ -1117,7 +1117,7 @@ function chatPage() {
           if (last._toolTextDetected) break;
           this._appendText(last, data.content);
           // Detect function-call patterns streamed as text and convert to tool cards
-          var fcIdx = last.text.search(/\w+<\/function[=,>]/);
+          var fcIdx = last.text.search(/\w+<\/function[=,>]/); // safe: applied to streaming assistant text (server-bounded chunks)
           if (fcIdx === -1) fcIdx = last.text.search(/<function=\w+>/);
           if (fcIdx !== -1) {
             var fcPart = last.text.substring(fcIdx);
@@ -1438,7 +1438,7 @@ function chatPage() {
 
       // Build a unique id for a rendering part (text or tool card).
       _partKey: function () {
-          return 'p' + (++msgId) + Math.random().toString(36).slice(2, 6);
+          return 'p' + (++msgId) + Math.random().toString(36).slice(2, 6); // safe: non-crypto render-key uniqueness
       },
 
     // Find or lazily create a streaming agent message at the tail of the
@@ -1552,7 +1552,7 @@ function chatPage() {
         // (and this one, after a reload) can dedupe by id instead of by text.
         var clientMsgId = (window.crypto && crypto.randomUUID)
             ? 'cm-' + crypto.randomUUID()
-            : 'cm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+            : 'cm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10); // safe: non-crypto fallback id when crypto.randomUUID unavailable
 
         // Stage the prompt in localStorage BEFORE clearing the input or
         // attempting to send. If the tab crashes between here and the WS
@@ -1754,11 +1754,11 @@ function chatPage() {
     sanitizeToolText: function(text) {
       if (!text) return text;
       // Pattern: tool_name</function={"key":"value"} or tool_name</function,{...}
-      text = text.replace(/\s*\w+<\/function[=,]?\s*\{[\s\S]*$/gm, '');
+      text = text.replace(/\s*\w+<\/function[=,]?\s*\{[\s\S]*$/gm, ''); // safe: applied to streaming assistant text (server-bounded chunks)
       // Pattern: <function=tool_name>{...}</function>
       text = text.replace(/<function=\w+>[\s\S]*?<\/function>/g, '');
       // Pattern: tool_name{"type":"function",...}
-      text = text.replace(/\s*\w+\{"type"\s*:\s*"function"[\s\S]*$/gm, '');
+      text = text.replace(/\s*\w+\{"type"\s*:\s*"function"[\s\S]*$/gm, ''); // safe: applied to streaming assistant text (server-bounded chunks)
       // Pattern: lone </function...> tags
       text = text.replace(/<\/function[^>]*>/g, '');
       // Pattern: <|python_tag|> or similar special tokens
