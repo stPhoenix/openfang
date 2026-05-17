@@ -259,6 +259,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "ready": ready,
                 "is_generating": generating.contains(&e.id),
                 "profile": e.manifest.profile,
+                "workspace": e.manifest.workspace.as_ref().map(|p| p.display().to_string()),
                 "identity": {
                     "emoji": e.identity.emoji,
                     "avatar_url": e.identity.avatar_url,

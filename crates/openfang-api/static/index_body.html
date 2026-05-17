@@ -153,6 +153,13 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
               <span class="nav-label">Logs</span>
             </a>
+          <a :aria-current="page === 'filebrowser' ? 'page' : false" :class="{ active: page === 'filebrowser' }" @click="navigate('filebrowser')"
+             class="nav-item">
+            <span class="nav-icon"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"
+                                        stroke-width="2" viewBox="0 0 24 24"><path
+                    d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
+            <span class="nav-label">Files</span>
+          </a>
         </div>
       </div>
 
@@ -1084,6 +1091,9 @@
                   </div>
                   <div class="flex gap-2 mt-4">
                     <button class="btn btn-primary" @click="chatWithAgent(detailAgent); showDetailModal = false">Chat</button>
+                    <button @click="openWorkdir(detailAgent)" class="btn btn-ghost"
+                            x-show="detailAgent && detailAgent.workspace">Open Workdir
+                    </button>
                     <button class="btn btn-ghost" @click="cloneAgent(detailAgent)">Clone</button>
                     <button class="btn btn-ghost" @click="clearHistory(detailAgent)">Clear History</button>
                     <button class="btn btn-danger" @click="killAgent(detailAgent)">Stop</button>
@@ -3853,6 +3863,93 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </table>
           </div>
 
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: File Browser -->
+    <template x-if="page === 'filebrowser'">
+      <div x-data="filebrowserPage" x-init="init()">
+        <div class="page-header"><h2>Files</h2></div>
+        <div class="page-body">
+          <div class="loading-state" x-show="loading">
+            <div class="spinner"></div>
+            <span>Loading...</span></div>
+          <div class="error-state" x-show="loadError">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+          </div>
+
+          <!-- Roots overview -->
+          <div x-show="!currentRoot && !loading">
+            <div class="text-dim mb-2" style="font-size:13px">Browse read-only contents of agent workspaces and
+              installed hands.
+            </div>
+            <template :key="r.name" x-for="r in roots">
+              <div @click="openRoot(r.name)" class="card mb-2" style="cursor:pointer">
+                <div class="font-bold" x-text="r.label"></div>
+                <div class="font-mono text-xs text-dim" x-text="r.path"></div>
+                <div class="text-xs" style="color:var(--warning)" x-show="!r.exists">Directory does not exist yet</div>
+              </div>
+            </template>
+          </div>
+
+          <!-- Directory + file viewer -->
+          <div x-show="currentRoot">
+            <!-- Breadcrumb -->
+            <div class="flex gap-1 items-center mb-2" style="flex-wrap:wrap">
+              <a @click="backToRoots()" class="link" style="cursor:pointer">Roots</a>
+              <template :key="idx" x-for="(crumb, idx) in breadcrumb">
+                <span class="flex gap-1 items-center">
+                  <span class="text-dim">/</span>
+                  <a @click="idx === 0 ? openRoot(currentRoot) : navigateTo(crumb.path)" class="link"
+                     style="cursor:pointer" x-text="crumb.label"></a>
+                </span>
+              </template>
+              <span class="text-dim" style="margin-left:8px" x-show="currentPath">
+                <button @click="navigateUp()" class="btn btn-ghost btn-sm">&larr; Up</button>
+              </span>
+            </div>
+
+            <!-- Directory listing -->
+            <div x-show="!viewingFile && !loading">
+              <div class="text-center text-dim" style="padding:24px" x-show="!entries.length">Empty directory</div>
+              <template :key="e.name" x-for="e in entries">
+                <div @click="openEntry(e)"
+                     class="file-list-item"
+                     style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border);cursor:pointer">
+                  <span style="width:18px;text-align:center" x-text="e.is_dir ? '📁' : '📄'"></span>
+                  <span class="font-mono" style="flex:1;font-size:13px" x-text="e.name + (e.is_dir ? '/' : '')"></span>
+                  <span class="text-xs text-dim" style="min-width:80px;text-align:right"
+                        x-text="e.is_dir ? '' : formatSize(e.size_bytes)"></span>
+                  <button @click.stop="downloadEntry(e)" class="btn btn-ghost btn-sm" style="font-size:11px"
+                          x-show="!e.is_dir">Download
+                  </button>
+                </div>
+              </template>
+            </div>
+
+            <!-- File viewer -->
+            <div x-show="viewingFile">
+              <div class="flex justify-between items-center mb-2" style="gap:8px;flex-wrap:wrap">
+                <span class="font-bold font-mono" x-text="viewingFile && viewingFile.name"></span>
+                <div class="flex gap-2">
+                  <span class="text-xs text-dim" x-text="viewingFile && formatSize(viewingFile.size_bytes)"></span>
+                  <button @click="downloadCurrent()" class="btn btn-ghost btn-sm">Download</button>
+                  <button @click="closeFile()" class="btn btn-ghost btn-sm">&larr; Back</button>
+                </div>
+              </div>
+              <div class="markdown-body" style="padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);overflow-x:auto"
+                   x-html="renderedMarkdown"
+                   x-show="viewingFile && viewingFile.isMarkdown"></div>
+              <pre style="padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px"
+                   x-show="viewingFile && !viewingFile.isMarkdown"><code
+                      x-text="viewingFile && viewingFile.content"></code></pre>
+              <div class="text-dim text-xs" style="margin-top:6px" x-show="viewingFile && viewingFile.truncated">File
+                truncated — download to see full contents.
+              </div>
+            </div>
           </div>
         </div>
       </div>

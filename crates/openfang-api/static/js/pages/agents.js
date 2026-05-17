@@ -369,7 +369,14 @@ function agentsPage() {
         }
     },
 
-    closeChat() {
+      openWorkdir(agent) {
+          if (!agent || !agent.workspace) return;
+          Alpine.store('fileBrowser', {root: 'workspaces', absPath: agent.workspace});
+          this.showDetailModal = false;
+          window.location.hash = 'filebrowser';
+      },
+
+      closeChat() {
       this.activeChatAgent = null;
       OpenFangAPI.wsDisconnect();
         try {

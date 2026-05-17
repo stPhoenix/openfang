@@ -174,6 +174,23 @@ pub async fn build_router(
             "/api/metrics",
             axum::routing::get(routes::prometheus_metrics),
         )
+        // File browser (read-only) — workspaces + hands roots.
+        .route(
+            "/api/files/roots",
+            axum::routing::get(crate::files_browser::list_roots),
+        )
+        .route(
+            "/api/files/list",
+            axum::routing::get(crate::files_browser::list_dir),
+        )
+        .route(
+            "/api/files/read",
+            axum::routing::get(crate::files_browser::read_file),
+        )
+        .route(
+            "/api/files/download",
+            axum::routing::get(crate::files_browser::download_file),
+        )
         .route("/api/health", axum::routing::get(routes::health))
         .route(
             "/api/health/detail",
