@@ -14,6 +14,9 @@ function evolutionPage() {
     loading: true,
     loadError: '',
     running: false,
+    progress: { current: 0, total: 0, lastSessionId: null, lastStatus: null },
+    _evolveSource: null,
+    _pollHandle: null,
     saving: false,
     showConfig: false,
     selectedAnalysis: null,
@@ -52,7 +55,7 @@ function evolutionPage() {
       this.loading = true;
       this.loadError = '';
       try {
-        await Promise.all([this.loadConfig(), this.loadStats(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords()]);
+        await Promise.all([this.loadConfig(), this.loadStats(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus()]);
         this.buildSkillClasses();
       } catch (e) {
         this.loadError = e.message || 'Failed to load evolution data.';
@@ -81,6 +84,50 @@ function evolutionPage() {
     async loadStats() {
       var data = await OpenFangAPI.get('/api/evolve/stats');
       if (data) this.stats = data;
+    },
+    // Recover progress for a batch that started in a previous page session.
+    // Mount hook → if server says running, start the status poller so the
+    // progress bar lights up immediately without needing the SSE stream.
+    async loadRunStatus() {
+      try {
+        var s = await OpenFangAPI.get('/api/evolve/run/status');
+        if (!s || !s.running) return;
+        this.running = true;
+        this.progress.current = s.current || 0;
+        this.progress.total = s.total || 0;
+        this.progress.lastSessionId = s.last_session_id || null;
+        this.progress.lastStatus = s.last_status || null;
+        this._startStatusPolling();
+      } catch (_) { /* ignore — endpoint may be down */ }
+    },
+    _startStatusPolling() {
+      if (this._pollHandle) return;
+      var self = this;
+      this._pollHandle = setInterval(async function() {
+        try {
+          var s = await OpenFangAPI.get('/api/evolve/run/status');
+          if (!s) return;
+          self.progress.current = s.current || 0;
+          self.progress.total = s.total || 0;
+          self.progress.lastSessionId = s.last_session_id || null;
+          self.progress.lastStatus = s.last_status || null;
+          if (!s.running) {
+            clearInterval(self._pollHandle);
+            self._pollHandle = null;
+            self.running = false;
+            if (s.error) {
+              OpenFangToast.error('Analysis failed: ' + s.error);
+            } else {
+              self.lastRunResult = { analyzed: s.analyzed || 0 };
+              OpenFangToast.success('Analyzed ' + (s.analyzed || 0) + ' sessions');
+            }
+            try {
+              await Promise.all([self.loadStats(), self.loadAnalyses(), self.loadAgent(), self.loadSkillRecords()]);
+              self.buildSkillClasses();
+            } catch (_) {}
+          }
+        } catch (_) { /* keep polling — transient network errors are fine */ }
+      }, 1200);
     },
     async loadModelOptions() {
       this.providersLoading = true;
@@ -138,16 +185,74 @@ function evolutionPage() {
       }
     },
     async runAnalysis() {
+      if (this.running) return;
       this.running = true;
       this.lastRunResult = null;
+      this.progress = { current: 0, total: 0, lastSessionId: null, lastStatus: null };
+
+      var self = this;
+      var done = false;
+
+      var finish = function(analyzed, errorMsg) {
+        if (done) return;
+        done = true;
+        if (self._evolveSource) {
+          try { self._evolveSource.close(); } catch (_) {}
+          self._evolveSource = null;
+        }
+        if (self._pollHandle) {
+          clearInterval(self._pollHandle);
+          self._pollHandle = null;
+        }
+        if (errorMsg) {
+          OpenFangToast.error('Analysis failed: ' + errorMsg);
+        } else {
+          self.lastRunResult = { analyzed: analyzed };
+          OpenFangToast.success('Analyzed ' + analyzed + ' sessions');
+        }
+        Promise.all([self.loadStats(), self.loadAnalyses(), self.loadAgent(), self.loadSkillRecords()])
+          .then(function() { self.buildSkillClasses(); })
+          .catch(function() {})
+          .finally(function() { self.running = false; });
+      };
+
+      var url = '/api/evolve/run/stream';
+      var token = (typeof OpenFangAPI !== 'undefined' && OpenFangAPI.getToken) ? OpenFangAPI.getToken() : null;
+      if (token) url += '?token=' + encodeURIComponent(token);
+
       try {
-        var data = await OpenFangAPI.post('/api/evolve/run', {});
-        this.lastRunResult = data;
-        OpenFangToast.success('Analyzed ' + (data.analyzed || 0) + ' sessions');
-        await Promise.all([this.loadStats(), this.loadAnalyses(), this.loadAgent(), this.loadSkillRecords()]);
-        this.buildSkillClasses();
-      } catch (e) { OpenFangToast.error('Analysis failed: ' + (e.message || e)); }
-      this.running = false;
+        this._evolveSource = new EventSource(url);
+      } catch (e) {
+        finish(0, e.message || 'EventSource unavailable');
+        return;
+      }
+
+      this._evolveSource.onmessage = function(event) {
+        var ev;
+        try { ev = JSON.parse(event.data); } catch (_) { return; }
+        if (ev.type === 'started') {
+          self.progress.total = ev.total || 0;
+          self.progress.current = 0;
+        } else if (ev.type === 'item') {
+          self.progress.current = (ev.index || 0) + 1;
+          self.progress.total = ev.total || self.progress.total;
+          self.progress.lastSessionId = ev.session_id || null;
+          self.progress.lastStatus = ev.status || null;
+        } else if (ev.type === 'completed') {
+          finish(ev.analyzed || 0, null);
+        } else if (ev.type === 'error') {
+          finish(0, ev.error || 'unknown error');
+        }
+      };
+
+      this._evolveSource.onerror = function() {
+        // EventSource auto-retries; only treat as terminal once we've received
+        // a `completed` event (done=true) or the stream errors before opening.
+        if (done) return;
+        if (self._evolveSource && self._evolveSource.readyState === EventSource.CLOSED) {
+          finish(0, 'stream connection lost');
+        }
+      };
     },
     selectAnalysis(a) {
       this.selectedAnalysis = (this.selectedAnalysis && this.selectedAnalysis.id === a.id) ? null : a;

@@ -52,6 +52,9 @@ pub async fn build_router(
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
+        evolve_progress: Arc::new(tokio::sync::RwLock::new(
+            routes::EvolveProgressSnapshot::default(),
+        )),
     });
 
     // Start WS cron broadcaster — subscribes to kernel event bus and pushes
@@ -673,6 +676,14 @@ pub async fn build_router(
             axum::routing::get(routes::evolve_get_config).put(routes::evolve_set_config),
         )
         .route("/api/evolve/run", axum::routing::post(routes::evolve_run))
+        .route(
+            "/api/evolve/run/stream",
+            axum::routing::get(routes::evolve_run_stream),
+        )
+        .route(
+            "/api/evolve/run/status",
+            axum::routing::get(routes::evolve_run_status),
+        )
         .route(
             "/api/evolve/analyze/{session_id}",
             axum::routing::post(routes::evolve_analyze_session),

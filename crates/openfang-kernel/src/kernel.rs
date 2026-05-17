@@ -7226,22 +7226,38 @@ impl OpenFangKernel {
     }
 
     /// Analyze all unanalyzed sessions via the evolution analyzer agent.
+    ///
+    /// Backwards-compatible wrapper that discards progress events. See
+    /// `evolve_analyze_unanalyzed_with_progress` for the streaming variant.
     pub async fn evolve_analyze_unanalyzed(
         &self,
         session_loader: impl Fn(&str, &str) -> Option<Vec<openfang_types::message::Message>>,
         available_skills: &[String],
     ) -> Result<Vec<openfang_evolve::ExecutionAnalysis>, openfang_evolve::EvolveError> {
+        self.evolve_analyze_unanalyzed_with_progress(session_loader, available_skills, |_| {})
+            .await
+    }
+
+    /// Analyze all unanalyzed sessions and forward `ProgressEvent`s to `on_progress`.
+    ///
+    /// The analyzer agent's session is reset **before each item** so per-session
+    /// analyses do not bleed context into one another.
+    pub async fn evolve_analyze_unanalyzed_with_progress(
+        &self,
+        session_loader: impl Fn(&str, &str) -> Option<Vec<openfang_types::message::Message>>,
+        available_skills: &[String],
+        on_progress: impl FnMut(openfang_evolve::ProgressEvent),
+    ) -> Result<Vec<openfang_evolve::ExecutionAnalysis>, openfang_evolve::EvolveError> {
         let analyzer_id = self
             .ensure_evolve_agent()
             .map_err(|e| openfang_evolve::EvolveError::Other(e.to_string()))?;
 
-        // Reset session so each analysis run starts fresh (avoids context bleed
-        // between analysis batches and prevents unbounded session growth).
-        if let Err(e) = self.reset_session(analyzer_id) {
-            warn!(agent_id = %analyzer_id, "failed to reset analyzer session: {e}");
-        }
-
         let send_fn = |user_message: String| async move {
+            // Per-item session reset: each batch item gets a fresh analyzer session
+            // so prior items can't bias the LLM's analysis of this one.
+            if let Err(e) = self.reset_session(analyzer_id) {
+                warn!(agent_id = %analyzer_id, "failed to reset analyzer session: {e}");
+            }
             match self.send_message(analyzer_id, &user_message).await {
                 Ok(result) => Ok((
                     result.response,
@@ -7270,7 +7286,14 @@ impl OpenFangKernel {
             .unwrap_or(openfang_evolve::prompt::DEFAULT_CONTEXT_WINDOW);
 
         self.evolve_engine
-            .analyze_unanalyzed(session_loader, available_skills, &known_skill_ids, context_window, send_fn)
+            .analyze_unanalyzed(
+                session_loader,
+                available_skills,
+                &known_skill_ids,
+                context_window,
+                send_fn,
+                on_progress,
+            )
             .await
     }
 

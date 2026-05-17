@@ -43,6 +43,29 @@ pub struct AppState {
     /// Thread-safe mutable budget config. Updated via PUT /api/budget.
     /// Initialized from `kernel.config.budget` at startup.
     pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
+    /// Live snapshot of the most recent / in-progress evolve batch run.
+    /// Mutated by `evolve_run_stream`'s progress callback; read by
+    /// `evolve_run_status` so the dashboard can recover state after a reload.
+    pub evolve_progress: Arc<tokio::sync::RwLock<EvolveProgressSnapshot>>,
+}
+
+/// Server-side snapshot of an evolve batch run.
+///
+/// Held on `AppState` and updated from `evolve_run_stream`'s progress closure.
+/// Stays around after `running` flips false so a reloading page can still
+/// see the last result.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct EvolveProgressSnapshot {
+    pub running: bool,
+    pub current: usize,
+    pub total: usize,
+    pub analyzed: usize,
+    pub last_session_id: Option<String>,
+    pub last_agent_id: Option<String>,
+    pub last_status: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -13070,6 +13093,140 @@ pub async fn evolve_run(
             Json(serde_json::json!({ "error": format!("{e}") })),
         ),
     }
+}
+
+/// GET /api/evolve/run/stream — Same batch as POST /api/evolve/run, streamed as SSE.
+///
+/// Emits one `started` event, one `item` event per session processed (with
+/// `index`, `total`, `session_id`, `agent_id`, `status`), and a final
+/// `completed` event. Consumed by the Evolution tab to show realtime progress.
+pub async fn evolve_run_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        )
+            .into_response();
+    }
+
+    // Reject overlapping batches: the analyzer agent resets its session per
+    // item, so a second concurrent batch would race that reset and corrupt
+    // results. The dashboard already guards in JS; this is the server backstop.
+    if state.evolve_progress.read().await.running {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "an analysis batch is already running" })),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+        Result<Event, std::convert::Infallible>,
+    >();
+
+    let skill_names: Vec<String> = {
+        let reg = state.kernel.skill_registry.read().unwrap();
+        reg.list().iter().map(|s| s.manifest.skill.name.clone()).collect()
+    };
+    let memory = state.kernel.memory.clone();
+    let session_loader = move |sid: &str, _aid: &str| -> Option<Vec<openfang_types::message::Message>> {
+        let session_id = openfang_types::agent::SessionId(
+            uuid::Uuid::parse_str(sid).ok()?
+        );
+        let session = memory.get_session(session_id).ok()??;
+        Some(session.messages)
+    };
+
+    let kernel = state.kernel.clone();
+    let progress_tx = tx.clone();
+    let progress_state = state.evolve_progress.clone();
+    let progress_state_for_error = progress_state.clone();
+    tokio::spawn(async move {
+        let on_progress = move |ev: openfang_evolve::ProgressEvent| {
+            // Update shared snapshot so a reloading dashboard can recover.
+            // `try_write` is fine: the only writer is this closure (same task);
+            // readers are short-lived status handlers that won't starve us.
+            if let Ok(mut snap) = progress_state.try_write() {
+                match &ev {
+                    openfang_evolve::ProgressEvent::Started { total } => {
+                        *snap = EvolveProgressSnapshot {
+                            running: true,
+                            total: *total,
+                            started_at: Some(chrono::Utc::now()),
+                            ..Default::default()
+                        };
+                    }
+                    openfang_evolve::ProgressEvent::Item {
+                        index,
+                        total,
+                        session_id,
+                        agent_id,
+                        status,
+                    } => {
+                        snap.current = index + 1;
+                        snap.total = *total;
+                        snap.last_session_id = Some(session_id.clone());
+                        snap.last_agent_id = Some(agent_id.clone());
+                        snap.last_status = Some(
+                            serde_json::to_value(status)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_string))
+                                .unwrap_or_default(),
+                        );
+                    }
+                    openfang_evolve::ProgressEvent::Completed { analyzed } => {
+                        snap.running = false;
+                        snap.analyzed = *analyzed;
+                        snap.finished_at = Some(chrono::Utc::now());
+                    }
+                }
+            }
+            let data = serde_json::to_string(&ev).unwrap_or_default();
+            let _ = progress_tx.send(Ok(Event::default().data(data)));
+        };
+
+        if let Err(e) = kernel
+            .evolve_analyze_unanalyzed_with_progress(session_loader, &skill_names, on_progress)
+            .await
+        {
+            let err = format!("{e}");
+            // Mark the snapshot as failed so reloading clients see the error
+            // (and the next run can start — `running` must be false).
+            {
+                let mut snap = progress_state_for_error.write().await;
+                snap.running = false;
+                snap.finished_at = Some(chrono::Utc::now());
+                snap.error = Some(err.clone());
+            }
+            let data =
+                serde_json::json!({ "type": "error", "error": err }).to_string();
+            let _ = tx.send(Ok(Event::default().data(data)));
+        }
+        // tx dropped here → receiver stream ends → client connection closes.
+    });
+
+    let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    Sse::new(rx_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// GET /api/evolve/run/status — Current snapshot of the most recent evolve batch.
+///
+/// The dashboard calls this on page mount; if `running` is true it starts
+/// polling so progress survives reloads of `/api/evolve/run/stream`.
+pub async fn evolve_run_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<EvolveProgressSnapshot> {
+    Json(state.evolve_progress.read().await.clone())
 }
 
 /// POST /api/evolve/analyze/{session_id} — Analyze a specific session.

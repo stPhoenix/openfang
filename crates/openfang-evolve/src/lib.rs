@@ -28,8 +28,42 @@ use openfang_types::agent::AgentId;
 use openfang_types::config::EvolveConfig;
 use openfang_types::message::Message;
 use rusqlite::Connection;
+use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, info, warn};
+
+/// Per-item outcome status for batch analysis progress events.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStatus {
+    Analyzed,
+    NoMessages,
+    LoadFailed,
+    ParseFailed,
+    SendFailed,
+}
+
+/// Progress event emitted during `analyze_unanalyzed`.
+///
+/// `type` is the serde discriminant; consumed by the SSE handler and the
+/// Evolution dashboard tab.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProgressEvent {
+    Started {
+        total: usize,
+    },
+    Item {
+        index: usize,
+        total: usize,
+        session_id: String,
+        agent_id: String,
+        status: ItemStatus,
+    },
+    Completed {
+        analyzed: usize,
+    },
+}
 
 /// The evolution engine — orchestrates analysis of agent sessions.
 ///
@@ -239,18 +273,21 @@ impl EvolveEngine {
     /// `session_loader` loads messages for a session.
     /// `send_message` sends a user message to the analyzer agent (called once per session).
     /// `known_skill_ids` is used for fuzzy correction of hallucinated skill IDs.
-    pub async fn analyze_unanalyzed<L, S, Fut>(
+    /// `on_progress` is called for `Started`, each `Item` outcome, and `Completed`.
+    pub async fn analyze_unanalyzed<L, S, Fut, P>(
         &self,
         session_loader: L,
         available_skills: &[String],
         known_skill_ids: &[String],
         context_window: usize,
         mut send_message: S,
+        mut on_progress: P,
     ) -> Result<Vec<ExecutionAnalysis>, EvolveError>
     where
         L: Fn(&str, &str) -> Option<Vec<Message>>,
         S: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
+        P: FnMut(ProgressEvent),
     {
         let config = self.config();
         if !config.enabled {
@@ -277,87 +314,105 @@ impl EvolveEngine {
         self.store.mark_agent_sessions_analyzed(&exclude_ids)?;
 
         let pending = self.store.list_unanalyzed_session_ids(config.batch_size, &exclude_ids)?;
+        let total = pending.len();
+        on_progress(ProgressEvent::Started { total });
+
         if pending.is_empty() {
             debug!("no unanalyzed sessions found");
+            on_progress(ProgressEvent::Completed { analyzed: 0 });
             return Ok(vec![]);
         }
 
-        info!(count = pending.len(), "analyzing unanalyzed sessions");
+        info!(count = total, "analyzing unanalyzed sessions");
 
         let mut results = Vec::new();
-        for (session_id, agent_id) in &pending {
-            let Some(messages) = session_loader(session_id, agent_id) else {
-                warn!(session_id, "could not load session, skipping");
-                continue;
-            };
+        for (index, (session_id, agent_id)) in pending.iter().enumerate() {
+            let status: ItemStatus = 'item: {
+                let Some(messages) = session_loader(session_id, agent_id) else {
+                    warn!(session_id, "could not load session, skipping");
+                    break 'item ItemStatus::LoadFailed;
+                };
 
-            if messages.is_empty() {
-                debug!(session_id, "session has no messages, marking as analyzed");
-                self.store.mark_session_analyzed(session_id)?;
-                continue;
-            }
+                if messages.is_empty() {
+                    debug!(session_id, "session has no messages, marking as analyzed");
+                    let _ = self.store.mark_session_analyzed(session_id);
+                    break 'item ItemStatus::NoMessages;
+                }
 
-            let user_content =
-                prompt::build_user_message(&messages, available_skills, context_window);
-            debug!(session_id, "sending analysis request to analyzer agent");
+                let user_content =
+                    prompt::build_user_message(&messages, available_skills, context_window);
+                debug!(session_id, "sending analysis request to analyzer agent");
 
-            match send_message(user_content).await {
-                Ok((response_text, input_tokens, output_tokens)) => {
-                    match analyzer::parse_json_from_response(&response_text) {
-                        Ok(raw) => {
-                            let mut analysis = ExecutionAnalysis {
-                                id: AnalysisId::new(),
-                                session_id: session_id.to_string(),
-                                agent_id: agent_id.to_string(),
-                                task_completed: raw.task_completed,
-                                execution_note: raw.execution_note,
-                                tool_issues: raw.tool_issues,
-                                skill_judgments: raw.skill_judgments,
-                                evolution_suggestions: raw.evolution_suggestions,
-                                model_used: config.model.clone(),
-                                input_tokens,
-                                output_tokens,
-                                analyzed_at: chrono::Utc::now(),
-                            };
+                match send_message(user_content).await {
+                    Ok((response_text, input_tokens, output_tokens)) => {
+                        match analyzer::parse_json_from_response(&response_text) {
+                            Ok(raw) => {
+                                let mut analysis = ExecutionAnalysis {
+                                    id: AnalysisId::new(),
+                                    session_id: session_id.to_string(),
+                                    agent_id: agent_id.to_string(),
+                                    task_completed: raw.task_completed,
+                                    execution_note: raw.execution_note,
+                                    tool_issues: raw.tool_issues,
+                                    skill_judgments: raw.skill_judgments,
+                                    evolution_suggestions: raw.evolution_suggestions,
+                                    model_used: config.model.clone(),
+                                    input_tokens,
+                                    output_tokens,
+                                    analyzed_at: chrono::Utc::now(),
+                                };
 
-                            // Fuzzy-correct hallucinated skill IDs
-                            if !known_skill_ids.is_empty() {
-                                correction::correct_analysis_skill_ids(
-                                    &mut analysis,
-                                    known_skill_ids,
+                                if !known_skill_ids.is_empty() {
+                                    correction::correct_analysis_skill_ids(
+                                        &mut analysis,
+                                        known_skill_ids,
+                                    );
+                                }
+
+                                if let Err(e) = self.store.save_analysis(&analysis) {
+                                    warn!(session_id, error = %e, "failed to save analysis");
+                                    break 'item ItemStatus::ParseFailed;
+                                }
+                                let _ = self.store.mark_session_analyzed(session_id);
+
+                                self.update_counters_from_analysis(&analysis);
+
+                                info!(
+                                    session_id,
+                                    analysis_id = %analysis.id,
+                                    task_completed = analysis.task_completed,
+                                    suggestions = analysis.evolution_suggestions.len(),
+                                    "session analysis complete"
                                 );
+                                results.push(analysis);
+                                ItemStatus::Analyzed
                             }
-
-                            if let Err(e) = self.store.save_analysis(&analysis) {
-                                warn!(session_id, error = %e, "failed to save analysis");
-                                continue;
+                            Err(e) => {
+                                warn!(session_id, error = %e, "failed to parse analysis response");
+                                let _ = self.store.mark_session_analyzed(session_id);
+                                ItemStatus::ParseFailed
                             }
-                            let _ = self.store.mark_session_analyzed(session_id);
-
-                            // Update skill counters
-                            self.update_counters_from_analysis(&analysis);
-
-                            info!(
-                                session_id,
-                                analysis_id = %analysis.id,
-                                task_completed = analysis.task_completed,
-                                suggestions = analysis.evolution_suggestions.len(),
-                                "session analysis complete"
-                            );
-                            results.push(analysis);
-                        }
-                        Err(e) => {
-                            warn!(session_id, error = %e, "failed to parse analysis response");
-                            let _ = self.store.mark_session_analyzed(session_id);
                         }
                     }
+                    Err(e) => {
+                        warn!(session_id, error = %e, "failed to send analysis message");
+                        ItemStatus::SendFailed
+                    }
                 }
-                Err(e) => {
-                    warn!(session_id, error = %e, "failed to send analysis message");
-                }
-            }
+            };
+
+            on_progress(ProgressEvent::Item {
+                index,
+                total,
+                session_id: session_id.to_string(),
+                agent_id: agent_id.to_string(),
+                status,
+            });
         }
 
+        on_progress(ProgressEvent::Completed {
+            analyzed: results.len(),
+        });
         Ok(results)
     }
 
