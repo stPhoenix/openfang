@@ -32,11 +32,26 @@ Subfolders auto-create on first `file_write` (the workspace sandbox walks up to 
 
 **Timestamp rule**: UTC `YYYYMMDD-HHMMSS`. Sortable, no spaces.
 
-## 2. Task classification rubric (HYBRID)
+## 2. Task classification (think first, classifier subagent on uncertainty)
 
-The system prompt's Phase 2 fast-path table is authoritative for keyword routing. Use the slow-path LLM classifier only when fast-path returns confidence ≠ `high`.
+Demiurg classifies every task by reasoning step-by-step in its own context. **No keyword tables, no regex, no
+pattern lookup** — the hand thinks through the task explicitly each time. The LLM classifier subagent is a fallback
+invoked only when the hand self-assesses uncertain.
 
-**Categories** (the slow-path JSON `category` field) and their typical resource targets:
+Process (mirrors system prompt Phase 2):
+
+1. **Hand reasons solo** in its own LLM call: literal goal, single- vs multi-step, domain-tools-needed vs pure-LLM,
+   best-fit category from the table below, steps (1–5 imperative verbs), required tools, and a self-assessed
+   confidence (`high` | `medium` | `low`).
+2. **If `high`** → use that classification directly. Skip the subagent (it would just be wasted cost).
+3. **If `medium` or `low`** → spawn the classifier subagent (discovery-only tools: `agent_list`, `hand_list`,
+   `agent_template_list`; inherits this hand's provider/model — set `provider = "default"`, `model = "default"` in
+   the child manifest). The subagent re-reasons independently AND enumerates live agents/hands/templates so it can
+   pick the target specialist itself, returning `selected_resource = {kind, id, rationale}` alongside the
+   classification fields per the JSON schema declared in Phase 2 of HAND.toml.
+
+**Categories** (the JSON `category` field, used either by the hand directly or by the classifier subagent) and
+their typical resource targets:
 
 | Category | Typical resource | Example tasks |
 |----------|------------------|---------------|
@@ -48,23 +63,22 @@ The system prompt's Phase 2 fast-path table is authoritative for keyword routing
 | `file_qa` | live agent w/ file tools | "answer questions about this file" |
 | `other` | ad-hoc fallback | anything else |
 
-**Fast-path confidence levels:**
-- `high` — multiple keywords match cleanly. Skip the LLM classifier; use the table's mapping directly.
-- `medium` — one weak match (e.g. URL with no verb). Run slow path to confirm.
-- `low` — no pattern matched. Run slow path.
+**Self-confidence definitions:**
+- `high` — goal unambiguous, category obvious, steps clear without speculation. Proceed solo.
+- `medium` — plausible but ambiguous (URL present with no clear verb, mixed verbs, possible multi-intent). Spawn classifier.
+- `low` — cannot tell what the user wants, or task is unusual enough to risk picking the wrong specialist. Spawn classifier.
 
-**Slow-path budget**: classifier subagent has discovery-only tools (`agent_list`, `hand_list`, `agent_template_list`)
-and inherits this hand's provider/model (no separate classifier model — set `provider = "default"`, `model = "default"`
-in the child manifest). The classifier reasons step-by-step about complexity and picks the target specialist itself,
-returning `selected_resource = {kind, id, rationale}` alongside the classification fields. Max 1 call per task, timeout
-180s. If it fails twice, fall back to the fast-path's best guess and demiurg's own heuristic in Phase 4. Never
-re-classify a task once Phase 2 produced an output — it causes drift.
+**Classifier budget:** max 1 call per task, timeout 180s. On parse failure twice, fall back to the hand's own
+best-confidence guess from Step 1 and proceed (do not loop). **Never re-classify** — Phase 2 is single-pass; the
+hand's reasoning plus the optional classifier output together count as one pass.
 
 ## 3. Resource selection priority
 
-If the slow-path classifier ran (Phase 2) and emitted `selected_resource`, trust it for the primary subtask — the
-classifier already enumerated live agents, hands, and templates. Apply the heuristic below only for secondary subtasks
-not covered by the classifier, OR when the classifier failed and the fast path is the source of truth.
+If the classifier subagent ran (Phase 2 medium/low confidence branch) and emitted `selected_resource`, trust it for
+the primary subtask — the classifier already enumerated live agents, hands, and templates. Apply the heuristic below
+only for secondary subtasks not covered by the classifier, OR when the classifier failed and the hand's own
+high-confidence guess is the source of truth. If the hand classified solo (Phase 2 high confidence), apply the
+heuristic below for every subtask.
 
 Apply this order **per subtask** (not per task):
 
@@ -215,6 +229,7 @@ Always write the full synthesis to `report_<slug>_<ts>.md` even if the response 
 - **Don't include taint prefix in stored outputs** — strip `[taint:untrusted_agent]` before file_write.
 - **Don't blind-append to state.md** — read first.
 - **Don't skip ledger.jsonl** — it's the only audit trail when the workspace is reviewed for debugging.
+- **Don't reach for keyword/pattern matching (or regex) on the task text** — Phase 2 is pure reasoning plus an optional classifier subagent. If a keyword pattern feels tempting, you're under-thinking the task; reason explicitly instead.
 
 ## 10. Memory keys
 
