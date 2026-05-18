@@ -93,10 +93,21 @@ use openfang_types::config::{ExecPolicy, ExecSecurityMode, ResourceLimits};
 /// after `fork()` but before `exec()`. Only calls POSIX async-signal-safe
 /// functions (`setrlimit` is async-signal-safe per POSIX).
 ///
+/// `cgroup_manages_pids` MUST be true when the caller has already placed the
+/// child into a per-agent cgroup with `pids.max` set. RLIMIT_NPROC is per-UID
+/// (counts every task owned by the daemon's real UID, including tokio worker
+/// threads) so the default cap of 256 is exhausted by the daemon long before
+/// any subprocess gets to fork. The cgroup is the authoritative per-agent
+/// bound; when it's in force, applying RLIMIT_NPROC on top guarantees fork
+/// failure under any non-trivial daemon load.
+///
 /// # Safety
 /// Must only be called in a `pre_exec` context (after fork, before exec).
 #[cfg(unix)]
-pub fn apply_resource_limits(limits: &ResourceLimits) -> Result<(), std::io::Error> {
+pub fn apply_resource_limits(
+    limits: &ResourceLimits,
+    cgroup_manages_pids: bool,
+) -> Result<(), std::io::Error> {
     use std::io::{Error, ErrorKind};
 
     // On Linux, __rlimit_resource_t is u32; on macOS it's c_int.
@@ -133,8 +144,11 @@ pub fn apply_resource_limits(limits: &ResourceLimits) -> Result<(), std::io::Err
     // RLIMIT_FSIZE: Maximum file size in bytes.
     set_limit!(libc::RLIMIT_FSIZE, limits.max_file_bytes);
 
-    // RLIMIT_NPROC: Maximum number of processes for this user.
-    set_limit!(libc::RLIMIT_NPROC, limits.max_processes);
+    // RLIMIT_NPROC: only when no cgroup is managing the per-agent pid bound.
+    // See doc comment for the per-UID-vs-per-cgroup rationale.
+    if !cgroup_manages_pids {
+        set_limit!(libc::RLIMIT_NPROC, limits.max_processes);
+    }
 
     Ok(())
 }

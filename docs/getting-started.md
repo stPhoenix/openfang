@@ -303,6 +303,40 @@ Press `Ctrl+C` in the terminal running the daemon, or:
 curl -X POST http://127.0.0.1:4200/api/shutdown
 ```
 
+### Linux: Run as a systemd user service (recommended)
+
+For anything beyond a one-off `openfang start`, run the daemon as a systemd user service. This gives openfang a cgroup tree it actually owns, which is what enables the per-agent `pids.max` sandbox. Without it, the daemon falls back to a per-UID `RLIMIT_NPROC` cap that's easy to exhaust under load (symptom: `shell_exec` failing with `"Cannot fork"` — see [Troubleshooting](troubleshooting.md#cannot-fork--rlimit_nproc-errors-in-shell_exec-linux)).
+
+Create `~/.config/systemd/user/openfang.service`:
+
+```ini
+[Unit]
+Description=OpenFang Agent Operating System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/openfang start
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5
+Delegate=yes
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now openfang.service
+journalctl --user -u openfang -f
+```
+
+You should see `Cgroup v2 per-agent sandbox initialized` near the top of the log — that confirms per-agent cgroups are active. To keep the daemon running after you log out: `sudo loginctl enable-linger $USER`.
+
 ---
 
 ## Using the WebChat UI
