@@ -34,6 +34,9 @@ services:
       RUST_LOG: info
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Private cgroup namespace — required for the per-agent pids.max sandbox
+    # to write under /sys/fs/cgroup. Tests assert cgroup setup.
+    cgroup: private
     entrypoint: ["/usr/local/bin/openfang"]
     command: ["start"]
     healthcheck:

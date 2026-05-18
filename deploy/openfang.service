@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 User=openfang
 Group=openfang
+Slice=openfang.slice
 ExecStart=/usr/local/bin/openfang start
 Restart=on-failure
 RestartSec=5
@@ -25,10 +26,17 @@ ReadWritePaths=/var/lib/openfang
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
-ProtectControlGroups=true
+# Cgroup write access required for per-agent pids.max sandbox. Delegate=
+# below restricts what we can touch to our own cgroup subtree.
+ProtectControlGroups=no
 RestrictSUIDSGID=true
 MemoryDenyWriteExecute=false
 RestrictRealtime=true
+
+# Cgroup v2 controller delegation — lets the openfang user create per-agent
+# sub-cgroups under /sys/fs/cgroup/openfang.slice/openfang.service and set
+# pids.max / memory.max / cpu.max on them.
+Delegate=pids cpu memory
 
 # Resource limits
 LimitNOFILE=65536

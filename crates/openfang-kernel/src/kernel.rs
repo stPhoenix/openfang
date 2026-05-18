@@ -123,6 +123,16 @@ pub struct OpenFangKernel {
     >,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// Cgroup v2 daemon setup, populated at startup if enabled and successful.
+    /// `None` = cgroup sandbox unavailable, all agents fall back to setrlimit.
+    pub cgroup_session: Option<openfang_runtime::cgroup_sandbox::CgroupSession>,
+    /// Per-agent cgroup handles. Created in `spawn_agent_with_parent` and
+    /// destroyed in `kill_agent`. Subprocesses spawned by the agent are placed
+    /// in their agent's cgroup via the `cgroup.procs` fd.
+    pub session_cgroups: dashmap::DashMap<
+        AgentId,
+        std::sync::Arc<openfang_runtime::cgroup_sandbox::SessionCgroup>,
+    >,
     /// AbortHandles for in-flight A2A tasks, keyed by A2A task id.
     /// Populated by `a2a_send_task`; aborted by `a2a_cancel_task`.
     pub a2a_task_handles: dashmap::DashMap<String, tokio::task::AbortHandle>,
@@ -1247,6 +1257,38 @@ impl OpenFangKernel {
             evolve_engine.sync_skills_from_registry(imports);
         }
 
+        // Initialize cgroup sandbox BEFORE moving `config` into the struct.
+        let cgroup_session = {
+            let policy = &config.exec_policy.cgroup_policy;
+            #[cfg(target_os = "linux")]
+            {
+                match openfang_runtime::cgroup_sandbox::init(policy) {
+                    Ok(sess) => {
+                        tracing::info!(
+                            parent = %sess.agent_parent.display(),
+                            max_processes = policy.max_processes,
+                            "Cgroup v2 per-agent sandbox initialized"
+                        );
+                        Some(sess)
+                    }
+                    Err(e) => {
+                        if policy.enabled {
+                            tracing::warn!(
+                                error = %e,
+                                "Cgroup v2 sandbox unavailable — falling back to RLIMIT_NPROC only"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = policy;
+                None
+            }
+        };
+
         let kernel = Self {
             config,
             registry: AgentRegistry::new(),
@@ -1266,6 +1308,8 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
+            cgroup_session,
+            session_cgroups: dashmap::DashMap::new(),
             a2a_task_handles: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
@@ -1771,6 +1815,27 @@ impl OpenFangKernel {
         self.registry
             .register(entry.clone())
             .map_err(KernelError::OpenFang)?;
+
+        // Create per-agent cgroup if the daemon-wide session is available.
+        // Failure here falls back to setrlimit-only sandboxing — never block
+        // agent spawn on a sandbox-tightening feature.
+        if let Some(sess) = self.cgroup_session.as_ref() {
+            let policy = &self.config.exec_policy.cgroup_policy;
+            match sess.create_agent(agent_id.0, policy) {
+                Ok(sc) => {
+                    self.session_cgroups
+                        .insert(agent_id, std::sync::Arc::new(sc));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %name,
+                        id = %agent_id,
+                        error = %e,
+                        "Failed to create per-agent cgroup; falling back to RLIMIT_NPROC"
+                    );
+                }
+            }
+        }
 
         // Update parent's children list
         if let Some(parent_id) = parent {
@@ -2886,6 +2951,7 @@ impl OpenFangKernel {
                     .to_string_lossy()
                     .to_string(),
             ),
+            cgroup_procs_fd: self.cgroup_procs_fd_for(agent_id),
             ..PythonConfig::default()
         };
 
@@ -4167,6 +4233,29 @@ impl OpenFangKernel {
         self.event_bus.unsubscribe_agent(agent_id);
         self.triggers.remove_agent_triggers(agent_id);
 
+        // Destroy per-agent cgroup. Best-effort: an EBUSY here means some
+        // child process is still alive (process_manager / kill_tree will
+        // catch up), so log + leak rather than retry-loop.
+        if let Some((_, sc)) = self.session_cgroups.remove(&agent_id) {
+            match std::sync::Arc::try_unwrap(sc) {
+                Ok(handle) => {
+                    if let Err(e) = handle.destroy() {
+                        tracing::warn!(
+                            id = %agent_id,
+                            error = %e,
+                            "cgroup destroy failed"
+                        );
+                    }
+                }
+                Err(_still_shared) => {
+                    tracing::debug!(
+                        id = %agent_id,
+                        "cgroup still referenced by in-flight pre_exec; dir will be reaped on last drop"
+                    );
+                }
+            }
+        }
+
         // Remove cron jobs so they don't linger as orphans (#504)
         let cron_removed = self.cron_scheduler.remove_agent_jobs(agent_id);
         if cron_removed > 0 {
@@ -4188,6 +4277,16 @@ impl OpenFangKernel {
 
         info!(agent = %entry.name, id = %agent_id, "Agent killed");
         Ok(())
+    }
+
+    /// Return the cgroup.procs fd handle for `agent_id`, if a per-agent cgroup
+    /// exists. Used by `tool_shell_exec` / `python_runtime` pre_exec hooks to
+    /// place children into the agent's cgroup before exec.
+    pub fn cgroup_procs_fd_for(
+        &self,
+        agent_id: AgentId,
+    ) -> Option<openfang_runtime::cgroup_sandbox::CgroupProcsFd> {
+        self.session_cgroups.get(&agent_id).map(|sc| sc.procs_fd())
     }
 
     // ─── Hand lifecycle ─────────────────────────────────────────────────────
@@ -5849,6 +5948,19 @@ impl OpenFangKernel {
         }
 
         self.supervisor.shutdown();
+
+        // Tear down per-agent cgroups. Each rmdir is best-effort; if procs
+        // still alive, kernel returns EBUSY and we leak the dir (systemd
+        // sweeps the unit's cgroup tree on stop, so leaks are bounded).
+        let cg_keys: Vec<AgentId> =
+            self.session_cgroups.iter().map(|e| *e.key()).collect();
+        for id in cg_keys {
+            if let Some((_, sc)) = self.session_cgroups.remove(&id) {
+                if let Ok(handle) = std::sync::Arc::try_unwrap(sc) {
+                    let _ = handle.destroy();
+                }
+            }
+        }
 
         // Update agent states to Suspended in persistent storage (not delete)
         for entry in self.registry.list() {
@@ -8242,6 +8354,13 @@ impl ScopedKernelHandle {
 
 #[async_trait]
 impl KernelHandle for ScopedKernelHandle {
+    fn cgroup_procs_fd(
+        &self,
+        agent_id: &str,
+    ) -> Option<openfang_runtime::cgroup_sandbox::CgroupProcsFd> {
+        self.inner.cgroup_procs_fd(agent_id)
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,
@@ -8760,6 +8879,14 @@ async fn cron_fan_out_targets(
 
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
+    fn cgroup_procs_fd(
+        &self,
+        agent_id: &str,
+    ) -> Option<openfang_runtime::cgroup_sandbox::CgroupProcsFd> {
+        let id: AgentId = agent_id.parse().ok()?;
+        self.cgroup_procs_fd_for(id)
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,

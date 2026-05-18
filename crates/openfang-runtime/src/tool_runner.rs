@@ -723,11 +723,15 @@ pub async fn execute_tool(
                     };
                 }
             }
+            let cg_fd = kernel
+                .zip(caller_agent_id)
+                .and_then(|(k, id)| k.cgroup_procs_fd(id));
             tool_shell_exec(
                 input,
                 allowed_env_vars.unwrap_or(&[]),
                 workspace_root,
                 exec_policy,
+                cg_fd,
             )
             .await
         }
@@ -2348,6 +2352,7 @@ async fn tool_shell_exec(
     allowed_env: &[String],
     workspace_root: Option<&Path>,
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    cgroup_procs_fd: Option<crate::cgroup_sandbox::CgroupProcsFd>,
 ) -> Result<String, String> {
     let command = input["command"]
         .as_str()
@@ -2440,12 +2445,33 @@ async fn tool_shell_exec(
         let limits = exec_policy
             .map(|p| p.resource_limits.clone())
             .unwrap_or_default();
-        // SAFETY: pre_exec runs after fork(), before exec(). setrlimit is
-        // async-signal-safe per POSIX, so this is safe in a pre_exec context.
+        // Linux: capture the cgroup.procs Arc<OwnedFd> by move into the
+        // pre_exec closure. This keeps the underlying fd alive across fork
+        // and through exec. Async-signal-safe write writes the child's pid.
+        #[cfg(target_os = "linux")]
+        let cg_fd = cgroup_procs_fd;
+        #[cfg(not(target_os = "linux"))]
+        let _ = cgroup_procs_fd;
+        // SAFETY: pre_exec runs after fork(), before exec(). The cgroup
+        // write uses only libc::getpid + libc::write of a stack buffer;
+        // apply_resource_limits uses only setrlimit. All async-signal-safe.
         unsafe {
-            cmd.pre_exec(move || crate::subprocess_sandbox::apply_resource_limits(&limits));
+            cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                if let Some(fd_arc) = cg_fd.as_ref() {
+                    use std::os::fd::AsRawFd;
+                    // Place child in agent cgroup FIRST — must not exec
+                    // uncontained on failure.
+                    crate::cgroup_sandbox::write_self_pid_async_signal_safe(
+                        fd_arc.as_raw_fd(),
+                    )?;
+                }
+                crate::subprocess_sandbox::apply_resource_limits(&limits)
+            });
         }
     }
+    #[cfg(not(unix))]
+    let _ = cgroup_procs_fd;
 
     let result =
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;

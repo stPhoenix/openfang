@@ -1,0 +1,8 @@
+[Unit]
+Description=Slice for OpenFang Agent OS workloads
+Documentation=https://github.com/openfang-ai/openfang
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes

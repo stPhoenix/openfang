@@ -20,6 +20,9 @@ services:
     mem_limit: 4g
     memswap_limit: 6g
     cpus: 4
+    # Private cgroup namespace — container sees its own cgroup root and can
+    # create per-agent sub-cgroups under it for pids.max enforcement.
+    cgroup: private
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"

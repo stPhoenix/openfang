@@ -331,6 +331,18 @@ pub trait KernelHandle: Send + Sync {
         let _ = agent_id;
     }
 
+    /// Return the cgroup.procs fd for the agent's session cgroup, if one was
+    /// created at spawn time. Subprocess pre_exec closures write the child's
+    /// pid here to enforce the per-agent `pids.max` cap. `None` = fall back to
+    /// `RLIMIT_NPROC` only.
+    fn cgroup_procs_fd(
+        &self,
+        agent_id: &str,
+    ) -> Option<crate::cgroup_sandbox::CgroupProcsFd> {
+        let _ = agent_id;
+        None
+    }
+
     /// Spawn a specialist agent, send it a message, get the response, and kill it.
     /// Combines agent_spawn + agent_send + agent_kill into one atomic operation.
     /// The spawned agent is always cleaned up, even on error or timeout.

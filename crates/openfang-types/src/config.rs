@@ -925,6 +925,39 @@ impl Default for ResourceLimits {
     }
 }
 
+/// Cgroup v2 sandbox policy. Linux-only — fields are ignored on other OSes.
+///
+/// When enabled, the kernel creates one cgroup per agent session at spawn
+/// time and places every `shell_exec` / Python skill child into it before
+/// exec. `pids.max` then caps the *agent's* subprocess tree independently
+/// of what the daemon UID is doing globally — `RLIMIT_NPROC` cannot do this
+/// because it is per-UID and counts the daemon's own tokio threads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CgroupPolicy {
+    /// Enable cgroup placement. Defaults to true on Linux, false elsewhere.
+    pub enabled: bool,
+    /// Parent cgroup path. Empty string = auto-detect from /proc/self/cgroup
+    /// (recommended).
+    pub parent_path: String,
+    /// Max processes (including threads) for each agent's cgroup.
+    pub max_processes: u64,
+    /// If true, a failed cgroup setup logs a warning and falls back to
+    /// setrlimit-only sandboxing. If false, agent spawn fails hard.
+    pub fallback_on_error: bool,
+}
+
+impl Default for CgroupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: cfg!(target_os = "linux"),
+            parent_path: String::new(),
+            max_processes: 256,
+            fallback_on_error: true,
+        }
+    }
+}
+
 /// Shell/exec security policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -947,6 +980,9 @@ pub struct ExecPolicy {
     /// Resource limits applied to child processes via setrlimit (Unix only).
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+    /// Cgroup v2 per-agent sandbox (Linux only). See `CgroupPolicy`.
+    #[serde(default)]
+    pub cgroup_policy: CgroupPolicy,
     /// Shell metacharacters normally blocked but permitted when listed here.
     /// Allowed values: "|", ";", "&&", "{}", ">", "<", "&".
     /// Backticks, $(), ${}, newlines and NUL are NEVER bypassable.
@@ -974,6 +1010,7 @@ impl Default for ExecPolicy {
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
             resource_limits: ResourceLimits::default(),
+            cgroup_policy: CgroupPolicy::default(),
             allowed_metacharacters: Vec::new(),
         }
     }

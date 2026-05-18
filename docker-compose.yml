@@ -21,6 +21,8 @@ services:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+    # Private cgroup namespace — required for per-agent pids.max sandbox.
+    cgroup: private
     restart: unless-stopped
 
 volumes:

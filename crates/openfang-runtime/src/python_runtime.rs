@@ -63,6 +63,10 @@ pub struct PythonConfig {
     pub working_dir: Option<String>,
     /// Specific env vars to pass through (capability-gated, not secrets).
     pub allowed_env_vars: Vec<String>,
+    /// Per-agent cgroup.procs fd. When Some, the Python child is placed in
+    /// the agent's cgroup before exec — same per-agent `pids.max` cap as
+    /// `shell_exec`. None falls back to setrlimit only.
+    pub cgroup_procs_fd: Option<crate::cgroup_sandbox::CgroupProcsFd>,
 }
 
 impl Default for PythonConfig {
@@ -72,6 +76,7 @@ impl Default for PythonConfig {
             timeout_secs: 120,
             working_dir: None,
             allowed_env_vars: Vec::new(),
+            cgroup_procs_fd: None,
         }
     }
 }
@@ -204,10 +209,24 @@ pub async fn run_python_agent(
     #[cfg(unix)]
     {
         let limits = openfang_types::config::ResourceLimits::default();
-        // SAFETY: pre_exec runs after fork(), before exec(). setrlimit is
-        // async-signal-safe per POSIX.
+        #[cfg(target_os = "linux")]
+        let cg_fd = config.cgroup_procs_fd.clone();
+        #[cfg(not(target_os = "linux"))]
+        let _ = &config.cgroup_procs_fd;
+        // SAFETY: pre_exec runs after fork(), before exec(). The cgroup
+        // write (single libc::write of stack-formatted pid) and setrlimit
+        // are async-signal-safe per POSIX.
         unsafe {
-            cmd.pre_exec(move || crate::subprocess_sandbox::apply_resource_limits(&limits));
+            cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                if let Some(fd_arc) = cg_fd.as_ref() {
+                    use std::os::fd::AsRawFd;
+                    crate::cgroup_sandbox::write_self_pid_async_signal_safe(
+                        fd_arc.as_raw_fd(),
+                    )?;
+                }
+                crate::subprocess_sandbox::apply_resource_limits(&limits)
+            });
         }
     }
 
