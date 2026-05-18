@@ -2450,6 +2450,10 @@ async fn tool_shell_exec(
         // and through exec. Async-signal-safe write writes the child's pid.
         #[cfg(target_os = "linux")]
         let cg_fd = cgroup_procs_fd;
+        #[cfg(target_os = "linux")]
+        let cgroup_manages_pids = cg_fd.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_manages_pids = false;
         #[cfg(not(target_os = "linux"))]
         let _ = cgroup_procs_fd;
         // SAFETY: pre_exec runs after fork(), before exec(). The cgroup
@@ -2466,7 +2470,10 @@ async fn tool_shell_exec(
                         fd_arc.as_raw_fd(),
                     )?;
                 }
-                crate::subprocess_sandbox::apply_resource_limits(&limits)
+                crate::subprocess_sandbox::apply_resource_limits(
+                    &limits,
+                    cgroup_manages_pids,
+                )
             });
         }
     }

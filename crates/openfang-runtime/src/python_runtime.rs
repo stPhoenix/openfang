@@ -211,6 +211,10 @@ pub async fn run_python_agent(
         let limits = openfang_types::config::ResourceLimits::default();
         #[cfg(target_os = "linux")]
         let cg_fd = config.cgroup_procs_fd.clone();
+        #[cfg(target_os = "linux")]
+        let cgroup_manages_pids = cg_fd.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_manages_pids = false;
         #[cfg(not(target_os = "linux"))]
         let _ = &config.cgroup_procs_fd;
         // SAFETY: pre_exec runs after fork(), before exec(). The cgroup
@@ -225,7 +229,10 @@ pub async fn run_python_agent(
                         fd_arc.as_raw_fd(),
                     )?;
                 }
-                crate::subprocess_sandbox::apply_resource_limits(&limits)
+                crate::subprocess_sandbox::apply_resource_limits(
+                    &limits,
+                    cgroup_manages_pids,
+                )
             });
         }
     }

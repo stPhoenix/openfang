@@ -352,6 +352,65 @@ tools = ["file_read", "web_fetch", "shell_exec"]  # Must list each tool
 2. LLM provider is configured and has a valid key
 3. Model specified in manifest exists in the catalog
 
+### "Cannot fork" / `RLIMIT_NPROC` errors in `shell_exec` (Linux)
+
+**Symptom**: An agent's `shell_exec` (commonly the youtube-extract hand invoking `yt-dlp`) returns:
+
+```
+Error: FATAL: sandbox process limit exhausted (RLIMIT_NPROC).
+Stderr: sh: 1: Cannot fork
+```
+
+**Cause**: OpenFang has two per-agent process-cap layers — a Linux cgroup v2 `pids.max` cap (the real per-agent bound) and a per-UID `RLIMIT_NPROC` setrlimit fallback for when cgroup setup fails. When the daemon runs inside a systemd-logind session scope (the default for `nohup openfang start &` from a terminal), that scope directory is owned by **root** with mode `0755`, so the daemon can't `mkdir` a per-agent sub-cgroup. Check the boot log for this line:
+
+```
+WARN Cgroup v2 sandbox unavailable — falling back to RLIMIT_NPROC only
+  error=no write permission on "...session-N.scope/supervisor": Permission denied
+```
+
+If that line is present, the daemon is on the setrlimit fallback path. `RLIMIT_NPROC` is **per-UID** (not per-process tree) and counts every task owned by the daemon's user — including all of its own tokio worker threads — so the default 256 cap can be exhausted before any subprocess gets to `fork()`.
+
+**Fix (recommended)**: Run openfang as a systemd user service with `Delegate=yes`. The daemon is then placed in a cgroup it actually owns, and per-agent `pids.max` becomes the authoritative bound.
+
+Create `~/.config/systemd/user/openfang.service`:
+
+```ini
+[Unit]
+Description=OpenFang Agent Operating System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/openfang start
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5
+Delegate=yes
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now openfang.service
+journalctl --user -u openfang -n 50 | grep -i cgroup
+```
+
+Look for `Cgroup v2 per-agent sandbox initialized` — that confirms the per-agent cap is active and the per-UID setrlimit is skipped. To keep the daemon running after you log out: `sudo loginctl enable-linger $USER`.
+
+**Fix (without systemd)**: If you can't use a systemd user service, raise the setrlimit cap by editing `~/.openfang/config.toml`:
+
+```toml
+[exec_policy.resource_limits]
+max_processes = 4096
+```
+
+The cap is still per-UID and shared with daemon threads, so pick a value that comfortably exceeds your daemon's task count plus headroom for concurrent `shell_exec` children.
+
 ---
 
 ## API Issues
