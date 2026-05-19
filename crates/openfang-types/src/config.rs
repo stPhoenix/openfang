@@ -352,6 +352,16 @@ pub struct WebFetchConfig {
     /// cloud metadata endpoint blocking (169.254.169.254, metadata.google.internal, etc.).
     #[serde(default)]
     pub ssrf_allowed_hosts: Vec<String>,
+    /// Domains the fetcher refuses to call. Useful for SPA / login-walled /
+    /// paywall hosts that web_fetch cannot read meaningfully — letting an
+    /// LLM-driven agent retry against them burns iterations and tokens.
+    ///
+    /// Entries can be exact hostnames (`"example.com"`) or wildcard subdomain
+    /// patterns (`"*.shopify.com"`). Matching uses suffix logic — a deny
+    /// entry of `"example.com"` rejects both `example.com` and any subdomain.
+    /// Default empty.
+    #[serde(default)]
+    pub deny_domains: Vec<String>,
 }
 
 impl Default for WebFetchConfig {
@@ -362,6 +372,7 @@ impl Default for WebFetchConfig {
             timeout_secs: 30,
             readability: true,
             ssrf_allowed_hosts: Vec::new(),
+            deny_domains: Vec::new(),
         }
     }
 }

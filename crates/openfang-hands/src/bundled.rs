@@ -171,6 +171,15 @@ mod tests {
         assert!(def.tools.contains(&"web_search".to_string()));
         assert!(def.tools.contains(&"web_fetch".to_string()));
         assert!(def.tools.contains(&"shell_exec".to_string()));
+        // Speedup pass: orchestrator now uses cheap bulk-path tools that
+        // replace per-URL extractor / per-query searcher subagent loops
+        // on the happy path. Subagents remain as the fallback.
+        assert!(def.tools.contains(&"web_fetch_extract".to_string()));
+        assert!(def.tools.contains(&"web_search_batch".to_string()));
+        // Browser fallback for SPA URLs that raw web_fetch can't read.
+        assert!(def.tools.contains(&"browser_navigate".to_string()));
+        assert!(def.tools.contains(&"browser_read_page".to_string()));
+        assert!(def.tools.contains(&"browser_close".to_string()));
         let policy = def
             .exec_policy
             .as_ref()
@@ -194,6 +203,37 @@ mod tests {
         assert!(def.settings.iter().any(|s| s.key == "plan_approval"));
         assert!(def.settings.iter().any(|s| s.key == "research_depth"));
         assert!(def.settings.iter().any(|s| s.key == "max_subagent_calls"));
+        // Quality-upgrade additions: configurable deny list + raised token budget.
+        let denied_hosts = def
+            .settings
+            .iter()
+            .find(|s| s.key == "denied_hosts")
+            .expect("pro-researcher must expose denied_hosts setting");
+        assert_eq!(denied_hosts.default, "");
+        assert!(matches!(
+            denied_hosts.setting_type,
+            crate::HandSettingType::Text
+        ));
+        let max_tokens_setting = def
+            .settings
+            .iter()
+            .find(|s| s.key == "max_total_input_tokens")
+            .expect("pro-researcher must expose max_total_input_tokens setting");
+        assert_eq!(max_tokens_setting.default, "1500000");
+        // Quality-upgrade phases present in the system prompt.
+        let prompt = &def.agent.system_prompt;
+        assert!(prompt.contains("Phase 1.5"), "missing goal extraction phase");
+        assert!(prompt.contains("required_coverage.md"));
+        assert!(prompt.contains("Phase 6.5a"), "missing citation chase");
+        assert!(prompt.contains("Phase 6.5b"), "missing integrator phase");
+        assert!(prompt.contains("Phase 7.0"), "missing coverage gate");
+        assert!(prompt.contains("Phase 7.1"), "missing source-quality floor");
+        assert!(prompt.contains("Phase 7.2"), "missing fabrication check");
+        assert!(prompt.contains("<DENIED_HOSTS>"), "deny list must be templated");
+        assert!(prompt.contains("integrator"));
+        assert!(prompt.contains("verifier"));
+        assert!(prompt.contains("fabrication_check.md"));
+        assert!(prompt.contains("narrative.md"));
         // Dashboard wired.
         assert!(!def.dashboard.metrics.is_empty());
         let metric_keys: Vec<&str> = def

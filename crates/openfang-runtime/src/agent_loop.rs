@@ -64,13 +64,17 @@ const AGENT_TOOL_TIMEOUT_SECS: u64 = 3700;
 /// Returns the appropriate timeout duration for a given tool name.
 /// Inter-agent calls get a longer timeout since they may trigger full agent loops
 /// (and in the case of `agent_delegate*`, may include grandchild delegations).
+/// `delegation_await` is a barrier over already-dispatched inter-agent calls —
+/// without the long timeout the outer wrap kills it at TOOL_TIMEOUT_SECS even
+/// though its own internal clamp accepts up to AGENT_TOOL_TIMEOUT_SECS.
 fn tool_timeout_for(tool_name: &str) -> Duration {
     match tool_name {
         "agent_send"
         | "agent_send_async"
         | "agent_spawn"
         | "agent_delegate"
-        | "agent_delegate_async" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
+        | "agent_delegate_async"
+        | "delegation_await" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
         _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
     }
 }
@@ -3933,6 +3937,10 @@ mod tests {
         assert_eq!(tool_timeout_for("agent_delegate"), Duration::from_secs(3700));
         assert_eq!(
             tool_timeout_for("agent_delegate_async"),
+            Duration::from_secs(3700)
+        );
+        assert_eq!(
+            tool_timeout_for("delegation_await"),
             Duration::from_secs(3700)
         );
         assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));

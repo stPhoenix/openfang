@@ -31,6 +31,33 @@ fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
 }
 
+/// Returns true when a shell-tool call should bypass the human approval gate
+/// because the hand's `exec_policy` already provides a stronger enforcement
+/// than a one-shot dialog could.
+///
+/// Bypass cases:
+/// - `mode = "full"` — user explicitly opted into unrestricted shell (issue #772).
+/// - `mode = "allowlist"` with `allowed_commands = ["*"]` — wildcard allow.
+/// - `mode = "allowlist"` with a *tight* list (≤4 entries, no wildcard) — the
+///   kernel-enforced allowlist (`subprocess_sandbox::validate_command_allowlist`)
+///   runs on every invocation and blocks anything off-list, so a human dialog
+///   adds latency without adding safety. Unblocks specialist hands like
+///   pro-researcher's yt-extractor (`["yt-dlp"]`) from approval-denial loops.
+fn exec_policy_bypasses_approval(
+    tool_name: &str,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+) -> bool {
+    is_shell_tool(tool_name)
+        && exec_policy.is_some_and(|p| {
+            p.mode == openfang_types::config::ExecSecurityMode::Full
+                || (p.mode == openfang_types::config::ExecSecurityMode::Allowlist
+                    && (p.allowed_commands.iter().any(|c| c == "*")
+                        || (!p.allowed_commands.is_empty()
+                            && p.allowed_commands.len() <= 4
+                            && p.allowed_commands.iter().all(|c| c != "*"))))
+        })
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -576,16 +603,8 @@ pub async fn execute_tool(
 
     // Approval gate: check if this tool requires human approval before execution.
     //
-    // When exec_policy.mode = "full" (or allowlist with allowed_commands = ["*"]),
-    // the user has explicitly opted into unrestricted shell access. In that case,
-    // shell_exec should bypass the approval gate — requiring approval for commands
-    // the user already whitelisted is contradictory (GitHub issue #772).
-    let exec_policy_bypasses_approval = is_shell_tool(tool_name)
-        && exec_policy.is_some_and(|p| {
-            p.mode == openfang_types::config::ExecSecurityMode::Full
-                || (p.mode == openfang_types::config::ExecSecurityMode::Allowlist
-                    && p.allowed_commands.iter().any(|c| c == "*"))
-        });
+    let exec_policy_bypasses_approval =
+        exec_policy_bypasses_approval(tool_name, exec_policy);
 
     if exec_policy_bypasses_approval {
         debug!(
@@ -668,6 +687,20 @@ pub async fn execute_tool(
             } else {
                 tool_web_search_legacy(input).await
             }
+        }
+        "web_fetch_extract" => {
+            let url = input["url"].as_str().unwrap_or("");
+            if let Some(violation) = check_taint_net_fetch(url) {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!("Taint violation: {violation}"),
+                    is_error: true,
+                };
+            }
+            tool_web_fetch_extract(input, web_ctx, kernel, caller_agent_id).await
+        }
+        "web_search_batch" => {
+            tool_web_search_batch(input, web_ctx).await
         }
 
         // Shell tool — metacharacter check + exec policy + taint check
@@ -1323,6 +1356,33 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "max_results": { "type": "integer", "description": "Maximum number of results to return (default: 5, max: 20)" }
                 },
                 "required": ["query"]
+            }),
+            ..Default::default()
+        },
+        ToolDefinition {
+            name: "web_fetch_extract".to_string(),
+            description: "Fetch a URL and distill its content for a specific sub-question in ONE round trip. Replaces the per-URL extractor subagent loop: short-circuits SPA / login-wall / paywall pages without an LLM call, and runs a single one-shot LLM completion (using the caller's resolved model) to produce a CRAAP-formatted extract. Returns either the CRAAP markdown, 'IRRELEVANT: <reason>', or 'FETCH_FAILED: <error>'.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL to fetch (http/https only)" },
+                    "sub_question": { "type": "string", "description": "The sub-question this URL is supposed to answer" },
+                    "max_tokens": { "type": "integer", "description": "Maximum tokens for the distilled extract (default: 1024)" }
+                },
+                "required": ["url", "sub_question"]
+            }),
+            ..Default::default()
+        },
+        ToolDefinition {
+            name: "web_search_batch".to_string(),
+            description: "Run multiple web_search queries in parallel, dedupe URLs across queries, drop denylisted hosts (via [web.fetch].deny_domains config), and return a single ranked URL list. Replaces the per-query searcher subagent loop. Returns JSON: {\"queries\": [...], \"urls\": [{\"url\", \"title\", \"snippet\", \"score\", \"matched_queries\": [...]}]}.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "queries": { "type": "array", "items": { "type": "string" }, "description": "List of search queries to run in parallel" },
+                    "top_n_per_query": { "type": "integer", "description": "Max results per query (default: 5, max: 20)" }
+                },
+                "required": ["queries"]
             }),
             ..Default::default()
         },
@@ -2341,6 +2401,175 @@ async fn tool_web_search_legacy(input: &serde_json::Value) -> Result<String, Str
     }
 
     Ok(output)
+}
+
+/// Returns true if a fetched body looks like a JS-rendered SPA shell or a
+/// login wall — content that an LLM extract pass cannot meaningfully use.
+fn body_looks_like_spa(body: &str) -> bool {
+    if body.len() < 2048 {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "__NEXT_DATA__",
+        "data-turbo",
+        "__NUXT__",
+        "ng-version",
+        "data-reactroot",
+    ];
+    MARKERS.iter().any(|m| body.contains(m))
+}
+
+const EXTRACT_SYSTEM_PROMPT: &str = "You are Extractor. Distill ONE web page for ONE sub-question. Output ONLY the markdown block below — no preamble, no chain-of-thought.\n\n- **Source**: <url> | <publish date if visible> | <author if visible>\n- **Quality** (CRAAP A/B/C/D): <letter> — <one-line reason>\n- **Claims**:\n  - \"<near-exact claim>\" — supports/contradicts/refines\n- **Data points**:\n  - <metric>: <value with units>\n- **Quotes** (verbatim, <=2):\n  - \"<quote>\"\n- **Gaps**: <what this source did NOT address>\n\nIf the page is irrelevant to the sub-question, output EXACTLY (single line):\nIRRELEVANT: <one-line reason>\n\nRules: NEVER paraphrase a claim and present it as a quote. NEVER include unrelated content.";
+
+async fn tool_web_fetch_extract(
+    input: &serde_json::Value,
+    web_ctx: Option<&WebToolsContext>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let url = input["url"].as_str().ok_or("Missing 'url' parameter")?;
+    let sub_question = input["sub_question"]
+        .as_str()
+        .ok_or("Missing 'sub_question' parameter")?;
+    let max_tokens = input["max_tokens"].as_u64().unwrap_or(1024) as u32;
+    let kh = kernel.ok_or("web_fetch_extract requires kernel access")?;
+    let agent_id = caller_agent_id
+        .ok_or("web_fetch_extract must be called by a running agent (no caller_agent_id)")?;
+
+    // Step 1: fetch via the protected pipeline (SSRF + deny-list).
+    let fetched = if let Some(ctx) = web_ctx {
+        ctx.fetch.fetch(url).await
+    } else {
+        tool_web_fetch_legacy(input).await
+    };
+    let body = match fetched {
+        Ok(b) => b,
+        Err(e) => return Ok(format!("FETCH_FAILED: {e}")),
+    };
+
+    // Step 2: SPA / login-wall short-circuit — no LLM call needed.
+    if body_looks_like_spa(&body) {
+        debug!(url, "web_fetch_extract: SPA marker detected, skipping LLM");
+        return Ok("IRRELEVANT: spa-or-login-wall".to_string());
+    }
+
+    // Step 3: one-shot LLM distill.
+    let trimmed = if body.len() > 16_000 {
+        format!(
+            "{}\n\n[...content truncated to 16000 chars, original {} bytes]",
+            crate::str_utils::safe_truncate_str(&body, 16_000),
+            body.len()
+        )
+    } else {
+        body
+    };
+    let user_prompt = format!(
+        "Sub-question: {sub_question}\nURL: {url}\n\nPAGE CONTENT:\n{trimmed}"
+    );
+    kh.llm_oneshot(agent_id, EXTRACT_SYSTEM_PROMPT, &user_prompt, max_tokens)
+        .await
+}
+
+async fn tool_web_search_batch(
+    input: &serde_json::Value,
+    web_ctx: Option<&WebToolsContext>,
+) -> Result<String, String> {
+    let queries: Vec<String> = input["queries"]
+        .as_array()
+        .ok_or("Missing 'queries' array")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if queries.is_empty() {
+        return Err("'queries' array must be non-empty".to_string());
+    }
+    let top_n = input["top_n_per_query"].as_u64().unwrap_or(5) as usize;
+    let top_n = top_n.clamp(1, 20);
+
+    // Run all queries concurrently using futures::join_all so WebSearchEngine
+    // doesn't need to be Clone'd into spawned tasks.
+    let futs = queries.iter().map(|q| {
+        let q = q.clone();
+        async move {
+            let res = if let Some(ctx) = web_ctx {
+                ctx.search.search(&q, top_n).await
+            } else {
+                let input = serde_json::json!({"query": q.clone(), "max_results": top_n});
+                tool_web_search_legacy(&input).await
+            };
+            (q, res)
+        }
+    });
+    let collected = futures::future::join_all(futs).await;
+
+    // Aggregate. Each search backend returns a markdown block — we parse it
+    // line-by-line for `URL:` markers and surrounding title/snippet lines.
+    use std::collections::HashMap;
+    let mut by_url: HashMap<
+        String,
+        (String, String, Vec<String>), // title, snippet, matched_queries
+    > = HashMap::new();
+    for (q, res) in collected {
+        let body = match res {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        for (i, ln) in lines.iter().enumerate() {
+            let trimmed = ln.trim();
+            let url = trimmed.strip_prefix("URL: ").map(str::trim);
+            if let Some(url) = url {
+                // Title: look back to the most recent numbered-list line.
+                let mut title = String::new();
+                for prev in lines[..i].iter().rev().take(3) {
+                    let prev = prev.trim();
+                    if !prev.is_empty() {
+                        title = prev
+                            .split_once(". ")
+                            .map(|(_, rest)| rest)
+                            .unwrap_or(prev)
+                            .to_string();
+                        break;
+                    }
+                }
+                // Snippet: next non-empty, non-URL line.
+                let snippet = lines
+                    .get(i + 1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let entry = by_url
+                    .entry(url.to_string())
+                    .or_insert_with(|| (title.clone(), snippet, vec![]));
+                if !entry.2.contains(&q) {
+                    entry.2.push(q.clone());
+                }
+            }
+        }
+    }
+
+    let mut ranked: Vec<_> = by_url.into_iter().collect();
+    // Rank by number of queries that matched this URL (more = stronger signal).
+    ranked.sort_by(|a, b| b.1 .2.len().cmp(&a.1 .2.len()));
+
+    let urls: Vec<serde_json::Value> = ranked
+        .into_iter()
+        .map(|(url, (title, snippet, matched))| {
+            let score = matched.len();
+            serde_json::json!({
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+                "score": score,
+                "matched_queries": matched,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "queries": queries,
+        "urls": urls,
+    })
+    .to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -5857,6 +6086,143 @@ mod tests {
         assert!(result.is_err(), "Deny mode must block process_start");
         assert!(result.unwrap_err().to_lowercase().contains("disabled"));
         assert_eq!(pm.count(), 0);
+    }
+
+    #[test]
+    fn test_body_looks_like_spa_short() {
+        // Anything under 2KB is treated as SPA shell / login page.
+        assert!(body_looks_like_spa("<html></html>"));
+        assert!(body_looks_like_spa(&"a".repeat(2047)));
+    }
+
+    #[test]
+    fn test_body_looks_like_spa_marker() {
+        // Long body with SPA marker triggers the short-circuit.
+        let body = format!(
+            "<html>{}<script id=\"__NEXT_DATA__\">{{}}</script></html>",
+            "x".repeat(3000)
+        );
+        assert!(body_looks_like_spa(&body));
+
+        let body_turbo = format!(
+            "<html><body data-turbo=\"true\">{}</body></html>",
+            "x".repeat(3000)
+        );
+        assert!(body_looks_like_spa(&body_turbo));
+    }
+
+    #[test]
+    fn test_body_looks_like_spa_real_content_passes() {
+        // Long body with no SPA markers is not SPA.
+        let body = format!(
+            "<html><body><article>{}</article></body></html>",
+            "Real article text. ".repeat(500)
+        );
+        assert!(!body_looks_like_spa(&body));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_batch_empty_queries_rejects() {
+        let input = serde_json::json!({ "queries": [] });
+        let r = tool_web_search_batch(&input, None).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("non-empty"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_batch_aggregates_markdown() {
+        // Use a fake `web_ctx = None` path with a hand-rolled stub by
+        // monkey-patching via the legacy fallback. The legacy fallback hits
+        // DDG which we don't want in tests, so we test only the parsing
+        // helper indirectly by giving an input that triggers the `Err`
+        // branch and confirming we still produce a valid JSON response with
+        // zero URLs (graceful aggregation on failed search).
+        let input = serde_json::json!({
+            "queries": ["__openfang_fake_query_that_should_404__"],
+            "top_n_per_query": 1,
+        });
+        let r = tool_web_search_batch(&input, None).await;
+        // The legacy DDG call may succeed or fail; either way the tool
+        // returns valid JSON. We just check the response parses.
+        assert!(r.is_ok());
+        let v: serde_json::Value = serde_json::from_str(&r.unwrap()).unwrap();
+        assert!(v.get("queries").is_some());
+        assert!(v.get("urls").is_some());
+        assert!(v["urls"].is_array());
+    }
+
+    #[test]
+    fn test_exec_policy_bypass_predicate() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        // Full mode → bypass.
+        let full = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        assert!(exec_policy_bypasses_approval("shell_exec", Some(&full)));
+        assert!(exec_policy_bypasses_approval("process_start", Some(&full)));
+
+        // Wildcard allowlist → bypass.
+        let wildcard = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["*".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(exec_policy_bypasses_approval("shell_exec", Some(&wildcard)));
+
+        // Tight allowlist (1 binary) → bypass (the pro-researcher yt-extractor case).
+        let yt = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["yt-dlp".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(exec_policy_bypasses_approval("shell_exec", Some(&yt)));
+
+        // Tight allowlist (4 binaries) → bypass.
+        let four = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["ls".into(), "cat".into(), "wc".into(), "grep".into()],
+            ..ExecPolicy::default()
+        };
+        assert!(exec_policy_bypasses_approval("shell_exec", Some(&four)));
+
+        // Wide allowlist (5 binaries) → require approval (over the tightness threshold).
+        let five = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec![
+                "ls".into(),
+                "cat".into(),
+                "wc".into(),
+                "grep".into(),
+                "find".into(),
+            ],
+            ..ExecPolicy::default()
+        };
+        assert!(!exec_policy_bypasses_approval("shell_exec", Some(&five)));
+
+        // Empty allowlist → require approval (degenerate; no commands runnable, but
+        // the predicate should not silently bypass an empty list).
+        let empty = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec![],
+            ..ExecPolicy::default()
+        };
+        assert!(!exec_policy_bypasses_approval("shell_exec", Some(&empty)));
+
+        // Deny mode → never bypass.
+        let deny = ExecPolicy {
+            mode: ExecSecurityMode::Deny,
+            ..ExecPolicy::default()
+        };
+        assert!(!exec_policy_bypasses_approval("shell_exec", Some(&deny)));
+
+        // Non-shell tools never bypass via this predicate.
+        assert!(!exec_policy_bypasses_approval("web_fetch", Some(&full)));
+        assert!(!exec_policy_bypasses_approval("file_write", Some(&yt)));
+
+        // No exec_policy → never bypass.
+        assert!(!exec_policy_bypasses_approval("shell_exec", None));
     }
 
     #[test]

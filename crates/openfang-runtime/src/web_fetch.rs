@@ -55,6 +55,9 @@ impl WebFetchEngine {
         // Step 1: SSRF protection — BEFORE any network I/O
         check_ssrf(url, &self.config.ssrf_allowed_hosts)?;
 
+        // Step 1b: Deny list — block hosts known to be SPA / login-walled / paywall
+        check_deny(url, &self.config.deny_domains)?;
+
         // Step 2: Cache lookup (only for GET)
         let cache_key = format!("fetch:{}:{}", method_upper, url);
         if method_upper == "GET" {
@@ -257,6 +260,43 @@ pub(crate) fn check_ssrf(url: &str, allowed_hosts: &[String]) -> Result<(), Stri
     Ok(())
 }
 
+/// Reject the fetch if the URL's host is in the configured deny list.
+///
+/// Entries can be exact hostnames (`"example.com"`) or wildcard subdomain
+/// patterns (`"*.shopify.com"`). Exact entries also match subdomains —
+/// `"example.com"` denies both `example.com` and `blog.example.com`.
+pub(crate) fn check_deny(url: &str, deny: &[String]) -> Result<(), String> {
+    if deny.is_empty() {
+        return Ok(());
+    }
+    let host = extract_host(url);
+    let hostname = if host.starts_with('[') {
+        host.find(']').map(|i| &host[..=i]).unwrap_or(&host)
+    } else {
+        host.split(':').next().unwrap_or(&host)
+    };
+    let hostname_lc = hostname.to_lowercase();
+    for entry in deny {
+        let entry_lc = entry.to_lowercase();
+        if let Some(suffix) = entry_lc.strip_prefix("*.") {
+            if hostname_lc == suffix
+                || hostname_lc.ends_with(&format!(".{suffix}"))
+            {
+                return Err(format!(
+                    "Fetch blocked: {hostname} matches deny entry '{entry}'"
+                ));
+            }
+        } else if hostname_lc == entry_lc
+            || hostname_lc.ends_with(&format!(".{entry_lc}"))
+        {
+            return Err(format!(
+                "Fetch blocked: {hostname} matches deny entry '{entry}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Returns true if an IP is a cloud metadata endpoint address.
 fn is_metadata_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -401,6 +441,40 @@ pub(crate) fn extract_host(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::str_utils::safe_truncate_str;
+
+    #[test]
+    fn test_deny_empty_passes() {
+        assert!(check_deny("https://example.com/foo", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_deny_exact_host() {
+        let deny = vec!["evil.com".to_string()];
+        assert!(check_deny("https://evil.com/x", &deny).is_err());
+        // Subdomains of an exact entry also matched (suffix rule)
+        assert!(check_deny("https://blog.evil.com/x", &deny).is_err());
+        // Unrelated host passes
+        assert!(check_deny("https://good.com/x", &deny).is_ok());
+        // Hostname containing the entry as a substring (not a domain suffix) passes
+        assert!(check_deny("https://notevil.com/x", &deny).is_ok());
+    }
+
+    #[test]
+    fn test_deny_wildcard_subdomain() {
+        let deny = vec!["*.shopify.com".to_string()];
+        assert!(check_deny("https://acme.shopify.com/x", &deny).is_err());
+        assert!(check_deny("https://shop.shopify.com/x", &deny).is_err());
+        // Bare apex matches too
+        assert!(check_deny("https://shopify.com/x", &deny).is_err());
+        // Unrelated host passes
+        assert!(check_deny("https://shopify.example.com/x", &deny).is_ok());
+    }
+
+    #[test]
+    fn test_deny_case_insensitive() {
+        let deny = vec!["Example.COM".to_string()];
+        assert!(check_deny("https://EXAMPLE.com/x", &deny).is_err());
+    }
 
     #[test]
     fn test_truncate_multibyte_no_panic() {

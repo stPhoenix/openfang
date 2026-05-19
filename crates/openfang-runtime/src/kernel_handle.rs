@@ -444,4 +444,25 @@ pub trait KernelHandle: Send + Sync {
         let _ = (template_name, instance_name);
         Err("Agent templates not available".to_string())
     }
+
+    /// Run a single one-shot LLM completion using the caller agent's resolved
+    /// model + provider + credentials. No tools, no streaming, no agent-loop
+    /// iteration. Returns the response text.
+    ///
+    /// Designed for tool implementations that need to distill or transform
+    /// content (e.g. `web_fetch_extract` does fetch + one-shot reduction).
+    /// Avoids spinning up a full subagent for tasks that don't need one.
+    ///
+    /// `max_tokens` caps the response size. Temperature defaults are model-
+    /// specific (the caller agent's manifest temperature is used).
+    async fn llm_oneshot(
+        &self,
+        caller_agent_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        let _ = (caller_agent_id, system_prompt, user_prompt, max_tokens);
+        Err("llm_oneshot not available".to_string())
+    }
 }

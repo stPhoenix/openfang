@@ -8675,6 +8675,18 @@ impl KernelHandle for ScopedKernelHandle {
             .spawn_agent_from_template(template_name, instance_name)
             .await
     }
+
+    async fn llm_oneshot(
+        &self,
+        caller_agent_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        self.inner
+            .llm_oneshot(caller_agent_id, system_prompt, user_prompt, max_tokens)
+            .await
+    }
 }
 
 /// Sanitize a human-readable string into a valid `CronJob.name`.
@@ -10215,6 +10227,37 @@ impl KernelHandle for OpenFangKernel {
             .spawn_agent_with_parent(manifest, None, None)
             .map_err(|e| format!("{e}"))?;
         Ok((agent_id.to_string(), agent_name))
+    }
+
+    async fn llm_oneshot(
+        &self,
+        caller_agent_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        let id: AgentId = self.resolve_agent_id(caller_agent_id)?;
+        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| format!("Agent not found: {caller_agent_id}"))?;
+        let driver = self
+            .resolve_driver(&entry.manifest)
+            .map_err(|e| format!("Failed to resolve LLM driver: {e}"))?;
+        let request = CompletionRequest {
+            model: entry.manifest.model.model.clone(),
+            messages: vec![openfang_types::message::Message::user(user_prompt)],
+            tools: vec![],
+            max_tokens,
+            temperature: entry.manifest.model.temperature,
+            system: Some(system_prompt.to_string()),
+            thinking: None,
+        };
+        let resp = driver
+            .complete(request)
+            .await
+            .map_err(|e| format!("LLM oneshot failed: {e}"))?;
+        Ok(resp.text())
     }
 }
 
