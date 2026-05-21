@@ -1,17 +1,12 @@
 //! Prompt construction for the execution analyzer LLM call.
 
+use openfang_types::config::EvolveConfig;
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::truncate_str;
 
 /// Maximum number of messages to include in the analysis prompt.
 /// If a session exceeds this, we keep the first 1/4 and last 3/4.
 const MAX_MESSAGES: usize = 100;
-
-/// Rough chars-per-token estimate (conservative — overestimates tokens slightly).
-const CHARS_PER_TOKEN: usize = 4;
-
-/// Tokens reserved for the system prompt (~1500 tokens) and model response headroom.
-const RESERVED_TOKENS: usize = 4000;
 
 /// Fallback context window when the model's actual limit is unknown.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 32_000;
@@ -116,14 +111,16 @@ impl FieldLimits {
 /// Build the user message containing the conversation transcript and skill list.
 ///
 /// `context_window` is the model's context window in tokens. The prompt is
-/// progressively truncated to fit within `(context_window - RESERVED_TOKENS)`.
+/// progressively truncated to fit within `(context_window - cfg.reserved_tokens)`,
+/// scaled by `cfg.chars_per_token` (4 by default).
 pub fn build_user_message(
     messages: &[Message],
     available_skills: &[String],
     context_window: usize,
+    cfg: &EvolveConfig,
 ) -> String {
-    let budget_tokens = context_window.saturating_sub(RESERVED_TOKENS);
-    let char_budget = budget_tokens * CHARS_PER_TOKEN;
+    let budget_tokens = context_window.saturating_sub(cfg.reserved_tokens);
+    let char_budget = budget_tokens * cfg.chars_per_token;
 
     // Phase 1: Try with default limits
     let result = build_with_limits(messages, available_skills, MAX_MESSAGES, &FieldLimits::default_limits());
@@ -617,7 +614,7 @@ mod tests {
     #[test]
     fn build_user_message_no_skills() {
         let msgs = vec![test_msg("Hello")];
-        let result = build_user_message(&msgs, &[], 200_000);
+        let result = build_user_message(&msgs, &[], 200_000, &EvolveConfig::default());
         assert!(result.contains("None"));
         assert!(result.contains("[USER]"));
         assert!(result.contains("Hello"));
@@ -627,7 +624,7 @@ mod tests {
     fn build_user_message_with_skills() {
         let msgs = vec![];
         let skills = vec!["docker".to_string(), "git-expert".to_string()];
-        let result = build_user_message(&msgs, &skills, 200_000);
+        let result = build_user_message(&msgs, &skills, 200_000, &EvolveConfig::default());
         assert!(result.contains("- docker"));
         assert!(result.contains("- git-expert"));
     }
@@ -653,8 +650,8 @@ mod tests {
         let msgs: Vec<Message> = (0..200)
             .map(|_| test_msg(&"x".repeat(100)))
             .collect();
-        let large = build_user_message(&msgs, &[], 200_000);
-        let small = build_user_message(&msgs, &[], 2_000);
+        let large = build_user_message(&msgs, &[], 200_000, &EvolveConfig::default());
+        let small = build_user_message(&msgs, &[], 2_000, &EvolveConfig::default());
         assert!(small.len() < large.len(), "small context should produce shorter prompt");
         // 2000 tokens - 4000 reserved = 0 (saturating), so it should hard-truncate
     }
@@ -665,9 +662,10 @@ mod tests {
             .map(|_| test_msg(&"word ".repeat(200)))
             .collect();
         let context_window = 8_000; // 8K tokens
-        let result = build_user_message(&msgs, &[], context_window);
-        let estimated_tokens = result.len() / CHARS_PER_TOKEN;
-        let budget = context_window.saturating_sub(RESERVED_TOKENS);
+        let cfg = EvolveConfig::default();
+        let result = build_user_message(&msgs, &[], context_window, &cfg);
+        let estimated_tokens = result.len() / cfg.chars_per_token;
+        let budget = context_window.saturating_sub(cfg.reserved_tokens);
         assert!(
             estimated_tokens <= budget,
             "prompt ({estimated_tokens} tokens) should fit within budget ({budget} tokens)"
@@ -802,8 +800,11 @@ mod tests {
             .map(|_| test_msg(&"°".repeat(200)))
             .collect();
         for context_window in [4006usize, 4008, 4010, 4015, 4020, 4030] {
-            let out = build_user_message(&msgs, &[], context_window);
-            assert!(out.contains("[TRUNCATED]") || out.len() <= context_window * CHARS_PER_TOKEN);
+            let out = build_user_message(&msgs, &[], context_window, &EvolveConfig::default());
+            assert!(
+                out.contains("[TRUNCATED]")
+                    || out.len() <= context_window * EvolveConfig::default().chars_per_token
+            );
         }
     }
 }

@@ -3,60 +3,60 @@
 //! Implements `ChannelBridgeHandle` on `OpenFangKernel` and provides the
 //! `start_channel_bridge()` entry point called by the daemon.
 
+// Wave 5
+use async_trait::async_trait;
+// Wave 3
+use openfang_channels::bluesky::BlueskyAdapter;
 use openfang_channels::bridge::{BridgeManager, ChannelBridgeHandle};
+use openfang_channels::dingtalk::DingTalkAdapter;
+use openfang_channels::dingtalk_stream::DingTalkStreamAdapter;
 use openfang_channels::discord::DiscordAdapter;
+use openfang_channels::discourse::DiscourseAdapter;
 use openfang_channels::email::EmailAdapter;
+use openfang_channels::feishu::FeishuAdapter;
+// Wave 4
+use openfang_channels::flock::FlockAdapter;
+use openfang_channels::gitter::GitterAdapter;
 use openfang_channels::google_chat::GoogleChatAdapter;
+use openfang_channels::gotify::GotifyAdapter;
+use openfang_channels::guilded::GuildedAdapter;
 use openfang_channels::irc::IrcAdapter;
+use openfang_channels::keybase::KeybaseAdapter;
+use openfang_channels::line::LineAdapter;
+use openfang_channels::linkedin::LinkedInAdapter;
+use openfang_channels::mastodon::MastodonAdapter;
 use openfang_channels::matrix::MatrixAdapter;
 use openfang_channels::mattermost::MattermostAdapter;
+use openfang_channels::messenger::MessengerAdapter;
+use openfang_channels::mqtt::MqttAdapter;
+use openfang_channels::mumble::MumbleAdapter;
+use openfang_channels::nextcloud::NextcloudAdapter;
+use openfang_channels::nostr::NostrAdapter;
+use openfang_channels::ntfy::NtfyAdapter;
+use openfang_channels::pumble::PumbleAdapter;
+use openfang_channels::reddit::RedditAdapter;
+use openfang_channels::revolt::RevoltAdapter;
 use openfang_channels::rocketchat::RocketChatAdapter;
 use openfang_channels::router::AgentRouter;
 use openfang_channels::signal::SignalAdapter;
 use openfang_channels::slack::SlackAdapter;
 use openfang_channels::teams::TeamsAdapter;
 use openfang_channels::telegram::TelegramAdapter;
+use openfang_channels::threema::ThreemaAdapter;
+use openfang_channels::twist::TwistAdapter;
 use openfang_channels::twitch::TwitchAdapter;
 use openfang_channels::types::ChannelAdapter;
+use openfang_channels::viber::ViberAdapter;
+use openfang_channels::webex::WebexAdapter;
+use openfang_channels::webhook::WebhookAdapter;
+use openfang_channels::wecom::WeComAdapter;
 use openfang_channels::whatsapp::WhatsAppAdapter;
 use openfang_channels::xmpp::XmppAdapter;
 use openfang_channels::zulip::ZulipAdapter;
-// Wave 3
-use openfang_channels::bluesky::BlueskyAdapter;
-use openfang_channels::feishu::FeishuAdapter;
-use openfang_channels::line::LineAdapter;
-use openfang_channels::mastodon::MastodonAdapter;
-use openfang_channels::messenger::MessengerAdapter;
-use openfang_channels::reddit::RedditAdapter;
-use openfang_channels::revolt::RevoltAdapter;
-use openfang_channels::viber::ViberAdapter;
-use openfang_types::config::FeishuMode;
-// Wave 4
-use openfang_channels::flock::FlockAdapter;
-use openfang_channels::guilded::GuildedAdapter;
-use openfang_channels::keybase::KeybaseAdapter;
-use openfang_channels::nextcloud::NextcloudAdapter;
-use openfang_channels::nostr::NostrAdapter;
-use openfang_channels::pumble::PumbleAdapter;
-use openfang_channels::threema::ThreemaAdapter;
-use openfang_channels::twist::TwistAdapter;
-use openfang_channels::webex::WebexAdapter;
-// Wave 5
-use async_trait::async_trait;
-use openfang_channels::dingtalk::DingTalkAdapter;
-use openfang_channels::dingtalk_stream::DingTalkStreamAdapter;
-use openfang_channels::discourse::DiscourseAdapter;
-use openfang_channels::gitter::GitterAdapter;
-use openfang_channels::gotify::GotifyAdapter;
-use openfang_channels::linkedin::LinkedInAdapter;
-use openfang_channels::mqtt::MqttAdapter;
-use openfang_channels::mumble::MumbleAdapter;
-use openfang_channels::ntfy::NtfyAdapter;
-use openfang_channels::webhook::WebhookAdapter;
-use openfang_channels::wecom::WeComAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_types::agent::AgentId;
+use openfang_types::config::FeishuMode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -610,6 +610,12 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             }
                             openfang_types::scheduler::CronAction::EvolveMetricCheck => {
                                 "Run skill metric check".to_string()
+                            }
+                            openfang_types::scheduler::CronAction::EvolveCanaryCheck => {
+                                "Run canary check".to_string()
+                            }
+                            openfang_types::scheduler::CronAction::EvolveGcStrandedSkills => {
+                                "Run stranded-skill GC".to_string()
                             }
                         };
                         match self.kernel.send_message(j.agent_id, &message).await {

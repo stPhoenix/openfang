@@ -44,8 +44,13 @@ pub async fn build_router(
     let channels_config = kernel.config.channels.clone();
     // Channels for the background evolve-execute worker. The worker owns the
     // receiver; handlers push contexts via the sender on AppState.
+    //
+    // Bounded at 64: the worker drains sequentially (one evolution at a time),
+    // so a deep queue mostly means the UI is faster than the LLM. 64 lets a
+    // typical "execute-all" batch from a single analysis fit; beyond that we
+    // surface HTTP 429 to the caller rather than silently piling up.
     let (evolve_exec_tx, evolve_exec_rx) =
-        tokio::sync::mpsc::unbounded_channel::<openfang_evolve::EvolutionContext>();
+        tokio::sync::mpsc::channel::<openfang_evolve::EvolutionContext>(64);
     let (evolve_exec_events_tx, _) =
         tokio::sync::broadcast::channel::<routes::EvolveExecuteEvent>(256);
     let evolve_execute_progress = Arc::new(tokio::sync::RwLock::new(
@@ -744,6 +749,10 @@ pub async fn build_router(
         .route(
             "/api/evolve/stats",
             axum::routing::get(routes::evolve_stats),
+        )
+        .route(
+            "/api/evolve/cost",
+            axum::routing::get(routes::evolve_cost),
         )
         .route(
             "/api/evolve/agent",

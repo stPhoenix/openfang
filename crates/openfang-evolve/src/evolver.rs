@@ -3,13 +3,14 @@
 use crate::patch::{self, PatchResult};
 use crate::prompt;
 use crate::types::*;
+use openfang_types::config::EvolveConfig;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-/// Maximum tool-calling rounds in the evolution agent loop.
+/// Default tool-calling rounds when no `EvolveConfig` is supplied (test fallback).
 pub const MAX_EVOLUTION_ITERATIONS: usize = 5;
 
-/// Maximum apply-retry attempts.
+/// Default apply-retry attempts when no `EvolveConfig` is supplied (test fallback).
 pub const MAX_EVOLUTION_ATTEMPTS: usize = 3;
 
 /// Sentinel indicating successful evolution.
@@ -86,8 +87,10 @@ pub fn parse_evolver_response(response: &str) -> Result<EvolverOutput, Option<St
 ///
 /// Sends the initial evolution prompt, then iterates checking for sentinels.
 /// On the final iteration, appends a nudge to force a decision.
+/// `cfg` provides `max_iterations`.
 pub async fn run_evolution<F, Fut>(
     context: &EvolutionContext,
+    cfg: &EvolveConfig,
     mut send_message: F,
 ) -> Result<EvolverOutput, EvolveError>
 where
@@ -101,8 +104,9 @@ where
     // LLMs often produce the content in one message and the sentinel in the next.
     let mut accumulated_content = String::new();
 
-    for iteration in 0..MAX_EVOLUTION_ITERATIONS {
-        let is_final = iteration == MAX_EVOLUTION_ITERATIONS - 1;
+    let max_iter = cfg.max_iterations.max(1);
+    for iteration in 0..max_iter {
+        let is_final = iteration == max_iter - 1;
 
         let prompt = if iteration == 0 {
             initial_prompt.clone()
@@ -175,9 +179,10 @@ where
 /// Apply evolution output to disk with retry on failure.
 ///
 /// Attempts to apply the patch, validates the result, and retries with
-/// LLM feedback if it fails (up to MAX_EVOLUTION_ATTEMPTS).
+/// LLM feedback if it fails (up to `cfg.max_attempts`).
 pub async fn apply_with_retry<F, Fut>(
     context: &EvolutionContext,
+    cfg: &EvolveConfig,
     initial_content: &str,
     skill_dir: &Path,
     mut send_message: F,
@@ -187,8 +192,9 @@ where
     Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
 {
     let mut current_content = initial_content.to_string();
+    let max_attempts = cfg.max_attempts.max(1);
 
-    for attempt in 1..=MAX_EVOLUTION_ATTEMPTS {
+    for attempt in 1..=max_attempts {
         debug!(attempt, "applying evolution output");
 
         let apply_result = match context.evolution_type {
@@ -212,10 +218,10 @@ where
             Ok(result) => {
                 // Validate the skill directory
                 if let Some(validation_error) = patch::validate_skill_dir(skill_dir) {
-                    if attempt == MAX_EVOLUTION_ATTEMPTS {
+                    if attempt == max_attempts {
                         cleanup_on_failure(skill_dir, context);
                         return Err(EvolveError::Other(format!(
-                            "validation failed after {MAX_EVOLUTION_ATTEMPTS} attempts: {validation_error}"
+                            "validation failed after {max_attempts} attempts: {validation_error}"
                         )));
                     }
 
@@ -232,10 +238,10 @@ where
                 return Ok(result);
             }
             Err(error) => {
-                if attempt == MAX_EVOLUTION_ATTEMPTS {
+                if attempt == max_attempts {
                     cleanup_on_failure(skill_dir, context);
                     return Err(EvolveError::Other(format!(
-                        "apply failed after {MAX_EVOLUTION_ATTEMPTS} attempts: {error}"
+                        "apply failed after {max_attempts} attempts: {error}"
                     )));
                 }
 
@@ -265,6 +271,7 @@ where
 /// Execute a full evolution: run the agent loop, then apply with retry.
 pub async fn evolve<F, Fut>(
     context: &EvolutionContext,
+    cfg: &EvolveConfig,
     skill_dir: &Path,
     mut send_message: F,
 ) -> Result<EvolutionResult, EvolveError>
@@ -273,10 +280,16 @@ where
     Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
 {
     // Phase 1: Run the evolution agent loop to get the changes
-    let output = run_evolution(context, &mut send_message).await?;
+    let output = run_evolution(context, cfg, &mut send_message).await?;
 
     // Phase 2: Apply the changes with retry
-    let patch_result = apply_with_retry(context, &output.raw_content, skill_dir, &mut send_message)
+    let patch_result = apply_with_retry(
+        context,
+        cfg,
+        &output.raw_content,
+        skill_dir,
+        &mut send_message,
+    )
         .await?;
 
     // Generate the skill ID for the result
@@ -517,6 +530,7 @@ mod tests {
                     change_summary: String::new(),
                     content_diff: String::new(),
                     content_snapshot: HashMap::new(),
+                    pre_fix_snapshot: HashMap::new(),
                     created_at: chrono::Utc::now(),
                     created_by: "human".into(),
                 },
@@ -528,6 +542,11 @@ mod tests {
                 total_fallbacks: 0,
                 first_seen: chrono::Utc::now(),
                 last_updated: chrono::Utc::now(),
+                is_canary: false,
+                canary_selections: 0,
+                canary_completions: 0,
+                parent_completion_rate_at_birth: 0.0,
+                canary_parent_skill_id: None,
             }],
             direction: String::new(),
             category: None,

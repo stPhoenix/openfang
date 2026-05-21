@@ -55,7 +55,7 @@ pub struct AppState {
     /// worker drains them sequentially. `None` if the worker has not been
     /// spawned (tests that build `AppState` directly).
     pub evolve_execute_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<openfang_evolve::EvolutionContext>>,
+        Option<tokio::sync::mpsc::Sender<openfang_evolve::EvolutionContext>>,
     /// Broadcast channel for SSE clients of `/api/evolve/execute/stream`.
     /// The worker publishes `EvolveExecuteEvent`s here.
     pub evolve_execute_events:
@@ -89,6 +89,9 @@ pub struct EvolveExecuteSnapshot {
     pub total: usize,
     pub succeeded: usize,
     pub failed: usize,
+    /// Items refused by the LLM confirmation gate or cost cap. Not a failure.
+    #[serde(default)]
+    pub declined: usize,
     pub queue: Vec<EvolveExecuteQueueItem>,
     pub last_status: Option<String>,
     pub last_change_summary: Option<String>,
@@ -106,7 +109,7 @@ pub struct EvolveExecuteQueueItem {
     pub kind: String,
     pub description: String,
     pub target_skill: Option<String>,
-    /// One of: queued | running | done | failed.
+    /// One of: queued | running | done | failed | declined.
     pub status: String,
     pub failure_reason: Option<String>,
     pub change_summary: Option<String>,
@@ -9943,6 +9946,8 @@ fn cron_job_to_schedule_view(
         CronAction::EvolveAnalyze => "evolve:analyze".to_string(),
         CronAction::EvolveToolDegradation => "evolve:tool_degradation".to_string(),
         CronAction::EvolveMetricCheck => "evolve:metric_check".to_string(),
+        CronAction::EvolveCanaryCheck => "evolve:canary_check".to_string(),
+        CronAction::EvolveGcStrandedSkills => "evolve:gc_stranded".to_string(),
     };
     let meta = kernel.cron_scheduler.get_meta(job.id);
     let last_status = meta.as_ref().and_then(|m| m.last_status.clone());
@@ -13409,14 +13414,28 @@ pub async fn evolve_set_config(
     match serde_json::from_value::<openfang_types::config::EvolveConfig>(body) {
         Ok(new_config) => {
             let old_config = state.kernel.evolve_engine.config();
-            let model_changed = old_config.provider != new_config.provider
-                || old_config.model != new_config.model;
+            let provider_changed = old_config.provider != new_config.provider;
+            let analyzer_model_changed = old_config.model != new_config.model;
+            // Evolver respawn triggers on: explicit evolver_model change, OR
+            // analyzer model change when evolver was inheriting it (None).
+            let old_effective_evolver = old_config
+                .evolver_model
+                .clone()
+                .unwrap_or_else(|| old_config.model.clone());
+            let new_effective_evolver = new_config
+                .evolver_model
+                .clone()
+                .unwrap_or_else(|| new_config.model.clone());
+            let evolver_changed = old_effective_evolver != new_effective_evolver;
             state.kernel.evolve_engine.update_config(new_config);
-            // Respawn analyzer agent if provider/model changed
-            if model_changed && state.kernel.evolve_engine.analyzer_agent_id().is_some() {
+            if (provider_changed || analyzer_model_changed)
+                && state.kernel.evolve_engine.analyzer_agent_id().is_some()
+            {
                 let _ = state.kernel.spawn_evolve_agent();
             }
-            if model_changed && state.kernel.evolve_engine.evolver_agent_id().is_some() {
+            if (provider_changed || evolver_changed)
+                && state.kernel.evolve_engine.evolver_agent_id().is_some()
+            {
                 let _ = state.kernel.spawn_evolver_agent();
             }
             (StatusCode::OK, Json(serde_json::json!({ "status": "updated" })))
@@ -13738,6 +13757,31 @@ pub async fn evolve_get_agent(
     Json(serde_json::json!({ "agent_id": agent_id.map(|id| id.to_string()) }))
 }
 
+/// GET /api/evolve/cost — Month-to-date USD spend on analyzer + evolver
+/// agents, plus the configured cap (if any).
+pub async fn evolve_cost(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let cfg = state.kernel.evolve_engine.config();
+    let this_month_usd = state.kernel.evolve_monthly_cost_usd();
+    let analyzer_id = state.kernel.evolve_engine.analyzer_agent_id();
+    let evolver_id = state.kernel.evolve_engine.evolver_agent_id();
+    let analyzer_cost = analyzer_id
+        .and_then(|id| state.kernel.memory.usage().query_monthly(id).ok())
+        .unwrap_or(0.0);
+    let evolver_cost = evolver_id
+        .and_then(|id| state.kernel.memory.usage().query_monthly(id).ok())
+        .unwrap_or(0.0);
+    Json(serde_json::json!({
+        "this_month_usd": this_month_usd,
+        "cap_usd": cfg.max_monthly_cost_usd,
+        "agents": {
+            "analyzer": { "id": analyzer_id.map(|id| id.to_string()), "month_usd": analyzer_cost },
+            "evolver": { "id": evolver_id.map(|id| id.to_string()), "month_usd": evolver_cost }
+        }
+    }))
+}
+
 /// GET /api/evolve/stats — Get aggregate evolution statistics.
 pub async fn evolve_stats(
     State(state): State<Arc<AppState>>,
@@ -13917,8 +13961,10 @@ pub async fn evolve_rollback_skill(
 pub async fn evolve_trigger_metrics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let cfg = state.kernel.evolve_engine.config();
     let candidates = openfang_evolve::triggers::check_metric_triggers(
         state.kernel.evolve_engine.store(),
+        &cfg,
     );
     (
         StatusCode::OK,
@@ -13995,9 +14041,16 @@ pub async fn evolve_execute(
                 "position": position,
             })),
         ),
-        Err(e) => (
+        Err(EnqueueError::QueueFull) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "evolve queue full",
+                "retry_after_seconds": 30,
+            })),
+        ),
+        Err(EnqueueError::Other(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": msg })),
         ),
     }
 }
@@ -14053,10 +14106,20 @@ pub async fn evolve_execute_all(
             .map(|s| s.name.clone());
         match enqueue_evolution(&state, context, target_label).await {
             Ok(_) => queued += 1,
-            Err(e) => {
+            Err(EnqueueError::QueueFull) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": "evolve queue full",
+                        "queued_so_far": queued,
+                        "retry_after_seconds": 30,
+                    })),
+                );
+            }
+            Err(EnqueueError::Other(msg)) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e })),
+                    Json(serde_json::json!({ "error": msg })),
                 );
             }
         }
@@ -14077,11 +14140,23 @@ async fn enqueue_evolution(
     state: &Arc<AppState>,
     context: openfang_evolve::EvolutionContext,
     target_label: Option<String>,
-) -> Result<usize, String> {
+) -> Result<usize, EnqueueError> {
     let tx = state
         .evolve_execute_tx
         .as_ref()
-        .ok_or_else(|| "evolve execute worker not initialized".to_string())?;
+        .ok_or_else(|| EnqueueError::Other("evolve execute worker not initialized".into()))?;
+
+    // Capacity check before mutating the snapshot — try_reserve gives us a
+    // bounded permit without committing to send if the queue is full.
+    let permit = match tx.clone().try_reserve_owned() {
+        Ok(p) => p,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return Err(EnqueueError::QueueFull);
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(EnqueueError::Other("worker channel closed".into()));
+        }
+    };
 
     let item = EvolveExecuteQueueItem {
         analysis_id: context.source_analysis.as_ref().map(|a| a.to_string()),
@@ -14098,7 +14173,6 @@ async fn enqueue_evolution(
 
     let position = {
         let mut snap = state.evolve_execute_progress.write().await;
-        // Reset stale state when starting a fresh batch.
         if !snap.running {
             *snap = EvolveExecuteSnapshot {
                 running: true,
@@ -14125,10 +14199,24 @@ async fn enqueue_evolution(
         });
     }
 
-    tx.send(context)
-        .map_err(|e| format!("worker channel closed: {e}"))?;
-
+    permit.send(context);
     Ok(position)
+}
+
+/// Error variants for `enqueue_evolution`. `QueueFull` maps to HTTP 429.
+#[derive(Debug)]
+enum EnqueueError {
+    QueueFull,
+    Other(String),
+}
+
+impl std::fmt::Display for EnqueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnqueueError::QueueFull => write!(f, "evolve queue full (capacity 64)"),
+            EnqueueError::Other(s) => write!(f, "{s}"),
+        }
+    }
 }
 
 /// GET /api/evolve/execute/status — Snapshot of the execute queue for reload
@@ -14201,7 +14289,7 @@ pub async fn evolve_execute_stream(
 /// event, and emits `Completed` once the queue drains.
 pub fn spawn_evolve_execute_worker(
     kernel: Arc<OpenFangKernel>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<openfang_evolve::EvolutionContext>,
+    mut rx: tokio::sync::mpsc::Receiver<openfang_evolve::EvolutionContext>,
     progress: Arc<tokio::sync::RwLock<EvolveExecuteSnapshot>>,
     events: tokio::sync::broadcast::Sender<EvolveExecuteEvent>,
 ) {
@@ -14252,9 +14340,14 @@ pub fn spawn_evolve_execute_worker(
                     None,
                     Some(result.change_summary),
                 ),
+                Err(e) if e.is_declined() => {
+                    let reason = format!("{e}");
+                    // Declined = LLM/cost-cap gate refused. Not a failure;
+                    // surface a distinct badge and do NOT call mark_suggestion_failed.
+                    ("declined".to_string(), Some(reason), None)
+                }
                 Err(e) => {
                     let reason = format!("{e}");
-                    // Persist failure so the row badge flips to "Failed".
                     if let Some(ref aid) = context.source_analysis {
                         if let Err(store_err) = kernel
                             .evolve_engine
@@ -14290,6 +14383,8 @@ pub fn spawn_evolve_execute_worker(
                     snap.queue[i].finished_at = Some(chrono::Utc::now());
                     if status == "done" {
                         snap.succeeded = snap.succeeded.saturating_add(1);
+                    } else if status == "declined" {
+                        snap.declined = snap.declined.saturating_add(1);
                     } else {
                         snap.failed = snap.failed.saturating_add(1);
                     }

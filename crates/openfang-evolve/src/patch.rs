@@ -334,70 +334,81 @@ fn extract_added_lines(hunk: &str) -> String {
         .join("\n")
 }
 
-/// Apply a unified-diff-style hunk to file content.
+/// Apply a unified-diff-style hunk to file content using `diffy`.
+///
+/// Surgical-fail: when the hunk's context doesn't match, `diffy::apply`
+/// returns an error. The caller (`evolver::apply_with_retry`) feeds the
+/// failure back into the LLM via `prompt::retry_prompt`, so an unmatched
+/// hunk produces a useful retry instead of a silently-misapplied file.
+///
+/// The LLM is instructed (see `prompt::evolver_system_prompt`) to use
+/// `@@ anchor_line` rather than proper `@@ -A,B +C,D @@` headers — we
+/// normalize that to a valid diffy hunk header before applying.
 fn apply_hunk_to_content(original: &str, hunk: &str) -> Result<String, String> {
-    let orig_lines: Vec<&str> = original.lines().collect();
-    let mut result_lines: Vec<String> = Vec::new();
-    let mut orig_idx = 0;
+    let normalized = normalize_hunk(hunk);
+    let patch_text = if normalized.trim_start().starts_with("--- ") {
+        normalized
+    } else {
+        format!("--- a\n+++ b\n{normalized}")
+    };
 
-    // Parse hunk lines
-    let hunk_lines: Vec<&str> = hunk.lines().collect();
-    let mut hunk_idx = 0;
+    let patch = diffy::Patch::from_str(&patch_text)
+        .map_err(|e| format!("invalid hunk: {e}"))?;
+    diffy::apply(original, &patch)
+        .map_err(|e| format!("hunk apply failed: {e}"))
+}
 
-    while hunk_idx < hunk_lines.len() {
-        let line = hunk_lines[hunk_idx];
+/// Replace any `@@ ... @@` (or `@@ anchor_line`) header in the hunk body
+/// with a synthesized `@@ -1,N +1,M @@` header where N counts context+del
+/// lines and M counts context+add lines. If no `@@` is present, prepend one.
+fn normalize_hunk(hunk: &str) -> String {
+    // Drop existing hunk headers
+    let body: Vec<&str> = hunk
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("@@"))
+        .collect();
 
-        // Skip @@ anchor lines
-        if line.starts_with("@@") {
-            // Find the anchor context in the original
-            if hunk_idx + 1 < hunk_lines.len() {
-                let next = hunk_lines[hunk_idx + 1];
-                let context = if let Some(c) = next.strip_prefix(' ') {
-                    c
-                } else {
-                    next
-                };
-                // Advance orig_idx to find matching context
-                while orig_idx < orig_lines.len() && orig_lines[orig_idx] != context {
-                    result_lines.push(orig_lines[orig_idx].to_string());
-                    orig_idx += 1;
+    let mut n_old = 0usize;
+    let mut n_new = 0usize;
+    for line in &body {
+        if let Some(c) = line.chars().next() {
+            match c {
+                ' ' => {
+                    n_old += 1;
+                    n_new += 1;
+                }
+                '-' => n_old += 1,
+                '+' => n_new += 1,
+                _ => {
+                    // Plain line (no prefix) — treat as context, same as old code.
+                    n_old += 1;
+                    n_new += 1;
                 }
             }
-            hunk_idx += 1;
+        }
+    }
+
+    let header = format!("@@ -1,{n_old} +1,{n_new} @@");
+    let mut out = String::with_capacity(hunk.len() + header.len() + 8);
+    out.push_str(&header);
+    out.push('\n');
+    // Normalize unprefixed lines to context lines (diffy requires one of ' '/-/+).
+    for line in body {
+        if line.is_empty() {
+            out.push(' ');
+            out.push('\n');
             continue;
         }
-
-        if let Some(context) = line.strip_prefix(' ') {
-            // Context line: copy from original
-            if orig_idx < orig_lines.len() && orig_lines[orig_idx] == context {
-                result_lines.push(context.to_string());
-                orig_idx += 1;
-            } else {
-                result_lines.push(context.to_string());
-            }
-        } else if line.starts_with('-') {
-            // Removed line: skip in original
-            orig_idx += 1;
-        } else if let Some(added) = line.strip_prefix('+') {
-            // Added line: insert
-            result_lines.push(added.to_string());
+        let first = line.chars().next().unwrap();
+        if first == ' ' || first == '-' || first == '+' || first == '\\' {
+            out.push_str(line);
         } else {
-            // Plain line (no prefix) — treat as context
-            if orig_idx < orig_lines.len() {
-                result_lines.push(orig_lines[orig_idx].to_string());
-                orig_idx += 1;
-            }
+            out.push(' ');
+            out.push_str(line);
         }
-        hunk_idx += 1;
+        out.push('\n');
     }
-
-    // Append remaining original lines
-    while orig_idx < orig_lines.len() {
-        result_lines.push(orig_lines[orig_idx].to_string());
-        orig_idx += 1;
-    }
-
-    Ok(result_lines.join("\n"))
+    out
 }
 
 /// Parse files from Format B (full content) output.
@@ -678,6 +689,55 @@ mod tests {
         assert!(!result.content_snapshot.is_empty());
         // .skill_id should not exist in derived copy
         assert!(!target_dir.join(".skill_id").exists());
+    }
+
+    #[test]
+    fn diffy_patch_simple_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("p");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: \"t\"\ndescription: \"d\"\n---\n\nline a\nline b\nline c\n",
+        )
+            .unwrap();
+
+        let patch_input = "*** Begin Patch\n\
+*** Update File: SKILL.md\n\
+@@ anchor\n\
+ line a\n\
+-line b\n\
++line BB\n\
+ line c\n\
+*** End Patch";
+        let result = apply_patch(&skill_dir, patch_input).unwrap();
+        let after = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(after.contains("line BB"), "patch should have replaced line b");
+        assert!(!after.contains("line b\n"), "old line should be gone");
+        assert!(!result.content_snapshot.is_empty());
+    }
+
+    #[test]
+    fn diffy_patch_context_mismatch_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("p");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: \"t\"\ndescription: \"d\"\n---\nactual content\n",
+        )
+            .unwrap();
+
+        // Context line that doesn't exist in original.
+        let bad = "*** Begin Patch\n\
+*** Update File: SKILL.md\n\
+@@\n\
+ nonexistent context\n\
+-line b\n\
++line BB\n\
+*** End Patch";
+        let result = apply_patch(&skill_dir, bad);
+        assert!(result.is_err(), "diffy should refuse to apply a mismatched hunk");
     }
 
     #[test]

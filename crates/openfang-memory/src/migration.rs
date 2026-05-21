@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -61,6 +61,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 13 {
         migrate_v13(conn)?;
+    }
+
+    if current_version < 14 {
+        migrate_v14(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -493,6 +497,39 @@ fn migrate_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description)
          VALUES (13, datetime('now'), 'Add failed_at and failure_reason to evolve_suggestions');",
+    )?;
+    Ok(())
+}
+
+/// Version 14: Add canary FIX-evolution columns to skill_records and
+/// parse-attempt tracking to sessions. Enables safe canary rollout of
+/// fixed skills + poison-session detection in analyzer.
+fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let canary_columns = [
+        ("is_canary", "INTEGER NOT NULL DEFAULT 0"),
+        ("canary_selections", "INTEGER NOT NULL DEFAULT 0"),
+        ("canary_completions", "INTEGER NOT NULL DEFAULT 0"),
+        ("parent_completion_rate_at_birth", "REAL NOT NULL DEFAULT 0.0"),
+        ("canary_parent_skill_id", "TEXT"),
+    ];
+    for (col, typ) in canary_columns {
+        if !column_exists(conn, "skill_records", col) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE skill_records ADD COLUMN {col} {typ};"
+            ))?;
+        }
+    }
+
+    if !column_exists(conn, "sessions", "evolve_parse_attempts") {
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN evolve_parse_attempts INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sr_canary ON skill_records(is_canary);
+         INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (14, datetime('now'), 'Add canary columns to skill_records and parse_attempts to sessions');",
     )?;
     Ok(())
 }

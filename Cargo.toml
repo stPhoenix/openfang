@@ -132,6 +132,12 @@ html-escape = "0.2"
 # Lightweight regex
 regex-lite = "0.1"
 
+# String similarity (Levenshtein, Jaro, etc.)
+strsim = "0.11"
+
+# Unified-diff patch application
+diffy = "0.4"
+
 # ML / NER inference (optional, behind `ner` feature)
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }

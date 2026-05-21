@@ -1629,8 +1629,89 @@ impl OpenFangKernel {
             }
         }
 
+        // Seed default evolve cron jobs on first boot when the engine is
+        // enabled. Skipped if any evolve-* job already exists (preserves
+        // user deletes across restarts).
+        if kernel.evolve_engine.is_enabled() {
+            if let Err(e) = kernel.seed_default_evolve_crons() {
+                warn!("failed to seed default evolve crons: {e}");
+            }
+        }
+
         info!("OpenFang kernel booted successfully");
         Ok(kernel)
+    }
+
+    /// Seed default cron jobs for the evolution subsystem.
+    ///
+    /// Idempotent: scans existing jobs for any `EvolveAnalyze` / `EvolveMetricCheck`
+    /// / `EvolveToolDegradation` / `EvolveCanaryCheck` / `EvolveGcStrandedSkills`
+    /// action and returns 0 if any are found. Otherwise inserts the five defaults
+    /// (every 4h analyze, daily metric/degradation/gc, hourly canary check).
+    pub fn seed_default_evolve_crons(&self) -> KernelResult<usize> {
+        use openfang_types::scheduler::{CronAction, CronDelivery, CronJob, CronJobId, CronSchedule};
+
+        // Skip if any evolve cron already exists (user may have deleted/customized).
+        let existing_evolve = self
+            .cron_scheduler
+            .list_all_jobs()
+            .into_iter()
+            .any(|j| {
+                matches!(
+                    j.action,
+                    CronAction::EvolveAnalyze
+                        | CronAction::EvolveMetricCheck
+                        | CronAction::EvolveToolDegradation
+                        | CronAction::EvolveCanaryCheck
+                        | CronAction::EvolveGcStrandedSkills
+                )
+            });
+        if existing_evolve {
+            return Ok(0);
+        }
+
+        // Seed under the analyzer's agent_id so the jobs appear grouped in the UI.
+        let owner = self
+            .evolve_engine
+            .analyzer_agent_id()
+            .unwrap_or_else(|| AgentId::from_string("evolution-analyzer"));
+
+        let defaults: &[(&str, &str, CronAction)] = &[
+            ("evolve: analyze sessions", "0 */4 * * *", CronAction::EvolveAnalyze),
+            ("evolve: metric check", "0 3 * * *", CronAction::EvolveMetricCheck),
+            ("evolve: tool degradation", "0 4 * * *", CronAction::EvolveToolDegradation),
+            ("evolve: canary check", "0 * * * *", CronAction::EvolveCanaryCheck),
+            ("evolve: gc stranded skills", "30 5 * * *", CronAction::EvolveGcStrandedSkills),
+        ];
+
+        let mut seeded = 0usize;
+        for (name, schedule_str, action) in defaults {
+            let job = CronJob {
+                id: CronJobId::new(),
+                agent_id: owner,
+                name: (*name).to_string(),
+                enabled: true,
+                schedule: CronSchedule::Cron {
+                    expr: schedule_str.to_string(),
+                    tz: None,
+                },
+                action: action.clone(),
+                delivery: CronDelivery::None,
+                delivery_targets: vec![],
+                created_at: chrono::Utc::now(),
+                last_run: None,
+                next_run: None,
+            };
+            match self.cron_scheduler.add_job(job, false) {
+                Ok(_) => seeded += 1,
+                Err(e) => warn!("failed to add default evolve cron '{name}': {e}"),
+            }
+        }
+        if seeded > 0 {
+            let _ = self.cron_scheduler.persist();
+            info!(count = seeded, "seeded default evolve cron jobs");
+        }
+        Ok(seeded)
     }
 
     /// Spawn a new agent from a manifest, optionally linking to a parent agent.
@@ -7294,8 +7375,16 @@ impl OpenFangKernel {
     }
 
     /// Build the agent manifest for the skill evolver (separate from analyzer).
+    ///
+    /// Uses `evolver_model` if configured, otherwise falls back to the
+    /// analyzer's `model`. Same provider/keys regardless — evolver_model
+    /// must be a model available under the configured provider.
     fn build_evolver_agent_manifest(&self) -> openfang_types::agent::AgentManifest {
         let config = self.evolve_engine.config();
+        let model = config
+            .evolver_model
+            .clone()
+            .unwrap_or_else(|| config.model.clone());
         openfang_types::agent::AgentManifest {
             name: "evolution-evolver".to_string(),
             version: "0.1.0".to_string(),
@@ -7304,7 +7393,7 @@ impl OpenFangKernel {
             module: "builtin:chat".to_string(),
             model: openfang_types::agent::ModelConfig {
                 provider: config.provider.clone(),
-                model: config.model.clone(),
+                model,
                 max_tokens: 16384,
                 temperature: 0.2,
                 system_prompt: openfang_evolve::prompt::evolver_system_prompt(),
@@ -7561,6 +7650,19 @@ impl OpenFangKernel {
             return Err(openfang_evolve::EvolveError::NotEnabled);
         }
 
+        // Cost-cap gate: skip when the combined analyzer+evolver monthly cost
+        // has breached the configured cap. Surfaces as `Declined`, not a
+        // failure, so cron/queue UIs distinguish it from real errors.
+        let cap_cfg = self.evolve_engine.config();
+        if let Some(cap) = cap_cfg.max_monthly_cost_usd {
+            let spent = self.evolve_monthly_cost_usd();
+            if spent >= cap {
+                return Err(openfang_evolve::EvolveError::Declined(format!(
+                    "monthly cost cap reached: ${spent:.4} >= ${cap:.4}"
+                )));
+            }
+        }
+
         // Serialize concurrent evolutions: one shared evolver agent means
         // overlapping `reset_session` + `send_message` loops would corrupt
         // each other's session. Holding this lock across the whole pipeline
@@ -7650,8 +7752,19 @@ impl OpenFangKernel {
             "executing skill evolution"
         );
 
+        // For FIX evolutions, snapshot the parent's pre-fix directory so the
+        // canary check can roll back to it if the new version regresses.
+        // Done before `evolve()` because FIX modifies in-place.
+        let pre_fix_snapshot: std::collections::HashMap<String, String> =
+            if matches!(context.evolution_type, SuggestionKind::Fix) && skill_dir.exists() {
+                snapshot_skill_dir(&skill_dir).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        let cfg_snap = self.evolve_engine.config();
         let result =
-            openfang_evolve::evolver::evolve(&context, &skill_dir, send_fn).await?;
+            openfang_evolve::evolver::evolve(&context, &cfg_snap, &skill_dir, send_fn).await?;
 
         // Stamp the skill manifest source as Evolution for DERIVED/CAPTURED so
         // the UI badges it correctly instead of inheriting a parent's source
@@ -7697,7 +7810,7 @@ impl OpenFangKernel {
             SuggestionKind::Captured => SkillOrigin::Captured,
         };
 
-        let config = self.evolve_engine.config();
+        let config = &cfg_snap;
         // Derive skill name: prefer parent skill name, then SKILL.md frontmatter, then skill ID prefix.
         let skill_name = context
             .target_skills
@@ -7750,6 +7863,7 @@ impl OpenFangKernel {
                 change_summary: result.change_summary.clone(),
                 content_diff: result.content_diff.clone(),
                 content_snapshot: result.content_snapshot.clone(),
+                pre_fix_snapshot: pre_fix_snapshot.clone(),
                 created_at: chrono::Utc::now(),
                 created_by: config.model.clone(),
             },
@@ -7769,6 +7883,25 @@ impl OpenFangKernel {
             total_fallbacks: 0,
             first_seen: chrono::Utc::now(),
             last_updated: chrono::Utc::now(),
+            // Canary fields populated below for FIX evolutions; defaults for derived/captured.
+            is_canary: matches!(context.evolution_type, SuggestionKind::Fix),
+            canary_selections: 0,
+            canary_completions: 0,
+            parent_completion_rate_at_birth: match context.evolution_type {
+                SuggestionKind::Fix => context
+                    .target_skills
+                    .first()
+                    .map(|s| s.completion_rate())
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            },
+            canary_parent_skill_id: match context.evolution_type {
+                SuggestionKind::Fix => context
+                    .target_skills
+                    .first()
+                    .map(|s| s.skill_id.clone()),
+                _ => None,
+            },
         };
 
         // Save the new evolved skill record.
@@ -7776,7 +7909,10 @@ impl OpenFangKernel {
             warn!(skill_id = %new_record.skill_id, error = %e, "failed to save evolved skill record");
         }
 
-        // Deactivate parent skill(s).
+        // Deactivate parent skill(s). For FIX evolutions, the new record is
+        // marked `is_canary=true` and the parent's pre-fix content is captured
+        // in `lineage.pre_fix_snapshot` so the canary check can roll back
+        // cleanly if the fix regresses (see evolve_canary_check).
         for parent_id in &parent_ids {
             if let Err(e) = self.evolve_engine.store().deactivate_skill(parent_id) {
                 warn!(parent_id = %parent_id, error = %e, "failed to deactivate parent skill");
@@ -7883,9 +8019,7 @@ impl OpenFangKernel {
                 reasoning = %reasoning,
                 "evolution declined by confirmation gate"
             );
-            return Err(openfang_evolve::EvolveError::Other(format!(
-                "evolution declined: {reasoning}",
-            )));
+            return Err(openfang_evolve::EvolveError::Declined(reasoning));
         }
 
         // Apply adjusted direction if the LLM refined it.
@@ -7894,6 +8028,170 @@ impl OpenFangKernel {
         }
 
         self.execute_evolution(context).await
+    }
+
+    /// Sum of the analyzer + evolver agents' month-to-date cost in USD.
+    /// Used by the cost-cap gate in `execute_evolution` and surfaced via
+    /// `/api/evolve/cost` for the dashboard.
+    pub fn evolve_monthly_cost_usd(&self) -> f64 {
+        let mut total = 0.0_f64;
+        if let Some(id) = self.evolve_engine.analyzer_agent_id() {
+            if let Ok(c) = self.memory.usage().query_monthly(id) {
+                total += c;
+            }
+        }
+        if let Some(id) = self.evolve_engine.evolver_agent_id() {
+            if let Ok(c) = self.memory.usage().query_monthly(id) {
+                total += c;
+            }
+        }
+        total
+    }
+
+    /// Promote ready canaries or roll back regressing ones.
+    ///
+    /// Returns `(promoted, rolled_back, pending)` counts.
+    /// A canary is **promoted** (loses canary flag, parent stays deactivated)
+    /// when its total_completions ≥ `cfg.canary_min_completions` AND its
+    /// completion_rate ≥ `parent_completion_rate_at_birth * cfg.canary_rate_floor`.
+    /// Otherwise it's **rolled back**: parent dir contents restored from
+    /// `lineage.pre_fix_snapshot`, parent reactivated, canary deactivated.
+    pub async fn evolve_canary_check(
+        &self,
+    ) -> Result<(u32, u32, u32), openfang_evolve::EvolveError> {
+        let cfg = self.evolve_engine.config();
+        let canaries = self
+            .evolve_engine
+            .store()
+            .list_active_canaries()
+            .unwrap_or_default();
+        let mut promoted = 0u32;
+        let mut rolled_back = 0u32;
+        let mut pending = 0u32;
+        for canary in canaries {
+            // Need enough samples to judge.
+            if canary.total_selections < cfg.canary_min_completions {
+                pending += 1;
+                continue;
+            }
+            let new_rate = canary.completion_rate();
+            let floor = canary.parent_completion_rate_at_birth * cfg.canary_rate_floor;
+            if new_rate >= floor {
+                // Promote: clear canary flag, parent already deactivated.
+                let parent_id = canary
+                    .canary_parent_skill_id
+                    .clone()
+                    .unwrap_or_default();
+                if let Err(e) = self
+                    .evolve_engine
+                    .store()
+                    .promote_canary(&canary.skill_id, &parent_id)
+                {
+                    warn!(skill_id = %canary.skill_id, error = %e, "promote_canary failed");
+                    continue;
+                }
+                info!(
+                    skill_id = %canary.skill_id,
+                    new_rate,
+                    floor,
+                    "canary promoted"
+                );
+                promoted += 1;
+            } else {
+                // Rollback: restore parent dir from pre_fix_snapshot.
+                let parent_dir = std::path::PathBuf::from(&canary.path);
+                if !canary.lineage.pre_fix_snapshot.is_empty() && parent_dir.exists() {
+                    if let Err(e) =
+                        restore_skill_dir(&parent_dir, &canary.lineage.pre_fix_snapshot)
+                    {
+                        warn!(error = %e, "failed to restore pre-fix snapshot during rollback");
+                    }
+                }
+                // Reactivate parent record + deactivate canary.
+                if let Some(ref parent_id) = canary.canary_parent_skill_id {
+                    if let Err(e) = self.evolve_engine.store().reactivate_skill(parent_id) {
+                        warn!(parent_id = %parent_id, error = %e, "reactivate parent failed");
+                    }
+                }
+                if let Err(e) = self
+                    .evolve_engine
+                    .store()
+                    .rollback_canary(&canary.skill_id)
+                {
+                    warn!(skill_id = %canary.skill_id, error = %e, "rollback_canary failed");
+                }
+                // Reload parent skill in the registry so agents see the restored content.
+                if let Ok(mut reg) = self.skill_registry.write() {
+                    let _ = reg.load_skill(&parent_dir);
+                }
+                warn!(
+                    skill_id = %canary.skill_id,
+                    new_rate,
+                    floor,
+                    "canary rolled back — regression detected"
+                );
+                rolled_back += 1;
+            }
+        }
+        Ok((promoted, rolled_back, pending))
+    }
+
+    /// Remove `captured-*` / `derived-*` skill directories not referenced by any
+    /// active or inactive record. Called by the `EvolveGcStrandedSkills` cron.
+    pub fn gc_stranded_skill_dirs(&self) -> usize {
+        let skills_dir = self.config.home_dir.join("skills");
+        if !skills_dir.exists() {
+            return 0;
+        }
+        let known_paths: std::collections::HashSet<std::path::PathBuf> = self
+            .evolve_engine
+            .store()
+            .list_skill_records(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                if openfang_evolve::is_bundled_path(&r.path) {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(&r.path))
+                }
+            })
+            .collect();
+
+        let entries = match std::fs::read_dir(&skills_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Only touch dirs whose names match the evolution-created patterns.
+            let matches_pattern = (name.starts_with("captured-") || name.starts_with("derived-"))
+                && name.len() >= "captured-12345678".len();
+            if !matches_pattern {
+                continue;
+            }
+            if known_paths.contains(&path) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(_) => {
+                    removed += 1;
+                    info!(path = %path.display(), "gc: removed stranded skill dir");
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "gc: failed to remove stranded dir");
+                }
+            }
+        }
+        removed
     }
 
     /// Execute a cron job on demand and deliver its result.
@@ -8089,24 +8387,33 @@ impl OpenFangKernel {
                     return Ok("evolve engine not enabled".into());
                 }
 
+                let cfg = self.evolve_engine.config();
                 let mut candidates = openfang_evolve::triggers::check_metric_triggers(
                     self.evolve_engine.store(),
+                    &cfg,
                 );
                 self.materialize_bundled_targets(&mut candidates);
 
                 let total = candidates.len();
                 let mut evolved = 0u32;
+                let mut declined = 0u32;
+                let mut failed = 0u32;
                 for ctx in candidates {
                     match self.execute_evolution_with_confirmation(ctx).await {
                         Ok(_) => evolved += 1,
+                        Err(e) if e.is_declined() => {
+                            declined += 1;
+                            info!("tool degradation evolution declined: {e}");
+                        }
                         Err(e) => {
-                            debug!("tool degradation evolution skipped/failed: {e}");
+                            failed += 1;
+                            warn!("tool degradation evolution failed: {e}");
                         }
                     }
                 }
 
                 let msg = format!(
-                    "tool degradation check: {total} candidates, {evolved} evolved"
+                    "tool degradation check: {total} candidates, {evolved} evolved, {declined} declined, {failed} failed"
                 );
                 self.cron_scheduler.record_success(job_id);
                 Ok(msg)
@@ -8117,23 +8424,64 @@ impl OpenFangKernel {
                     return Ok("evolve engine not enabled".into());
                 }
 
+                let cfg = self.evolve_engine.config();
                 let mut candidates = openfang_evolve::triggers::check_metric_triggers(
                     self.evolve_engine.store(),
+                    &cfg,
                 );
                 self.materialize_bundled_targets(&mut candidates);
 
                 let total = candidates.len();
                 let mut evolved = 0u32;
+                let mut declined = 0u32;
+                let mut failed = 0u32;
                 for ctx in candidates {
                     match self.execute_evolution_with_confirmation(ctx).await {
                         Ok(_) => evolved += 1,
+                        Err(e) if e.is_declined() => {
+                            declined += 1;
+                            info!("metric check evolution declined: {e}");
+                        }
                         Err(e) => {
-                            debug!("metric check evolution skipped/failed: {e}");
+                            failed += 1;
+                            warn!("metric check evolution failed: {e}");
                         }
                     }
                 }
 
-                let msg = format!("metric check: {total} candidates, {evolved} evolved");
+                let msg = format!(
+                    "metric check: {total} candidates, {evolved} evolved, {declined} declined, {failed} failed"
+                );
+                self.cron_scheduler.record_success(job_id);
+                Ok(msg)
+            }
+            CronAction::EvolveCanaryCheck => {
+                if !self.evolve_engine.is_enabled() {
+                    self.cron_scheduler.record_success(job_id);
+                    return Ok("evolve engine not enabled".into());
+                }
+                match self.evolve_canary_check().await {
+                    Ok((promoted, rolled_back, pending)) => {
+                        let msg = format!(
+                            "canary check: {promoted} promoted, {rolled_back} rolled back, {pending} pending"
+                        );
+                        self.cron_scheduler.record_success(job_id);
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let err_msg = format!("canary check failed: {e}");
+                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        Err(err_msg)
+                    }
+                }
+            }
+            CronAction::EvolveGcStrandedSkills => {
+                if !self.evolve_engine.is_enabled() {
+                    self.cron_scheduler.record_success(job_id);
+                    return Ok("evolve engine not enabled".into());
+                }
+                let removed = self.gc_stranded_skill_dirs();
+                let msg = format!("gc: removed {removed} stranded skill dirs");
                 self.cron_scheduler.record_success(job_id);
                 Ok(msg)
             }
@@ -8168,6 +8516,9 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
 /// Rewrite the manifest of an evolved skill so its provenance shows as
 /// `SkillSource::Evolution`. Single-parent DERIVED copies the parent dir
 /// wholesale, so the parent's `skill.toml` (with its own source field) was
+use crate::evolve::{restore_skill_dir, snapshot_skill_dir};
+
+
 /// carried over verbatim — without this stamp, the UI would badge a
 /// ClawHub-parented evolution as "ClawHub".
 fn stamp_evolution_source(

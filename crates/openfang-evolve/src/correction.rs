@@ -5,33 +5,13 @@ use crate::types::ExecutionAnalysis;
 /// Maximum edit distance for fuzzy skill ID correction.
 const MAX_EDIT_DISTANCE: usize = 3;
 
-/// Compute Levenshtein edit distance between two strings.
+/// Char-based Levenshtein distance. Multibyte-safe — uses `strsim::generic_levenshtein`
+/// over `Vec<char>` so non-ASCII names (e.g. "café") get correct distances rather
+/// than the byte-indexed answer the old homemade version produced.
 fn edit_distance(a: &str, b: &str) -> usize {
-    let a_len = a.len();
-    let b_len = b.len();
-
-    if a_len == 0 {
-        return b_len;
-    }
-    if b_len == 0 {
-        return a_len;
-    }
-
-    let mut prev: Vec<usize> = (0..=b_len).collect();
-    let mut curr = vec![0; b_len + 1];
-
-    for (i, ca) in a.chars().enumerate() {
-        curr[0] = i + 1;
-        for (j, cb) in b.chars().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = (prev[j] + cost)
-                .min(curr[j] + 1)
-                .min(prev[j + 1] + 1);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[b_len]
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    strsim::generic_levenshtein(&a_chars, &b_chars)
 }
 
 /// Extract the name prefix from a skill ID (everything before "__").
@@ -228,6 +208,17 @@ mod tests {
         assert_eq!(edit_distance("abc", "abd"), 1);
         assert_eq!(edit_distance("abc", ""), 3);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn edit_distance_multibyte_correct() {
+        // Old byte-based implementation would have returned distance >= 2
+        // because '\u{00e9}' (é) is 2 bytes in UTF-8 vs 'e' which is 1.
+        // strsim::generic_levenshtein over chars gives correct distance 1.
+        assert_eq!(edit_distance("café", "cafe"), 1);
+        assert_eq!(edit_distance("naïve", "naive"), 1);
+        // Two diffs across char boundaries.
+        assert_eq!(edit_distance("résumé", "resume"), 2);
     }
 
     #[test]

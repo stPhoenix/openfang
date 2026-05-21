@@ -18,11 +18,19 @@ impl EvolveStore {
         Self { conn }
     }
 
-    /// Save an execution analysis and all its child records.
+    /// Save an execution analysis and all its child records atomically.
+    ///
+    /// Wrapped in a single SQLite transaction — if any child insert fails,
+    /// the whole write rolls back so we never leave an orphan parent row
+    /// or a parent with partial children.
     pub fn save_analysis(&self, analysis: &ExecutionAnalysis) -> Result<(), EvolveError> {
-        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        let tx = conn.transaction()?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO execution_analyses (id, session_id, agent_id, task_completed, execution_note, model_used, input_tokens, output_tokens, analyzed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
@@ -40,9 +48,8 @@ impl EvolveStore {
 
         let analysis_id = analysis.id.to_string();
 
-        // Insert tool issues
         for issue in &analysis.tool_issues {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO evolve_tool_issues (analysis_id, tool_name, issue_type, description)
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![
@@ -54,9 +61,8 @@ impl EvolveStore {
             )?;
         }
 
-        // Insert skill judgments
         for judgment in &analysis.skill_judgments {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO evolve_skill_judgments (analysis_id, skill_name, applied, quality, note)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
@@ -69,9 +75,8 @@ impl EvolveStore {
             )?;
         }
 
-        // Insert evolution suggestions
         for suggestion in &analysis.evolution_suggestions {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO evolve_suggestions (analysis_id, kind, target_skill, description, priority)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
@@ -84,6 +89,7 @@ impl EvolveStore {
             )?;
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -351,8 +357,8 @@ impl EvolveStore {
     pub fn save_skill_record(&self, record: &SkillRecord) -> Result<(), EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         conn.execute(
-            "INSERT INTO skill_records (skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "INSERT INTO skill_records (skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(skill_id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
@@ -368,7 +374,12 @@ impl EvolveStore {
                 total_applied = excluded.total_applied,
                 total_completions = excluded.total_completions,
                 total_fallbacks = excluded.total_fallbacks,
-                last_updated = excluded.last_updated",
+                last_updated = excluded.last_updated,
+                is_canary = excluded.is_canary,
+                canary_selections = excluded.canary_selections,
+                canary_completions = excluded.canary_completions,
+                parent_completion_rate_at_birth = excluded.parent_completion_rate_at_birth,
+                canary_parent_skill_id = excluded.canary_parent_skill_id",
             rusqlite::params![
                 record.skill_id,
                 record.name,
@@ -388,6 +399,11 @@ impl EvolveStore {
                 record.total_fallbacks as i64,
                 record.first_seen.to_rfc3339(),
                 record.last_updated.to_rfc3339(),
+                record.is_canary as i32,
+                record.canary_selections as i64,
+                record.canary_completions as i64,
+                record.parent_completion_rate_at_birth,
+                record.canary_parent_skill_id,
             ],
         )?;
         Ok(())
@@ -397,7 +413,7 @@ impl EvolveStore {
     pub fn get_skill_record(&self, skill_id: &str) -> Result<Option<SkillRecord>, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
              FROM skill_records WHERE skill_id = ?1",
         )?;
         match stmt.query_row([skill_id], Self::row_to_skill_record) {
@@ -411,7 +427,7 @@ impl EvolveStore {
     pub fn get_skill_record_by_name(&self, name: &str) -> Result<Option<SkillRecord>, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
              FROM skill_records WHERE name = ?1 LIMIT 1",
         )?;
         match stmt.query_row([name], Self::row_to_skill_record) {
@@ -438,7 +454,9 @@ impl EvolveStore {
 
     /// Atomically increment skill counters by skill **name** (not ID).
     ///
-    /// This is used by the analyzer flow where judgments reference skills by name.
+    /// Only updates the active row for that name. Deactivated parents are
+    /// preserved as historical records — incrementing their counters would
+    /// pollute aggregate stats and corrupt completion-rate trend lines.
     pub fn update_skill_counters_by_name(
         &self,
         name: &str,
@@ -455,7 +473,7 @@ impl EvolveStore {
                 total_completions = total_completions + ?4,
                 total_fallbacks = total_fallbacks + ?5,
                 last_updated = ?6
-             WHERE name = ?1",
+             WHERE name = ?1 AND is_active = 1",
             rusqlite::params![
                 name,
                 selections as i64,
@@ -472,10 +490,10 @@ impl EvolveStore {
     pub fn list_skill_records(&self, active_only: bool) -> Result<Vec<SkillRecord>, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         let sql = if active_only {
-            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
              FROM skill_records WHERE is_active = 1 ORDER BY name"
         } else {
-            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
              FROM skill_records ORDER BY name"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -596,6 +614,115 @@ impl EvolveStore {
         Ok(())
     }
 
+    /// List all active canary records (skills under canary rollout).
+    pub fn list_active_canaries(&self) -> Result<Vec<SkillRecord>, EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
+             FROM skill_records WHERE is_canary = 1 AND is_active = 1 ORDER BY first_seen",
+        )?;
+        let rows = stmt
+            .query_map([], Self::row_to_skill_record)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return the active canary sibling for a given parent skill name (if any).
+    /// Used by the registry to decide whether to apply traffic splitting.
+    pub fn get_active_canary_for_parent_name(
+        &self,
+        parent_name: &str,
+    ) -> Result<Option<SkillRecord>, EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT skill_id, name, description, path, is_active, category, tags, visibility, creator_id, lineage, tool_dependencies, critical_tools, total_selections, total_applied, total_completions, total_fallbacks, first_seen, last_updated, is_canary, canary_selections, canary_completions, parent_completion_rate_at_birth, canary_parent_skill_id
+             FROM skill_records
+             WHERE is_canary = 1 AND is_active = 1 AND name = ?1
+             LIMIT 1",
+        )?;
+        match stmt.query_row([parent_name], Self::row_to_skill_record) {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Increment canary-only counters for a record by skill_id.
+    pub fn increment_canary_counters(
+        &self,
+        skill_id: &str,
+        selections: u64,
+        completions: u64,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE skill_records SET
+                canary_selections = canary_selections + ?2,
+                canary_completions = canary_completions + ?3,
+                last_updated = ?4
+             WHERE skill_id = ?1",
+            rusqlite::params![
+                skill_id,
+                selections as i64,
+                completions as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Promote a canary: clear canary flag on child, deactivate the parent.
+    /// Done in a single transaction.
+    pub fn promote_canary(
+        &self,
+        canary_skill_id: &str,
+        parent_skill_id: &str,
+    ) -> Result<(), EvolveError> {
+        let mut conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE skill_records SET is_canary = 0, canary_parent_skill_id = NULL, last_updated = ?2
+             WHERE skill_id = ?1",
+            rusqlite::params![canary_skill_id, now],
+        )?;
+        tx.execute(
+            "UPDATE skill_records SET is_active = 0, last_updated = ?2 WHERE skill_id = ?1",
+            rusqlite::params![parent_skill_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Roll back a canary: deactivate the canary, parent stays active.
+    pub fn rollback_canary(&self, canary_skill_id: &str) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE skill_records SET is_active = 0, last_updated = ?2 WHERE skill_id = ?1",
+            rusqlite::params![canary_skill_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Increment the analyzer parse-attempt counter for a session.
+    /// Returns the new attempt count.
+    pub fn bump_session_parse_attempts(&self, session_id: &str) -> Result<u32, EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE sessions SET evolve_parse_attempts = evolve_parse_attempts + 1 WHERE id = ?1",
+            [session_id],
+        )?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT evolve_parse_attempts FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count as u32)
+    }
+
     // -- Private helpers --
 
     fn row_to_skill_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRecord> {
@@ -628,6 +755,7 @@ impl EvolveStore {
                 change_summary: String::new(),
                 content_diff: String::new(),
                 content_snapshot: std::collections::HashMap::new(),
+                pre_fix_snapshot: std::collections::HashMap::new(),
                 created_at: chrono::Utc::now(),
                 created_by: "unknown".into(),
             }),
@@ -643,6 +771,11 @@ impl EvolveStore {
             last_updated: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(17)?)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
+            is_canary: row.get::<_, i32>(18).unwrap_or(0) != 0,
+            canary_selections: row.get::<_, i64>(19).unwrap_or(0) as u64,
+            canary_completions: row.get::<_, i64>(20).unwrap_or(0) as u64,
+            parent_completion_rate_at_birth: row.get::<_, f64>(21).unwrap_or(0.0),
+            canary_parent_skill_id: row.get::<_, Option<String>>(22).unwrap_or(None),
         })
     }
 
@@ -773,7 +906,8 @@ mod tests {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 label TEXT,
-                evolution_analyzed INTEGER NOT NULL DEFAULT 0
+                evolution_analyzed INTEGER NOT NULL DEFAULT 0,
+                evolve_parse_attempts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS execution_analyses (
@@ -836,7 +970,12 @@ mod tests {
                 total_completions INTEGER DEFAULT 0,
                 total_fallbacks INTEGER DEFAULT 0,
                 first_seen TEXT,
-                last_updated TEXT
+                last_updated TEXT,
+                is_canary INTEGER NOT NULL DEFAULT 0,
+                canary_selections INTEGER NOT NULL DEFAULT 0,
+                canary_completions INTEGER NOT NULL DEFAULT 0,
+                parent_completion_rate_at_birth REAL NOT NULL DEFAULT 0.0,
+                canary_parent_skill_id TEXT
             );
 
             ",
@@ -1097,6 +1236,7 @@ mod tests {
                 change_summary: "Initial import".into(),
                 content_diff: String::new(),
                 content_snapshot: std::collections::HashMap::new(),
+                pre_fix_snapshot: std::collections::HashMap::new(),
                 created_at: Utc::now(),
                 created_by: "human".into(),
             },
@@ -1108,6 +1248,11 @@ mod tests {
             total_fallbacks: 1,
             first_seen: Utc::now(),
             last_updated: Utc::now(),
+            is_canary: false,
+            canary_selections: 0,
+            canary_completions: 0,
+            parent_completion_rate_at_birth: 0.0,
+            canary_parent_skill_id: None,
         }
     }
 

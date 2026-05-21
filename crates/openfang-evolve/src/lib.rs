@@ -222,7 +222,7 @@ impl EvolveEngine {
         }
 
         let user_content =
-            prompt::build_user_message(messages, available_skills, context_window);
+            prompt::build_user_message(messages, available_skills, context_window, &config);
         debug!(session_id, "sending analysis request to analyzer agent");
 
         let (response_text, input_tokens, output_tokens) = send_message(user_content)
@@ -340,7 +340,7 @@ impl EvolveEngine {
                 }
 
                 let user_content =
-                    prompt::build_user_message(&messages, available_skills, context_window);
+                    prompt::build_user_message(&messages, available_skills, context_window, &config);
                 debug!(session_id, "sending analysis request to analyzer agent");
 
                 match send_message(user_content).await {
@@ -498,6 +498,7 @@ impl EvolveEngine {
                     change_summary: "Imported from skill registry".into(),
                     content_diff: String::new(),
                     content_snapshot: std::collections::HashMap::new(),
+                    pre_fix_snapshot: std::collections::HashMap::new(),
                     created_at: now,
                     created_by: "system".into(),
                 },
@@ -509,6 +510,11 @@ impl EvolveEngine {
                 total_fallbacks: 0,
                 first_seen: now,
                 last_updated: now,
+                is_canary: false,
+                canary_selections: 0,
+                canary_completions: 0,
+                parent_completion_rate_at_birth: 0.0,
+                canary_parent_skill_id: None,
             };
 
             if let Err(e) = self.store.save_skill_record(&record) {

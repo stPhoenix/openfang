@@ -1373,6 +1373,11 @@ pub struct EvolveConfig {
     pub provider: String,
     /// Model to use for analysis.
     pub model: String,
+    /// Optional separate model for the skill evolver. Falls back to `model` if `None`.
+    /// Recommended: stronger model than analyzer (e.g. sonnet) because evolver
+    /// authors skill text — quality matters more than speed/cost there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evolver_model: Option<String>,
     /// Optional API key override (falls back to provider's default env var).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -1381,6 +1386,45 @@ pub struct EvolveConfig {
     pub base_url: Option<String>,
     /// Max sessions to analyze in a single batch run.
     pub batch_size: usize,
+    /// Monthly USD cost cap for analyzer + evolver combined. None = no cap.
+    /// When breached, analyze/evolve calls return `EvolveError::Declined`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_monthly_cost_usd: Option<f64>,
+
+    // --- Metric-trigger thresholds (see openfang_evolve::triggers) ---
+    /// Fallback rate above this triggers FIX candidate (skill selected but ignored).
+    pub fallback_threshold: f64,
+    /// Completion rate below this (with high applied) triggers FIX.
+    pub low_completion_threshold: f64,
+    /// Applied rate above this (with low completion) triggers FIX.
+    pub high_applied_for_fix: f64,
+    /// Effective rate below this triggers DERIVED candidate.
+    pub moderate_effective_threshold: f64,
+    /// Minimum applied rate to consider for DERIVED.
+    pub min_applied_for_derived: f64,
+    /// Minimum total_selections before a skill is eligible for metric checks.
+    pub min_selections: u64,
+
+    // --- Prompt token budgeting (see openfang_evolve::prompt) ---
+    /// Rough chars-per-token estimate for the analyzer's prompt budget.
+    pub chars_per_token: usize,
+    /// Tokens reserved for system prompt and model response headroom.
+    pub reserved_tokens: usize,
+
+    // --- Evolver loop limits (see openfang_evolve::evolver) ---
+    /// Maximum tool-calling rounds in the evolution agent loop.
+    pub max_iterations: usize,
+    /// Maximum apply-retry attempts.
+    pub max_attempts: usize,
+
+    // --- Canary rollout for FIX evolutions (see Fix 13) ---
+    /// Fraction of skill selections routed to canary vs parent (0.0..=1.0).
+    pub canary_traffic_split: f64,
+    /// Minimum canary selections required before promote/rollback decision.
+    pub canary_min_completions: u64,
+    /// Canary completion rate must be ≥ `parent_birth_rate * canary_rate_floor`
+    /// to be promoted. Below = automatic rollback.
+    pub canary_rate_floor: f64,
 }
 
 impl Default for EvolveConfig {
@@ -1389,9 +1433,24 @@ impl Default for EvolveConfig {
             enabled: false,
             provider: "anthropic".to_string(),
             model: "claude-haiku-4-5-20251001".to_string(),
+            evolver_model: None,
             api_key: None,
             base_url: None,
             batch_size: 20,
+            max_monthly_cost_usd: None,
+            fallback_threshold: 0.4,
+            low_completion_threshold: 0.35,
+            high_applied_for_fix: 0.4,
+            moderate_effective_threshold: 0.55,
+            min_applied_for_derived: 0.25,
+            min_selections: 5,
+            chars_per_token: 4,
+            reserved_tokens: 4_000,
+            max_iterations: 5,
+            max_attempts: 3,
+            canary_traffic_split: 0.25,
+            canary_min_completions: 10,
+            canary_rate_floor: 0.7,
         }
     }
 }

@@ -137,6 +137,10 @@ pub enum CronAction {
     EvolveToolDegradation,
     /// Run periodic skill health metric checks and trigger evolution.
     EvolveMetricCheck,
+    /// Promote ready canaries or roll back regressing ones (FIX-evolution canary lifecycle).
+    EvolveCanaryCheck,
+    /// Remove orphaned `captured-*` / `derived-*` skill directories not referenced by any record.
+    EvolveGcStrandedSkills,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +399,9 @@ impl CronJob {
             }
             CronAction::EvolveAnalyze
             | CronAction::EvolveToolDegradation
-            | CronAction::EvolveMetricCheck => { /* no fields to validate */ }
+            | CronAction::EvolveMetricCheck
+            | CronAction::EvolveCanaryCheck
+            | CronAction::EvolveGcStrandedSkills => { /* no fields to validate */ }
         }
         Ok(())
     }

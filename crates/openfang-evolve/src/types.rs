@@ -371,6 +371,12 @@ pub struct SkillLineage {
     pub content_diff: String,
     /// Full snapshot of the skill directory: {relative_path: file_content}.
     pub content_snapshot: HashMap<String, String>,
+    /// For FIX evolutions: snapshot of the parent's directory BEFORE the fix
+    /// was applied. Lets `evolve_canary_check` roll back cleanly if the canary
+    /// underperforms. Empty for non-FIX origins. Stored alongside the new
+    /// content so a single record carries both versions for the canary window.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pre_fix_snapshot: HashMap<String, String>,
     /// When this version was created.
     pub created_at: DateTime<Utc>,
     /// "human" or LLM model identifier.
@@ -435,6 +441,27 @@ pub struct SkillRecord {
     pub first_seen: DateTime<Utc>,
     /// Last modification timestamp.
     pub last_updated: DateTime<Utc>,
+
+    // --- Canary rollout (FIX evolution promotion gate) ---
+    /// True while this record is a canary of `canary_parent_skill_id`.
+    /// Parent stays active alongside; traffic split governed by
+    /// `EvolveConfig.canary_traffic_split` in the registry layer.
+    #[serde(default)]
+    pub is_canary: bool,
+    /// Selections routed to this skill *while it was a canary*. Reset on
+    /// promote (and the record drops `is_canary`).
+    #[serde(default)]
+    pub canary_selections: u64,
+    /// Task completions on this canary while it was a canary.
+    #[serde(default)]
+    pub canary_completions: u64,
+    /// Snapshot of parent's `completion_rate()` at the moment the canary
+    /// was created. Promotion gate compares canary's rate to this.
+    #[serde(default)]
+    pub parent_completion_rate_at_birth: f64,
+    /// Set on canary records — the parent skill they're testing against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_parent_skill_id: Option<String>,
 }
 
 impl SkillRecord {
@@ -468,6 +495,14 @@ impl SkillRecord {
             return 0.0;
         }
         self.total_fallbacks as f64 / self.total_selections as f64
+    }
+
+    /// Canary-only completion rate (only meaningful when `is_canary == true`).
+    pub fn canary_completion_rate(&self) -> f64 {
+        if self.canary_selections == 0 {
+            return 0.0;
+        }
+        self.canary_completions as f64 / self.canary_selections as f64
     }
 }
 
@@ -553,8 +588,21 @@ pub enum EvolveError {
     SessionNotFound(String),
     #[error("analysis already exists for session: {0}")]
     AlreadyAnalyzed(String),
+    /// Evolution was deliberately skipped (LLM confirmation gate said no,
+    /// cost cap reached, etc.). Callers should treat this as an expected,
+    /// non-error outcome — distinct from `Other` which signals a real failure.
+    #[error("evolution declined: {0}")]
+    Declined(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl EvolveError {
+    /// True when the error is a deliberate skip (declined / cost cap),
+    /// not an actual failure.
+    pub fn is_declined(&self) -> bool {
+        matches!(self, EvolveError::Declined(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +689,7 @@ mod tests {
                 change_summary: String::new(),
                 content_diff: String::new(),
                 content_snapshot: HashMap::new(),
+                pre_fix_snapshot: HashMap::new(),
                 created_at: Utc::now(),
                 created_by: "human".into(),
             },
@@ -652,6 +701,11 @@ mod tests {
             total_fallbacks: 1,
             first_seen: Utc::now(),
             last_updated: Utc::now(),
+            is_canary: false,
+            canary_selections: 0,
+            canary_completions: 0,
+            parent_completion_rate_at_birth: 0.0,
+            canary_parent_skill_id: None,
         };
 
         assert!((rec.applied_rate() - 0.8).abs() < f64::EPSILON);
@@ -676,6 +730,7 @@ mod tests {
             change_summary: "Merged two skills".into(),
             content_diff: String::new(),
             content_snapshot: HashMap::from([("SKILL.md".into(), "# Test".into())]),
+            pre_fix_snapshot: HashMap::new(),
             created_at: Utc::now(),
             created_by: "claude-haiku".into(),
         };

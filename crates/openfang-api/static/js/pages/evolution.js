@@ -19,11 +19,22 @@ function evolutionPage() {
     _pollHandle: null,
 
     // ── Evolve-execute queue ──
-    executeProgress: { running: false, current: 0, total: 0, succeeded: 0, failed: 0, queue: [], lastStatus: null, lastChangeSummary: null },
+      executeProgress: {
+          running: false,
+          current: 0,
+          total: 0,
+          succeeded: 0,
+          failed: 0,
+          declined: 0,
+          queue: [],
+          lastStatus: null,
+          lastChangeSummary: null
+      },
     _executeSource: null,
     _executePollHandle: null,
     saving: false,
     showConfig: false,
+      showAdvanced: false,
     selectedAnalysis: null,
     lastRunResult: null,
     analyzerAgentId: null,
@@ -57,10 +68,11 @@ function evolutionPage() {
     // Lifecycle
     // ════════════════════════════════════════
     async loadData() {
+        this._tearDown();
       this.loading = true;
       this.loadError = '';
       try {
-        await Promise.all([this.loadConfig(), this.loadStats(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus(), this.loadExecuteStatus()]);
+          await Promise.all([this.loadConfig(), this.loadStats(), this.loadCost(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus(), this.loadExecuteStatus()]);
         this.buildSkillClasses();
       } catch (e) {
         this.loadError = e.message || 'Failed to load evolution data.';
@@ -68,7 +80,47 @@ function evolutionPage() {
       this.loading = false;
     },
 
-    // ════════════════════════════════════════
+      // Close any open EventSources and timers — call from loadData() and from
+      // an unmount hook to prevent stacked SSE connections on remount.
+      _tearDown() {
+          if (this._evolveSource) {
+              try {
+                  this._evolveSource.close();
+              } catch (_) {
+              }
+              this._evolveSource = null;
+          }
+          if (this._executeSource) {
+              try {
+                  this._executeSource.close();
+              } catch (_) {
+              }
+              this._executeSource = null;
+          }
+          if (this._pollHandle) {
+              clearInterval(this._pollHandle);
+              this._pollHandle = null;
+          }
+          if (this._executePollHandle) {
+              clearInterval(this._executePollHandle);
+              this._executePollHandle = null;
+          }
+      },
+
+      destroy() {
+          this._tearDown();
+      },
+
+      cost: {this_month_usd: 0, cap_usd: null, agents: {}},
+      async loadCost() {
+          try {
+              var data = await OpenFangAPI.get('/api/evolve/cost');
+              if (data) this.cost = data;
+          } catch (_) { /* ignore */
+          }
+      },
+
+      // ════════════════════════════════════════
     // API loaders (unchanged)
     // ════════════════════════════════════════
     async loadConfig() {
@@ -78,11 +130,19 @@ function evolutionPage() {
     async saveConfig() {
       this.saving = true;
       try {
-        var body = { enabled: this.config.enabled, provider: this.config.provider, model: this.config.model, batch_size: parseInt(this.config.batch_size) || 20 };
-        if (this.config.api_key) body.api_key = this.config.api_key;
-        if (this.config.base_url) body.base_url = this.config.base_url;
+          // Send the full config so server-side defaults aren't reset on PUT.
+          var body = Object.assign({}, this.config);
+          body.enabled = !!this.config.enabled;
+          body.batch_size = parseInt(this.config.batch_size) || 20;
+          if (!body.api_key) delete body.api_key;
+          if (!body.base_url) delete body.base_url;
+          if (!body.evolver_model) delete body.evolver_model;
+          if (body.max_monthly_cost_usd === '' || body.max_monthly_cost_usd === null) {
+              delete body.max_monthly_cost_usd;
+          }
         await OpenFangAPI.put('/api/evolve/config', body);
         OpenFangToast.success('Configuration saved');
+          await this.loadCost();
       } catch (e) { OpenFangToast.error('Failed to save: ' + (e.message || e)); }
       this.saving = false;
     },
@@ -154,6 +214,7 @@ function evolutionPage() {
       this.executeProgress.total = s.total || 0;
       this.executeProgress.succeeded = s.succeeded || 0;
       this.executeProgress.failed = s.failed || 0;
+        this.executeProgress.declined = s.declined || 0;
       this.executeProgress.queue = Array.isArray(s.queue) ? s.queue : [];
       this.executeProgress.lastStatus = s.last_status || null;
       this.executeProgress.lastChangeSummary = s.last_change_summary || null;
@@ -200,16 +261,19 @@ function evolutionPage() {
             self.executeProgress.current = Math.max(self.executeProgress.current, (ev.index || 0) + 1);
             self.executeProgress.running = true;
           }
-          if (ev.status === 'done' || ev.status === 'failed') {
+            if (ev.status === 'done' || ev.status === 'failed' || ev.status === 'declined') {
             // Refresh row badges (executed_at / failed_at) from the DB.
+                // Declined doesn't update DB but UI shows the badge inline.
             self.loadAnalyses().catch(function() {});
           }
         } else if (ev.type === 'completed') {
           self.executeProgress.running = false;
           self.executeProgress.succeeded = ev.succeeded || 0;
           self.executeProgress.failed = ev.failed || 0;
+            self.executeProgress.declined = ev.declined || 0;
           var msg = 'Evolved ' + self.executeProgress.succeeded + '/' + self.executeProgress.total;
           if (self.executeProgress.failed > 0) msg += ' (' + self.executeProgress.failed + ' failed)';
+            if (self.executeProgress.declined > 0) msg += ' (' + self.executeProgress.declined + ' declined)';
           OpenFangToast.success(msg);
           try { self._executeSource.close(); } catch (_) {}
           self._executeSource = null;
@@ -498,7 +562,13 @@ function evolutionPage() {
         this._startExecutePolling();
       } catch (e) {
         suggestion._executing = false;
-        OpenFangToast.error('Evolution failed to queue: ' + (e.message || e));
+          var msg = e && e.message ? e.message : String(e);
+          // OpenFangAPI surfaces HTTP status; detect 429 via the error string.
+          if (/429|queue full|too many/i.test(msg)) {
+              OpenFangToast.error('Evolve queue full — retry in ~30s.');
+          } else {
+              OpenFangToast.error('Evolution failed to queue: ' + msg);
+          }
       }
     },
 

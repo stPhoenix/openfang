@@ -3,32 +3,14 @@
 //! Two independent triggers feed into the SkillEvolver pipeline:
 //! 1. Post-Analysis (synchronous) — after analysis produces suggestions
 //! 2. Metric Monitor (background) — periodic skill health checks
+//!
+//! Thresholds live on [`openfang_types::config::EvolveConfig`] so operators
+//! tune them from `~/.openfang/config.toml` without rebuilding.
 
 use crate::store::EvolveStore;
 use crate::types::*;
+use openfang_types::config::EvolveConfig;
 use tracing::debug;
-
-// ---------------------------------------------------------------------------
-// Metric Monitor Thresholds (intentionally relaxed — LLM filters false positives)
-// ---------------------------------------------------------------------------
-
-/// Fallback rate above this triggers FIX candidate.
-pub const FALLBACK_THRESHOLD: f64 = 0.4;
-
-/// Completion rate below this (with high applied) triggers FIX candidate.
-pub const LOW_COMPLETION_THRESHOLD: f64 = 0.35;
-
-/// Applied rate above this (with low completion) triggers FIX.
-pub const HIGH_APPLIED_FOR_FIX: f64 = 0.4;
-
-/// Effective rate below this triggers DERIVED candidate.
-pub const MODERATE_EFFECTIVE_THRESHOLD: f64 = 0.55;
-
-/// Minimum applied rate to consider for DERIVED.
-pub const MIN_APPLIED_FOR_DERIVED: f64 = 0.25;
-
-/// Minimum total_selections before a skill is eligible for metric checks.
-pub const MIN_SELECTIONS: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Trigger 1: Post-Analysis (Synchronous)
@@ -78,8 +60,11 @@ pub fn build_contexts_from_analysis(
 /// Diagnose a skill's health based on cumulative metrics.
 ///
 /// Returns `(proposed_type, proposed_direction)` or `None` if healthy.
-pub fn diagnose_skill_health(record: &SkillRecord) -> Option<(SuggestionKind, String)> {
-    if record.total_selections < MIN_SELECTIONS {
+pub fn diagnose_skill_health(
+    record: &SkillRecord,
+    cfg: &EvolveConfig,
+) -> Option<(SuggestionKind, String)> {
+    if record.total_selections < cfg.min_selections {
         return None;
     }
 
@@ -89,7 +74,7 @@ pub fn diagnose_skill_health(record: &SkillRecord) -> Option<(SuggestionKind, St
     let effective_rate = record.effective_rate();
 
     // High fallback rate → FIX (selected but not used → unclear/outdated instructions)
-    if fallback_rate > FALLBACK_THRESHOLD {
+    if fallback_rate > cfg.fallback_threshold {
         return Some((
             SuggestionKind::Fix,
             format!(
@@ -101,7 +86,7 @@ pub fn diagnose_skill_health(record: &SkillRecord) -> Option<(SuggestionKind, St
     }
 
     // High applied + low completion → FIX (used but tasks fail → incorrect instructions)
-    if applied_rate > HIGH_APPLIED_FOR_FIX && completion_rate < LOW_COMPLETION_THRESHOLD {
+    if applied_rate > cfg.high_applied_for_fix && completion_rate < cfg.low_completion_threshold {
         return Some((
             SuggestionKind::Fix,
             format!(
@@ -114,7 +99,9 @@ pub fn diagnose_skill_health(record: &SkillRecord) -> Option<(SuggestionKind, St
     }
 
     // Moderate effectiveness → DERIVED (works sometimes → could be enhanced)
-    if effective_rate < MODERATE_EFFECTIVE_THRESHOLD && applied_rate > MIN_APPLIED_FOR_DERIVED {
+    if effective_rate < cfg.moderate_effective_threshold
+        && applied_rate > cfg.min_applied_for_derived
+    {
         return Some((
             SuggestionKind::Derived,
             format!(
@@ -129,7 +116,7 @@ pub fn diagnose_skill_health(record: &SkillRecord) -> Option<(SuggestionKind, St
 }
 
 /// Check all active skills for metric-based evolution candidates.
-pub fn check_metric_triggers(store: &EvolveStore) -> Vec<EvolutionContext> {
+pub fn check_metric_triggers(store: &EvolveStore, cfg: &EvolveConfig) -> Vec<EvolutionContext> {
     let active_skills = match store.list_skill_records(true) {
         Ok(skills) => skills,
         Err(_) => return vec![],
@@ -138,7 +125,7 @@ pub fn check_metric_triggers(store: &EvolveStore) -> Vec<EvolutionContext> {
     let mut contexts = Vec::new();
 
     for skill in active_skills {
-        if let Some((kind, direction)) = diagnose_skill_health(&skill) {
+        if let Some((kind, direction)) = diagnose_skill_health(&skill, cfg) {
             debug!(
                 skill_id = %skill.skill_id,
                 kind = %kind,
@@ -196,6 +183,7 @@ mod tests {
                 change_summary: String::new(),
                 content_diff: String::new(),
                 content_snapshot: HashMap::new(),
+                pre_fix_snapshot: HashMap::new(),
                 created_at: Utc::now(),
                 created_by: "human".into(),
             },
@@ -207,6 +195,11 @@ mod tests {
             total_fallbacks: fallbacks,
             first_seen: Utc::now(),
             last_updated: Utc::now(),
+            is_canary: false,
+            canary_selections: 0,
+            canary_completions: 0,
+            parent_completion_rate_at_birth: 0.0,
+            canary_parent_skill_id: None,
         }
     }
 
@@ -214,21 +207,21 @@ mod tests {
     fn diagnose_healthy_skill() {
         // 10 selections, 8 applied, 7 completed, 1 fallback
         let skill = make_skill("healthy__imp_1234", 10, 8, 7, 1);
-        assert!(diagnose_skill_health(&skill).is_none());
+        assert!(diagnose_skill_health(&skill, &EvolveConfig::default()).is_none());
     }
 
     #[test]
     fn diagnose_insufficient_data() {
         // Only 3 selections — below MIN_SELECTIONS
         let skill = make_skill("new__imp_1234", 3, 2, 1, 0);
-        assert!(diagnose_skill_health(&skill).is_none());
+        assert!(diagnose_skill_health(&skill, &EvolveConfig::default()).is_none());
     }
 
     #[test]
     fn diagnose_high_fallback() {
         // 10 selections, 2 applied, 1 completed, 6 fallbacks → fallback_rate = 60%
         let skill = make_skill("bad__imp_1234", 10, 2, 1, 6);
-        let (kind, direction) = diagnose_skill_health(&skill).unwrap();
+        let (kind, direction) = diagnose_skill_health(&skill, &EvolveConfig::default()).unwrap();
         assert_eq!(kind, SuggestionKind::Fix);
         assert!(direction.contains("fallback"));
     }
@@ -237,7 +230,7 @@ mod tests {
     fn diagnose_high_applied_low_completion() {
         // 10 selections, 8 applied, 2 completed, 0 fallbacks
         let skill = make_skill("broken__imp_1234", 10, 8, 2, 0);
-        let (kind, direction) = diagnose_skill_health(&skill).unwrap();
+        let (kind, direction) = diagnose_skill_health(&skill, &EvolveConfig::default()).unwrap();
         assert_eq!(kind, SuggestionKind::Fix);
         assert!(direction.contains("completion"));
     }
@@ -246,7 +239,7 @@ mod tests {
     fn diagnose_moderate_effectiveness() {
         // 10 selections, 6 applied, 4 completed, 2 fallbacks → effective = 40%
         let skill = make_skill("mediocre__imp_1234", 10, 6, 4, 2);
-        let (kind, _) = diagnose_skill_health(&skill).unwrap();
+        let (kind, _) = diagnose_skill_health(&skill, &EvolveConfig::default()).unwrap();
         assert_eq!(kind, SuggestionKind::Derived);
     }
 
