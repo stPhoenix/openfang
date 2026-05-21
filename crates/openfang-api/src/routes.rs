@@ -47,6 +47,19 @@ pub struct AppState {
     /// Mutated by `evolve_run_stream`'s progress callback; read by
     /// `evolve_run_status` so the dashboard can recover state after a reload.
     pub evolve_progress: Arc<tokio::sync::RwLock<EvolveProgressSnapshot>>,
+    /// Live snapshot of the evolve-execution queue (single-suggestion + batch
+    /// execute). Mutated by the background `evolve_execute_worker`; read by
+    /// `evolve_execute_status` so dashboard reloads can recover state.
+    pub evolve_execute_progress: Arc<tokio::sync::RwLock<EvolveExecuteSnapshot>>,
+    /// Submission channel: handlers push `EvolutionContext`s here and the
+    /// worker drains them sequentially. `None` if the worker has not been
+    /// spawned (tests that build `AppState` directly).
+    pub evolve_execute_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<openfang_evolve::EvolutionContext>>,
+    /// Broadcast channel for SSE clients of `/api/evolve/execute/stream`.
+    /// The worker publishes `EvolveExecuteEvent`s here.
+    pub evolve_execute_events:
+        Option<tokio::sync::broadcast::Sender<EvolveExecuteEvent>>,
 }
 
 /// Server-side snapshot of an evolve batch run.
@@ -66,6 +79,67 @@ pub struct EvolveProgressSnapshot {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub error: Option<String>,
+}
+
+/// Snapshot of the evolve-execution queue. Survives across page reloads.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct EvolveExecuteSnapshot {
+    pub running: bool,
+    pub current: usize,
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub queue: Vec<EvolveExecuteQueueItem>,
+    pub last_status: Option<String>,
+    pub last_change_summary: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+}
+
+/// One entry in the execute queue. The composite key
+/// `(analysis_id, kind, description)` matches the DB row that
+/// `mark_suggestion_executed` / `mark_suggestion_failed` update.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvolveExecuteQueueItem {
+    pub analysis_id: Option<String>,
+    pub kind: String,
+    pub description: String,
+    pub target_skill: Option<String>,
+    /// One of: queued | running | done | failed.
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub change_summary: Option<String>,
+    pub enqueued_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// SSE event payload for `/api/evolve/execute/stream`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EvolveExecuteEvent {
+    Started {
+        total: usize,
+    },
+    Item {
+        index: usize,
+        total: usize,
+        analysis_id: Option<String>,
+        kind: String,
+        description: String,
+        target_skill: Option<String>,
+        status: String,
+        failure_reason: Option<String>,
+        change_summary: Option<String>,
+    },
+    Completed {
+        succeeded: usize,
+        failed: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -7011,6 +7085,257 @@ pub async fn a2a_send_task(
     }
 }
 
+/// POST /a2a/tasks/sendSubscribe — Submit a task and stream updates over SSE.
+///
+/// Same request shape as `a2a_send_task` but the response is an SSE stream
+/// of `TaskStatusUpdate` events: one frame per text delta, tool-use, tool
+/// result, and a terminal frame (`final: true`) carrying the assembled
+/// assistant message and token usage. The task is also written into
+/// `kernel.a2a_task_store` so concurrent `GET /a2a/tasks/{id}` polling and
+/// the existing `POST /a2a/tasks/{id}/cancel` route keep working.
+///
+/// Tool calls are surfaced as `A2aPart::Data` parts with mime
+/// `application/vnd.openfang.tool+json` (see `A2A_TOOL_MIME`).
+pub async fn a2a_send_task_subscribe(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::stream;
+    use openfang_runtime::a2a::{
+        stream_event_to_a2a_update, A2aMessage, A2aPart, A2aTask, A2aTaskStatus,
+        A2aTaskStatusUpdateEvent,
+    };
+    use openfang_runtime::llm_driver::StreamEvent;
+
+    // Extract message text exactly like a2a_send_task.
+    let message_text = request["params"]["message"]["parts"]
+        .as_array()
+        .and_then(|parts| {
+            parts.iter().find_map(|p| {
+                if p["type"].as_str() == Some("text") {
+                    p["text"].as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "No message provided".to_string());
+
+    let agents = state.kernel.registry.list();
+    if agents.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No agents available"})),
+        )
+            .into_response();
+    }
+
+    let agent = agents
+        .iter()
+        .find(|a| a.name.to_ascii_lowercase().contains("demiurg"))
+        .unwrap_or(&agents[0]);
+    let agent_id = agent.id;
+    let workspace = agent.manifest.workspace.clone();
+    let task_uuid = uuid::Uuid::new_v4();
+    let task_id = task_uuid.to_string();
+    let session_id_str = request["params"]["sessionId"].as_str().map(String::from);
+    let session_uuid = session_id_str
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or(task_uuid);
+    let kernel_session_id = openfang_types::agent::SessionId(session_uuid);
+
+    // Seed the task store so concurrent GET /a2a/tasks/{id} sees Working.
+    let task = A2aTask {
+        id: task_id.clone(),
+        session_id: session_id_str.clone(),
+        status: A2aTaskStatus::Working.into(),
+        messages: vec![A2aMessage {
+            role: "user".to_string(),
+            parts: vec![A2aPart::Text {
+                text: message_text.clone(),
+            }],
+        }],
+        artifacts: vec![],
+    };
+    state.kernel.a2a_task_store.insert(task);
+
+    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+
+    let (rx, join_handle) = match state.kernel.send_message_streaming_with_session(
+        agent_id,
+        &message_text,
+        Some(kernel_handle),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        kernel_session_id,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let err_msg = A2aMessage {
+                role: "agent".to_string(),
+                parts: vec![A2aPart::Text {
+                    text: format!("Error: {e}"),
+                }],
+            };
+            state.kernel.a2a_task_store.fail(&task_id, err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error": "Streaming task failed to start", "taskId": task_id}),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    // Register abort handle so POST /a2a/tasks/{id}/cancel can stop us.
+    state
+        .kernel
+        .a2a_task_handles
+        .insert(task_id.clone(), join_handle.abort_handle());
+
+    // Forwarder channel: the sidecar task drains the kernel rx, maps to A2A
+    // events, and pushes them into this channel. The SSE response unfolds
+    // this channel. The sidecar OWNS the kernel rx and join_handle so the
+    // task-store finalization runs even if the HTTP client disconnects.
+    let (tx_sse, rx_sse) = tokio::sync::mpsc::channel::<A2aTaskStatusUpdateEvent>(256);
+
+    let sidecar_state = state.clone();
+    let sidecar_task_id = task_id.clone();
+    let sidecar_workspace = workspace.clone();
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut accumulated = String::new();
+
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta { ref text } = event {
+                accumulated.push_str(text);
+            }
+            if let Some(update) = stream_event_to_a2a_update(&event, &sidecar_task_id) {
+                // Best-effort send; if the SSE client is gone the channel
+                // closes — we keep draining so the kernel run still
+                // finalizes the task store.
+                let _ = tx_sse.send(update).await;
+            }
+            if matches!(event, StreamEvent::ContentComplete { .. }) {
+                // Drain any tail and exit so we can await the join handle.
+                break;
+            }
+        }
+        // Drain remaining events (driver may emit a final TextDelta + PhaseChange
+        // after ContentComplete in some providers).
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::TextDelta { ref text } = event {
+                accumulated.push_str(text);
+            }
+            if let Some(update) = stream_event_to_a2a_update(&event, &sidecar_task_id) {
+                let _ = tx_sse.send(update).await;
+            }
+        }
+
+        // Await the kernel run.
+        let kernel_outcome = join_handle.await;
+
+        let (clean_text, artifacts) =
+            extract_a2a_artifacts(&accumulated, sidecar_workspace.as_deref(), &sidecar_task_id);
+        let final_msg = A2aMessage {
+            role: "agent".to_string(),
+            parts: vec![A2aPart::Text {
+                text: clean_text,
+            }],
+        };
+
+        // Honor a concurrent cancel before deciding terminal state.
+        let store_state = sidecar_state
+            .kernel
+            .a2a_task_store
+            .get(&sidecar_task_id)
+            .map(|t| t.status.state().clone());
+
+        let (terminal_state, metadata): (A2aTaskStatus, Option<serde_json::Value>) =
+            match (&store_state, &kernel_outcome) {
+                (Some(A2aTaskStatus::Cancelled), _) => (A2aTaskStatus::Cancelled, None),
+                (_, Ok(Ok(loop_result))) => {
+                    sidecar_state
+                        .kernel
+                        .a2a_task_store
+                        .complete(&sidecar_task_id, final_msg.clone(), artifacts);
+                    let usage_meta = serde_json::json!({
+                        "usage": {
+                            "input_tokens": loop_result.total_usage.input_tokens,
+                            "output_tokens": loop_result.total_usage.output_tokens,
+                        }
+                    });
+                    (A2aTaskStatus::Completed, Some(usage_meta))
+                }
+                (_, Ok(Err(e))) => {
+                    let err_msg = A2aMessage {
+                        role: "agent".to_string(),
+                        parts: vec![A2aPart::Text {
+                            text: format!("Error: {e}"),
+                        }],
+                    };
+                    sidecar_state
+                        .kernel
+                        .a2a_task_store
+                        .fail(&sidecar_task_id, err_msg);
+                    (A2aTaskStatus::Failed, None)
+                }
+                (_, Err(join_err)) if join_err.is_cancelled() => (A2aTaskStatus::Cancelled, None),
+                (_, Err(_)) => {
+                    let err_msg = A2aMessage {
+                        role: "agent".to_string(),
+                        parts: vec![A2aPart::Text {
+                            text: "Error: kernel task panicked".to_string(),
+                        }],
+                    };
+                    sidecar_state
+                        .kernel
+                        .a2a_task_store
+                        .fail(&sidecar_task_id, err_msg);
+                    (A2aTaskStatus::Failed, None)
+                }
+            };
+
+        sidecar_state
+            .kernel
+            .a2a_task_handles
+            .remove(&sidecar_task_id);
+
+        let terminal_msg = match terminal_state {
+            A2aTaskStatus::Completed => Some(final_msg),
+            _ => None,
+        };
+        let terminal = A2aTaskStatusUpdateEvent::terminal(
+            &sidecar_task_id,
+            terminal_state,
+            terminal_msg,
+            metadata,
+        );
+        let _ = tx_sse.send(terminal).await;
+        // tx_sse drops here, closing the SSE forwarder channel.
+    });
+
+    let sse_stream = stream::unfold(rx_sse, |mut rx_sse| async move {
+        let update = rx_sse.recv().await?;
+        let sse_event: Result<Event, std::convert::Infallible> = Ok(Event::default()
+            .event("TaskStatusUpdate")
+            .json_data(&update)
+            .unwrap_or_else(|_| Event::default().data("error")));
+        Some((sse_event, rx_sse))
+    });
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 /// Parse `<artifact path="..." mime="..."/>` markers out of an agent reply.
 ///
 /// Returns the text with markers stripped, plus one `A2aArtifact` per marker.
@@ -13638,8 +13963,9 @@ pub async fn evolve_execute(
         .as_str()
         .and_then(|s| s.parse::<openfang_evolve::AnalysisId>().ok());
 
+    let target_label = body["target_skill"].as_str().map(str::to_string);
     // Look up the target skill record.
-    let target_skills = if let Some(target) = body["target_skill"].as_str() {
+    let target_skills = if let Some(ref target) = target_label {
         let store = state.kernel.evolve_engine.store();
         // Try by ID first, then by name.
         let record = store
@@ -13655,36 +13981,28 @@ pub async fn evolve_execute(
     let context = openfang_evolve::EvolutionContext {
         evolution_type: kind,
         target_skills,
-        direction: description,
+        direction: description.clone(),
         category: None,
         trigger_context: "Manual trigger from UI".to_string(),
         source_analysis: analysis_id,
     };
 
-    match state.kernel.execute_evolution(context.clone()).await {
-        Ok(result) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&result).unwrap_or_default()),
+    match enqueue_evolution(&state, context, target_label).await {
+        Ok(position) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "queued": true,
+                "position": position,
+            })),
         ),
-        Err(e) => {
-            // Mark the suggestion as failed so the UI shows the status.
-            if let Some(ref aid) = context.source_analysis {
-                let _ = state.kernel.evolve_engine.store().mark_suggestion_failed(
-                    aid,
-                    &context.evolution_type,
-                    &context.direction,
-                    &format!("{e}"),
-                );
-            }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("{e}") })),
-            )
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
     }
 }
 
-/// POST /api/evolve/execute-all — Execute all suggestions from an analysis.
+/// POST /api/evolve/execute-all — Enqueue all suggestions from an analysis.
 pub async fn evolve_execute_all(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -13727,40 +14045,293 @@ pub async fn evolve_execute_all(
         state.kernel.evolve_engine.store(),
     );
 
-    let total = contexts.len();
-    let mut succeeded = 0u32;
-    let mut failed = 0u32;
-    let mut results = Vec::new();
-
+    let mut queued = 0usize;
     for context in contexts {
-        match state.kernel.execute_evolution(context).await {
-            Ok(result) => {
-                succeeded += 1;
-                results.push(serde_json::json!({
-                    "skill_id": result.evolved_skill_id,
-                    "summary": result.change_summary,
-                    "success": true,
-                }));
-            }
+        let target_label = context
+            .target_skills
+            .first()
+            .map(|s| s.name.clone());
+        match enqueue_evolution(&state, context, target_label).await {
+            Ok(_) => queued += 1,
             Err(e) => {
-                failed += 1;
-                results.push(serde_json::json!({
-                    "error": format!("{e}"),
-                    "success": false,
-                }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e })),
+                );
             }
         }
     }
 
     (
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "executed": total,
-            "succeeded": succeeded,
-            "failed": failed,
-            "results": results,
+            "queued": queued,
         })),
     )
+}
+
+/// Push an `EvolutionContext` onto the execute queue. Updates the snapshot
+/// (queue + counters + running flag), broadcasts a queued `Item` event, and
+/// sends the context to the worker. Returns the 1-based queue position.
+async fn enqueue_evolution(
+    state: &Arc<AppState>,
+    context: openfang_evolve::EvolutionContext,
+    target_label: Option<String>,
+) -> Result<usize, String> {
+    let tx = state
+        .evolve_execute_tx
+        .as_ref()
+        .ok_or_else(|| "evolve execute worker not initialized".to_string())?;
+
+    let item = EvolveExecuteQueueItem {
+        analysis_id: context.source_analysis.as_ref().map(|a| a.to_string()),
+        kind: context.evolution_type.to_string().to_lowercase(),
+        description: context.direction.clone(),
+        target_skill: target_label,
+        status: "queued".to_string(),
+        failure_reason: None,
+        change_summary: None,
+        enqueued_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+    };
+
+    let position = {
+        let mut snap = state.evolve_execute_progress.write().await;
+        // Reset stale state when starting a fresh batch.
+        if !snap.running {
+            *snap = EvolveExecuteSnapshot {
+                running: true,
+                started_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            };
+        }
+        snap.total += 1;
+        snap.queue.push(item.clone());
+        snap.queue.len()
+    };
+
+    if let Some(ev_tx) = state.evolve_execute_events.as_ref() {
+        let _ = ev_tx.send(EvolveExecuteEvent::Item {
+            index: position - 1,
+            total: position,
+            analysis_id: item.analysis_id,
+            kind: item.kind,
+            description: item.description,
+            target_skill: item.target_skill,
+            status: "queued".to_string(),
+            failure_reason: None,
+            change_summary: None,
+        });
+    }
+
+    tx.send(context)
+        .map_err(|e| format!("worker channel closed: {e}"))?;
+
+    Ok(position)
+}
+
+/// GET /api/evolve/execute/status — Snapshot of the execute queue for reload
+/// recovery. Returns the most recent snapshot regardless of `running`.
+pub async fn evolve_execute_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<EvolveExecuteSnapshot> {
+    Json(state.evolve_execute_progress.read().await.clone())
+}
+
+/// GET /api/evolve/execute/stream — SSE stream of `EvolveExecuteEvent`s
+/// published by the background worker. Each subscriber gets a fresh
+/// receiver from the broadcast channel; missed events (subscribed mid-run)
+/// are surfaced via the `status` endpoint instead.
+pub async fn evolve_execute_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let ev_tx = match state.evolve_execute_events.as_ref() {
+        Some(tx) => tx,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::json!({ "error": "evolve execute worker not initialized" }),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let mut rx = ev_tx.subscribe();
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<
+        Result<Event, std::convert::Infallible>,
+    >();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let data = serde_json::to_string(&ev).unwrap_or_default();
+                    if sse_tx.send(Ok(Event::default().data(data))).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx);
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Background worker that drains the execute queue sequentially. Spawned once
+/// at server startup. Owns the `mpsc::Receiver`; handlers push contexts via
+/// `AppState.evolve_execute_tx`.
+///
+/// Per item: marks running, runs `kernel.execute_evolution` (whose
+/// kernel-level mutex serializes against cron too), persists failure via
+/// `mark_suggestion_failed` on error (success persistence already happens
+/// inside `execute_evolution`), updates the snapshot, broadcasts an `Item`
+/// event, and emits `Completed` once the queue drains.
+pub fn spawn_evolve_execute_worker(
+    kernel: Arc<OpenFangKernel>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<openfang_evolve::EvolutionContext>,
+    progress: Arc<tokio::sync::RwLock<EvolveExecuteSnapshot>>,
+    events: tokio::sync::broadcast::Sender<EvolveExecuteEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(context) = rx.recv().await {
+            let key_analysis_id = context.source_analysis.as_ref().map(|a| a.to_string());
+            let key_kind = context.evolution_type.to_string().to_lowercase();
+            let key_description = context.direction.clone();
+
+            // Flip the matching queue item to `running` and bump `current`.
+            let (index, total) = {
+                let mut snap = progress.write().await;
+                let idx = snap.queue.iter().position(|q| {
+                    q.status == "queued"
+                        && q.analysis_id == key_analysis_id
+                        && q.kind == key_kind
+                        && q.description == key_description
+                });
+                if let Some(i) = idx {
+                    snap.queue[i].status = "running".to_string();
+                    snap.queue[i].started_at = Some(chrono::Utc::now());
+                    snap.current = snap.current.saturating_add(1);
+                }
+                (idx, snap.total)
+            };
+
+            if let Some(i) = index {
+                let _ = events.send(EvolveExecuteEvent::Item {
+                    index: i,
+                    total,
+                    analysis_id: key_analysis_id.clone(),
+                    kind: key_kind.clone(),
+                    description: key_description.clone(),
+                    target_skill: None,
+                    status: "running".to_string(),
+                    failure_reason: None,
+                    change_summary: None,
+                });
+            }
+
+            // Run the evolution. The kernel-level `evolver_exec_lock` ensures
+            // we never overlap with cron paths.
+            let outcome = kernel.execute_evolution(context.clone()).await;
+
+            let (status, failure_reason, change_summary) = match outcome {
+                Ok(result) => (
+                    "done".to_string(),
+                    None,
+                    Some(result.change_summary),
+                ),
+                Err(e) => {
+                    let reason = format!("{e}");
+                    // Persist failure so the row badge flips to "Failed".
+                    if let Some(ref aid) = context.source_analysis {
+                        if let Err(store_err) = kernel
+                            .evolve_engine
+                            .store()
+                            .mark_suggestion_failed(
+                                aid,
+                                &context.evolution_type,
+                                &context.direction,
+                                &reason,
+                            )
+                        {
+                            tracing::warn!(
+                                error = %store_err,
+                                "failed to mark suggestion failed"
+                            );
+                        }
+                    }
+                    ("failed".to_string(), Some(reason), None)
+                }
+            };
+
+            let (item_index, queue_done) = {
+                let mut snap = progress.write().await;
+                if let Some(i) = snap.queue.iter().position(|q| {
+                    q.status == "running"
+                        && q.analysis_id == key_analysis_id
+                        && q.kind == key_kind
+                        && q.description == key_description
+                }) {
+                    snap.queue[i].status = status.clone();
+                    snap.queue[i].failure_reason = failure_reason.clone();
+                    snap.queue[i].change_summary = change_summary.clone();
+                    snap.queue[i].finished_at = Some(chrono::Utc::now());
+                    if status == "done" {
+                        snap.succeeded = snap.succeeded.saturating_add(1);
+                    } else {
+                        snap.failed = snap.failed.saturating_add(1);
+                    }
+                    snap.last_status = Some(status.clone());
+                    snap.last_change_summary = change_summary.clone();
+                    let any_pending = snap
+                        .queue
+                        .iter()
+                        .any(|q| q.status == "queued" || q.status == "running");
+                    if !any_pending {
+                        snap.running = false;
+                        snap.finished_at = Some(chrono::Utc::now());
+                    }
+                    (Some(i), !any_pending)
+                } else {
+                    (None, false)
+                }
+            };
+
+            if let Some(i) = item_index {
+                let _ = events.send(EvolveExecuteEvent::Item {
+                    index: i,
+                    total,
+                    analysis_id: key_analysis_id,
+                    kind: key_kind,
+                    description: key_description,
+                    target_skill: None,
+                    status,
+                    failure_reason,
+                    change_summary,
+                });
+            }
+
+            if queue_done {
+                let snap = progress.read().await;
+                let _ = events.send(EvolveExecuteEvent::Completed {
+                    succeeded: snap.succeeded,
+                    failed: snap.failed,
+                });
+            }
+        }
+    });
 }
 
 /// DELETE /api/evolve/suggestion — Delete a single evolution suggestion.

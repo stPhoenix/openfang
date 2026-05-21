@@ -42,6 +42,16 @@ pub async fn build_router(
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
     let channels_config = kernel.config.channels.clone();
+    // Channels for the background evolve-execute worker. The worker owns the
+    // receiver; handlers push contexts via the sender on AppState.
+    let (evolve_exec_tx, evolve_exec_rx) =
+        tokio::sync::mpsc::unbounded_channel::<openfang_evolve::EvolutionContext>();
+    let (evolve_exec_events_tx, _) =
+        tokio::sync::broadcast::channel::<routes::EvolveExecuteEvent>(256);
+    let evolve_execute_progress = Arc::new(tokio::sync::RwLock::new(
+        routes::EvolveExecuteSnapshot::default(),
+    ));
+
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
         started_at: Instant::now(),
@@ -55,7 +65,21 @@ pub async fn build_router(
         evolve_progress: Arc::new(tokio::sync::RwLock::new(
             routes::EvolveProgressSnapshot::default(),
         )),
+        evolve_execute_progress: evolve_execute_progress.clone(),
+        evolve_execute_tx: Some(evolve_exec_tx),
+        evolve_execute_events: Some(evolve_exec_events_tx.clone()),
     });
+
+    // Spawn the single evolve-execute worker. It drains the mpsc receiver
+    // sequentially, runs each evolution via `kernel.execute_evolution` (whose
+    // kernel-level mutex already serializes against cron paths), and updates
+    // the snapshot + broadcast stream as it goes.
+    routes::spawn_evolve_execute_worker(
+        kernel.clone(),
+        evolve_exec_rx,
+        evolve_execute_progress,
+        evolve_exec_events_tx,
+    );
 
     // Start WS cron broadcaster — subscribes to kernel event bus and pushes
     // cron job results to all connected WebSocket clients in real-time.
@@ -752,6 +776,14 @@ pub async fn build_router(
             axum::routing::post(routes::evolve_execute_all),
         )
         .route(
+            "/api/evolve/execute/status",
+            axum::routing::get(routes::evolve_execute_status),
+        )
+        .route(
+            "/api/evolve/execute/stream",
+            axum::routing::get(routes::evolve_execute_stream),
+        )
+        .route(
             "/api/evolve/suggestion",
             axum::routing::delete(routes::evolve_delete_suggestion),
         )
@@ -784,6 +816,10 @@ pub async fn build_router(
         .route(
             "/a2a/tasks/send",
             axum::routing::post(routes::a2a_send_task),
+        )
+        .route(
+            "/a2a/tasks/sendSubscribe",
+            axum::routing::post(routes::a2a_send_task_subscribe),
         )
         .route("/a2a/tasks/{id}", axum::routing::get(routes::a2a_get_task))
         .route(

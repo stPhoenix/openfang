@@ -346,6 +346,172 @@ impl Default for A2aTaskStore {
 }
 
 // ---------------------------------------------------------------------------
+// A2A Streaming — TaskStatusUpdateEvent wire shape for `tasks/sendSubscribe`
+// ---------------------------------------------------------------------------
+
+/// Mime type used for OpenFang tool-call envelopes carried inside
+/// `A2aPart::Data` on streaming `TaskStatusUpdate` frames. The A2A spec does
+/// not standardize tool calls — we surface them as opaque `data` parts
+/// addressed by this mime so cooperating clients can detect them while
+/// generic A2A consumers can safely ignore them.
+pub const A2A_TOOL_MIME: &str = "application/vnd.openfang.tool+json";
+
+/// Status snapshot embedded in a `TaskStatusUpdateEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aStatusSnapshot {
+    pub state: A2aTaskStatus,
+    /// RFC3339 timestamp.
+    pub timestamp: String,
+}
+
+/// SSE event emitted by `POST /a2a/tasks/sendSubscribe`. One frame per
+/// observable progress beat (text delta, tool use, tool result, phase
+/// change, terminal completion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aTaskStatusUpdateEvent {
+    pub id: String,
+    pub status: A2aStatusSnapshot,
+    /// Optional working-update message — usually a single agent `Text` part
+    /// (for `TextDelta`) or a single `Data` part with mime `A2A_TOOL_MIME`
+    /// (for tool events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<A2aMessage>,
+    /// Free-form metadata. Used by the terminal frame to carry token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// Whether this is the terminating frame of the stream.
+    pub r#final: bool,
+}
+
+impl A2aTaskStatusUpdateEvent {
+    fn now_rfc3339() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    /// Build a non-final `working` frame with the given message.
+    pub fn working(task_id: &str, message: Option<A2aMessage>) -> Self {
+        Self {
+            id: task_id.to_string(),
+            status: A2aStatusSnapshot {
+                state: A2aTaskStatus::Working,
+                timestamp: Self::now_rfc3339(),
+            },
+            message,
+            metadata: None,
+            r#final: false,
+        }
+    }
+
+    /// Build a terminal frame with the given state and optional message.
+    pub fn terminal(
+        task_id: &str,
+        state: A2aTaskStatus,
+        message: Option<A2aMessage>,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id: task_id.to_string(),
+            status: A2aStatusSnapshot {
+                state,
+                timestamp: Self::now_rfc3339(),
+            },
+            message,
+            metadata,
+            r#final: true,
+        }
+    }
+}
+
+/// Helper: wrap a JSON envelope as an agent `Data` message part with the
+/// OpenFang tool mime type.
+fn tool_data_message(payload: serde_json::Value) -> A2aMessage {
+    A2aMessage {
+        role: "agent".to_string(),
+        parts: vec![A2aPart::Data {
+            mime_type: A2A_TOOL_MIME.to_string(),
+            data: payload,
+        }],
+    }
+}
+
+/// Map an in-flight `StreamEvent` to an A2A `TaskStatusUpdateEvent`.
+///
+/// Returns `None` for variants that don't carry user-visible progress
+/// (`ToolInputDelta`, `IterationStart`) — callers must skip them so the SSE
+/// stream stays clean. `ContentComplete` and `PhaseChange { phase = "error" }`
+/// produce frames with `final: false` here; the caller is responsible for
+/// emitting the *terminal* frame separately (with the accumulated assistant
+/// text and final state) after the stream channel drains.
+pub fn stream_event_to_a2a_update(
+    ev: &crate::llm_driver::StreamEvent,
+    task_id: &str,
+) -> Option<A2aTaskStatusUpdateEvent> {
+    use crate::llm_driver::StreamEvent;
+    match ev {
+        StreamEvent::TextDelta { text } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(A2aMessage {
+                role: "agent".to_string(),
+                parts: vec![A2aPart::Text { text: text.clone() }],
+            }),
+        )),
+        StreamEvent::ToolUseStart { id, name } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(tool_data_message(serde_json::json!({
+                "event": "tool_use",
+                "id": id,
+                "name": name,
+            }))),
+        )),
+        StreamEvent::ToolUseEnd { id, name, input } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(tool_data_message(serde_json::json!({
+                "event": "tool_use_end",
+                "id": id,
+                "name": name,
+                "input": input,
+            }))),
+        )),
+        StreamEvent::ToolExecutionResult {
+            id,
+            name,
+            result_preview,
+            is_error,
+        } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(tool_data_message(serde_json::json!({
+                "event": "tool_result",
+                "id": id,
+                "name": name,
+                "result": result_preview,
+                "is_error": is_error,
+            }))),
+        )),
+        StreamEvent::ThinkingDelta { text } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(tool_data_message(serde_json::json!({
+                "event": "thinking",
+                "content": text,
+            }))),
+        )),
+        StreamEvent::PhaseChange { phase, detail } => Some(A2aTaskStatusUpdateEvent::working(
+            task_id,
+            Some(tool_data_message(serde_json::json!({
+                "event": "phase",
+                "phase": phase,
+                "detail": detail,
+            }))),
+        )),
+        // Skipped: caller emits the terminal frame itself.
+        StreamEvent::ContentComplete { .. }
+        | StreamEvent::IterationStart { .. }
+        | StreamEvent::ToolInputDelta { .. } => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A2A Discovery — auto-discover external agents at boot
 // ---------------------------------------------------------------------------
 
@@ -823,6 +989,130 @@ mod tests {
         store.insert(task);
         // One was evicted, plus the new one
         assert!(store.len() <= 2);
+    }
+
+    #[test]
+    fn test_map_text_delta() {
+        use crate::llm_driver::StreamEvent;
+        let ev = StreamEvent::TextDelta {
+            text: "hi".to_string(),
+        };
+        let upd = stream_event_to_a2a_update(&ev, "t-1").expect("expected Some");
+        assert_eq!(upd.id, "t-1");
+        assert_eq!(upd.status.state, A2aTaskStatus::Working);
+        assert!(!upd.r#final);
+        let msg = upd.message.expect("expected message");
+        assert_eq!(msg.role, "agent");
+        match &msg.parts[0] {
+            A2aPart::Text { text } => assert_eq!(text, "hi"),
+            _ => panic!("expected Text part"),
+        }
+    }
+
+    #[test]
+    fn test_map_tool_use_start_data_part() {
+        use crate::llm_driver::StreamEvent;
+        let ev = StreamEvent::ToolUseStart {
+            id: "tu_1".to_string(),
+            name: "read_file".to_string(),
+        };
+        let upd = stream_event_to_a2a_update(&ev, "t-1").unwrap();
+        let msg = upd.message.unwrap();
+        match &msg.parts[0] {
+            A2aPart::Data { mime_type, data } => {
+                assert_eq!(mime_type, A2A_TOOL_MIME);
+                assert_eq!(data["event"], "tool_use");
+                assert_eq!(data["id"], "tu_1");
+                assert_eq!(data["name"], "read_file");
+            }
+            _ => panic!("expected Data part"),
+        }
+    }
+
+    #[test]
+    fn test_map_tool_use_end_includes_input() {
+        use crate::llm_driver::StreamEvent;
+        let ev = StreamEvent::ToolUseEnd {
+            id: "tu_2".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "x.rs", "content": "fn main() {}"}),
+        };
+        let upd = stream_event_to_a2a_update(&ev, "t-1").unwrap();
+        let msg = upd.message.unwrap();
+        match &msg.parts[0] {
+            A2aPart::Data { data, .. } => {
+                assert_eq!(data["event"], "tool_use_end");
+                assert_eq!(data["input"]["path"], "x.rs");
+                assert_eq!(data["input"]["content"], "fn main() {}");
+            }
+            _ => panic!("expected Data part"),
+        }
+    }
+
+    #[test]
+    fn test_map_tool_result_is_error_flag() {
+        use crate::llm_driver::StreamEvent;
+        let ev = StreamEvent::ToolExecutionResult {
+            id: "tu_3".to_string(),
+            name: "shell".to_string(),
+            result_preview: "boom".to_string(),
+            is_error: true,
+        };
+        let upd = stream_event_to_a2a_update(&ev, "t-1").unwrap();
+        match &upd.message.unwrap().parts[0] {
+            A2aPart::Data { data, .. } => {
+                assert_eq!(data["event"], "tool_result");
+                assert_eq!(data["result"], "boom");
+                assert_eq!(data["is_error"], true);
+            }
+            _ => panic!("expected Data part"),
+        }
+    }
+
+    #[test]
+    fn test_map_skip_variants_return_none() {
+        use crate::llm_driver::StreamEvent;
+        use openfang_types::message::StopReason;
+        assert!(stream_event_to_a2a_update(
+            &StreamEvent::ToolInputDelta {
+                text: "{".to_string(),
+            },
+            "t-1",
+        )
+        .is_none());
+        assert!(stream_event_to_a2a_update(
+            &StreamEvent::IterationStart { iteration: 2 },
+            "t-1",
+        )
+        .is_none());
+        assert!(stream_event_to_a2a_update(
+            &StreamEvent::ContentComplete {
+                stop_reason: StopReason::EndTurn,
+                usage: openfang_types::message::TokenUsage::default(),
+            },
+            "t-1",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_terminal_frame_carries_final_flag_and_metadata() {
+        let ev = A2aTaskStatusUpdateEvent::terminal(
+            "t-9",
+            A2aTaskStatus::Completed,
+            Some(A2aMessage {
+                role: "agent".to_string(),
+                parts: vec![A2aPart::Text {
+                    text: "done".to_string(),
+                }],
+            }),
+            Some(serde_json::json!({"usage": {"input_tokens": 7, "output_tokens": 3}})),
+        );
+        assert!(ev.r#final);
+        assert_eq!(ev.status.state, A2aTaskStatus::Completed);
+        let wire = serde_json::to_value(&ev).unwrap();
+        assert_eq!(wire["final"], true);
+        assert_eq!(wire["metadata"]["usage"]["input_tokens"], 7);
     }
 
     #[test]

@@ -285,3 +285,165 @@ def test_update_model_unknown_id_returns_404(client: httpx.Client) -> None:
 def test_dashboard_has_max_output_column(client: httpx.Client) -> None:
     html = client.get("/").text
     assert "Max Output" in html, "Max Output column missing from dashboard models table"
+
+
+# ── A2A streaming: POST /a2a/tasks/sendSubscribe (SSE) ────────────────────────
+
+
+def _parse_sse(body_iter):
+    """Yield (event, json_payload) for each SSE frame on the wire.
+
+    Frame shape per the W3C spec is `event: <name>\\ndata: <line>\\n\\n`. We
+    only need the `event` and the JSON-decoded `data`, and the daemon emits
+    single-line data payloads.
+    """
+    import json as _json
+
+    event_name = None
+    data_lines: list[str] = []
+    for raw in body_iter:
+        if raw is None:
+            continue
+        line = raw.rstrip("\r\n") if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line == "":
+            if event_name is not None and data_lines:
+                payload = "\n".join(data_lines)
+                try:
+                    yield event_name, _json.loads(payload)
+                except _json.JSONDecodeError:
+                    pass
+            event_name = None
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue  # comment / keepalive
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+
+
+def test_a2a_send_task_subscribe_streams_updates(base_url: str) -> None:
+    """sendSubscribe must emit ≥1 non-final TaskStatusUpdate and exactly one
+    final frame with state ∈ {completed, failed}. Polling GET /a2a/tasks/{id}
+    after the stream closes must observe the same terminal state."""
+    payload = {
+        "params": {
+            "message": {
+                "parts": [{"type": "text", "text": "Reply with exactly the word PONG."}]
+            }
+        }
+    }
+    frames: list[tuple[str, dict]] = []
+    task_id: str | None = None
+    with httpx.Client(base_url=base_url, timeout=180.0) as c:
+        with c.stream("POST", "/a2a/tasks/sendSubscribe", json=payload) as resp:
+            assert resp.status_code == 200, f"sendSubscribe returned {resp.status_code}"
+            for ev_name, data in _parse_sse(resp.iter_lines()):
+                frames.append((ev_name, data))
+                if task_id is None and isinstance(data, dict) and "id" in data:
+                    task_id = data["id"]
+                if isinstance(data, dict) and data.get("final") is True:
+                    break
+
+    assert task_id is not None, "no task id surfaced from any frame"
+    assert any(
+        ev == "TaskStatusUpdate"
+        and isinstance(d, dict)
+        and d.get("status", {}).get("state") == "working"
+        and d.get("final") is False
+        for ev, d in frames
+    ), f"expected ≥1 working frame; got events {[(e, d.get('status', {}).get('state')) for e, d in frames]}"
+
+    terminals = [d for _ev, d in frames if isinstance(d, dict) and d.get("final") is True]
+    assert len(terminals) == 1, f"expected exactly one final frame, got {len(terminals)}"
+    terminal = terminals[0]
+    assert terminal["status"]["state"] in ("completed", "failed"), terminal
+
+    # Polling endpoint must agree with the terminal frame.
+    with httpx.Client(base_url=base_url, timeout=30.0) as c:
+        r = c.get(f"/a2a/tasks/{task_id}")
+        assert r.status_code == 200, r.text[:300]
+        body = r.json()
+        # status may be either bare string ("completed") or {"state": ...}
+        status_obj = body.get("status")
+        if isinstance(status_obj, dict):
+            state = status_obj.get("state")
+        else:
+            state = status_obj
+        assert state == terminal["status"]["state"], (state, terminal)
+
+
+def test_a2a_send_task_subscribe_cancel_midstream(base_url: str) -> None:
+    """Cancel mid-stream: terminal frame must carry state=cancelled when the
+    cancel lands before the run finishes; otherwise the stream still produces
+    a clean terminal frame and the task store reflects the same state."""
+    import threading
+    import time as _time
+
+    payload = {
+        "params": {
+            "message": {
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": "Write a 1000-word essay about the Roman empire.",
+                    }
+                ]
+            }
+        }
+    }
+
+    cancelled_fired = threading.Event()
+    stream_done = threading.Event()
+    task_id_holder: dict[str, str] = {}
+
+    def fire_cancel_when_id_known() -> None:
+        # Use a fresh client so its lifecycle is independent of the main thread.
+        with httpx.Client(base_url=base_url, timeout=30.0) as cc:
+            for _ in range(300):
+                if stream_done.is_set():
+                    return
+                tid = task_id_holder.get("id")
+                if tid is not None:
+                    try:
+                        cc.post(f"/a2a/tasks/{tid}/cancel")
+                    except httpx.HTTPError:
+                        pass
+                    cancelled_fired.set()
+                    return
+                _time.sleep(0.1)
+
+    canceller = threading.Thread(target=fire_cancel_when_id_known, daemon=True)
+    canceller.start()
+
+    terminal: dict | None = None
+    try:
+        with httpx.Client(base_url=base_url, timeout=180.0) as c:
+            with c.stream("POST", "/a2a/tasks/sendSubscribe", json=payload) as resp:
+                assert resp.status_code == 200
+                for _ev, data in _parse_sse(resp.iter_lines()):
+                    if isinstance(data, dict) and "id" in data and "id" not in task_id_holder:
+                        task_id_holder["id"] = data["id"]
+                    if isinstance(data, dict) and data.get("final") is True:
+                        terminal = data
+                        break
+    finally:
+        stream_done.set()
+        canceller.join(timeout=2.0)
+
+    assert "id" in task_id_holder, "stream never surfaced a task id"
+    assert terminal is not None, "stream closed without a final frame"
+
+    state = terminal["status"]["state"]
+    # `cancelled` is the goal; `completed`/`failed` happen when the run
+    # finishes before cancel lands or when the LLM upstream errors fast.
+    assert state in ("cancelled", "completed", "failed"), terminal
+
+    with httpx.Client(base_url=base_url, timeout=30.0) as c:
+        r = c.get(f"/a2a/tasks/{task_id_holder['id']}")
+        assert r.status_code == 200
+        body = r.json()
+        status_obj = body.get("status")
+        poll_state = status_obj.get("state") if isinstance(status_obj, dict) else status_obj
+        assert poll_state == state, (poll_state, state)

@@ -5855,6 +5855,19 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 </div>
               </div>
             </template>
+            <template x-if="executeProgress.running && executeProgress.total > 0">
+              <div style="display:flex;flex-direction:column;justify-content:center;min-width:160px;font-size:11px;opacity:0.85">
+                <div>
+                  Evolving <span x-text="executeProgress.current"></span> / <span x-text="executeProgress.total"></span>
+                  <span style="opacity:0.65">·</span>
+                  <span style="color:var(--success, #10b981)" x-text="'✓' + executeProgress.succeeded"></span>
+                  <span x-show="executeProgress.failed > 0" style="color:var(--danger, #ef4444);margin-left:2px" x-text="'✗' + executeProgress.failed"></span>
+                </div>
+                <div style="height:3px;background:rgba(255,255,255,0.1);border-radius:2px;margin-top:4px;overflow:hidden">
+                  <div style="height:100%;background:var(--success, #10b981);transition:width 200ms" :style="'width:' + (executeProgress.total > 0 ? ((executeProgress.succeeded + executeProgress.failed) / executeProgress.total * 100) : 0) + '%'"></div>
+                </div>
+              </div>
+            </template>
             <button class="btn btn-primary btn-sm" @click="runAnalysis()" :disabled="running || !config.enabled">
               <span x-show="!running">Run Analysis</span>
               <span x-show="running">Analyzing...</span>
@@ -6134,9 +6147,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                     <template x-if="!es.executed_at && !es.failed_at">
                                       <button class="btn btn-xs btn-primary"
                                               @click="executeSuggestion(selectedAnalysis.id, es)"
-                                              :disabled="es._executing">
-                                        <span x-show="es._executing" class="loading loading-spinner loading-xs"></span>
-                                        <span x-show="!es._executing">Evolve</span>
+                                              :disabled="es._executing || isSuggestionExecuting(selectedAnalysis.id, es) || (es.kind === 'fix' && !es.target_skill)"
+                                              :title="(es.kind === 'fix' && !es.target_skill) ? 'FIX requires a target skill — analyzer did not name one' : ''">
+                                        <span x-show="es._executing || isSuggestionExecuting(selectedAnalysis.id, es)" class="loading loading-spinner loading-xs"></span>
+                                        <span x-show="!(es._executing || isSuggestionExecuting(selectedAnalysis.id, es))">Evolve</span>
                                       </button>
                                     </template>
                                   </td>
@@ -6225,9 +6239,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                 <template x-if="!row.executed_at">
                                   <button class="btn btn-xs btn-primary"
                                     @click="executeSuggestion(row._analysis.id, row)"
-                                    :disabled="row._executing">
-                                    <span x-show="row._executing" class="loading loading-spinner loading-xs"></span>
-                                    <span x-show="!row._executing">Evolve</span>
+                                    :disabled="row._executing || isSuggestionExecuting(row._analysis.id, row) || (row.kind === 'fix' && !row.target_skill)"
+                                    :title="(row.kind === 'fix' && !row.target_skill) ? 'FIX requires a target skill — analyzer did not name one' : ''">
+                                    <span x-show="row._executing || isSuggestionExecuting(row._analysis.id, row)" class="loading loading-spinner loading-xs"></span>
+                                    <span x-show="!(row._executing || isSuggestionExecuting(row._analysis.id, row))">Evolve</span>
                                   </button>
                                 </template>
                                 <button class="btn btn-xs btn-error" style="margin-left:4px"

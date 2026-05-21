@@ -81,6 +81,9 @@ async fn start_test_server_with_provider(
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
         evolve_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        evolve_execute_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        evolve_execute_tx: None,
+        evolve_execute_events: None,
     });
 
     let app = Router::new()
@@ -842,6 +845,9 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
         evolve_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        evolve_execute_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        evolve_execute_tx: None,
+        evolve_execute_events: None,
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();

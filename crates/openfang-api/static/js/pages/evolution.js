@@ -17,6 +17,11 @@ function evolutionPage() {
     progress: { current: 0, total: 0, lastSessionId: null, lastStatus: null },
     _evolveSource: null,
     _pollHandle: null,
+
+    // ── Evolve-execute queue ──
+    executeProgress: { running: false, current: 0, total: 0, succeeded: 0, failed: 0, queue: [], lastStatus: null, lastChangeSummary: null },
+    _executeSource: null,
+    _executePollHandle: null,
     saving: false,
     showConfig: false,
     selectedAnalysis: null,
@@ -55,7 +60,7 @@ function evolutionPage() {
       this.loading = true;
       this.loadError = '';
       try {
-        await Promise.all([this.loadConfig(), this.loadStats(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus()]);
+        await Promise.all([this.loadConfig(), this.loadStats(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus(), this.loadExecuteStatus()]);
         this.buildSkillClasses();
       } catch (e) {
         this.loadError = e.message || 'Failed to load evolution data.';
@@ -129,6 +134,133 @@ function evolutionPage() {
         } catch (_) { /* keep polling — transient network errors are fine */ }
       }, 1200);
     },
+    // ── Evolve-execute progress ──
+    // Hydrate the execute snapshot on mount so a reloading page resumes the
+    // progress card and badge updates without waiting for the SSE stream.
+    async loadExecuteStatus() {
+      try {
+        var s = await OpenFangAPI.get('/api/evolve/execute/status');
+        if (!s) return;
+        this._applyExecuteSnapshot(s);
+        if (s.running) {
+          this._startExecuteStream();
+          this._startExecutePolling();
+        }
+      } catch (_) { /* ignore — endpoint may be down */ }
+    },
+    _applyExecuteSnapshot(s) {
+      this.executeProgress.running = !!s.running;
+      this.executeProgress.current = s.current || 0;
+      this.executeProgress.total = s.total || 0;
+      this.executeProgress.succeeded = s.succeeded || 0;
+      this.executeProgress.failed = s.failed || 0;
+      this.executeProgress.queue = Array.isArray(s.queue) ? s.queue : [];
+      this.executeProgress.lastStatus = s.last_status || null;
+      this.executeProgress.lastChangeSummary = s.last_change_summary || null;
+    },
+    _startExecuteStream() {
+      if (this._executeSource) return;
+      var self = this;
+      var url = '/api/evolve/execute/stream';
+      var token = (typeof OpenFangAPI !== 'undefined' && OpenFangAPI.getToken) ? OpenFangAPI.getToken() : null;
+      if (token) url += '?token=' + encodeURIComponent(token);
+      try { this._executeSource = new EventSource(url); }
+      catch (e) { return; }
+      this._executeSource.onmessage = function(event) {
+        var ev; try { ev = JSON.parse(event.data); } catch (_) { return; }
+        if (ev.type === 'item') {
+          // Mutate the matching queue entry in-place so the card updates
+          // without a status fetch.
+          var key = (ev.analysis_id || '') + '|' + (ev.kind || '') + '|' + (ev.description || '');
+          var q = self.executeProgress.queue;
+          var found = false;
+          for (var i = 0; i < q.length; i++) {
+            var k = (q[i].analysis_id || '') + '|' + (q[i].kind || '') + '|' + (q[i].description || '');
+            if (k === key) {
+              q[i].status = ev.status;
+              q[i].failure_reason = ev.failure_reason || null;
+              q[i].change_summary = ev.change_summary || null;
+              found = true;
+              break;
+            }
+          }
+          if (!found && ev.status === 'queued') {
+            q.push({
+              analysis_id: ev.analysis_id || null,
+              kind: ev.kind,
+              description: ev.description,
+              target_skill: ev.target_skill || null,
+              status: ev.status,
+              failure_reason: null,
+              change_summary: null,
+            });
+            self.executeProgress.total = Math.max(self.executeProgress.total, q.length);
+          }
+          if (ev.status === 'running') {
+            self.executeProgress.current = Math.max(self.executeProgress.current, (ev.index || 0) + 1);
+            self.executeProgress.running = true;
+          }
+          if (ev.status === 'done' || ev.status === 'failed') {
+            // Refresh row badges (executed_at / failed_at) from the DB.
+            self.loadAnalyses().catch(function() {});
+          }
+        } else if (ev.type === 'completed') {
+          self.executeProgress.running = false;
+          self.executeProgress.succeeded = ev.succeeded || 0;
+          self.executeProgress.failed = ev.failed || 0;
+          var msg = 'Evolved ' + self.executeProgress.succeeded + '/' + self.executeProgress.total;
+          if (self.executeProgress.failed > 0) msg += ' (' + self.executeProgress.failed + ' failed)';
+          OpenFangToast.success(msg);
+          try { self._executeSource.close(); } catch (_) {}
+          self._executeSource = null;
+          if (self._executePollHandle) { clearInterval(self._executePollHandle); self._executePollHandle = null; }
+          Promise.all([self.loadSkillRecords(), self.loadStats(), self.loadAnalyses()])
+            .then(function() { self.buildSkillClasses(); })
+            .catch(function() {});
+        } else if (ev.type === 'error') {
+          OpenFangToast.error('Evolution stream error: ' + (ev.message || 'unknown'));
+        }
+      };
+      this._executeSource.onerror = function() {
+        // EventSource auto-retries; rely on poller to detect end-of-run.
+      };
+    },
+    _startExecutePolling() {
+      if (this._executePollHandle) return;
+      var self = this;
+      this._executePollHandle = setInterval(async function() {
+        try {
+          var s = await OpenFangAPI.get('/api/evolve/execute/status');
+          if (!s) return;
+          self._applyExecuteSnapshot(s);
+          if (!s.running) {
+            clearInterval(self._executePollHandle);
+            self._executePollHandle = null;
+            if (self._executeSource) { try { self._executeSource.close(); } catch (_) {} self._executeSource = null; }
+            try { await Promise.all([self.loadStats(), self.loadAnalyses(), self.loadSkillRecords()]); self.buildSkillClasses(); } catch (_) {}
+          }
+        } catch (_) {}
+      }, 1500);
+    },
+    // True if a suggestion row currently has work pending or running on the
+    // execute queue. Used by the row template to keep the spinner visible
+    // across reloads.
+    isSuggestionExecuting(analysisId, suggestion) {
+      var aid = analysisId || '';
+      var kind = (suggestion.kind || '').toLowerCase();
+      var desc = suggestion.description || '';
+      var q = this.executeProgress.queue || [];
+      for (var i = 0; i < q.length; i++) {
+        if ((q[i].analysis_id || '') === aid
+            && (q[i].kind || '') === kind
+            && (q[i].description || '') === desc
+            && (q[i].status === 'queued' || q[i].status === 'running')) {
+          return true;
+        }
+      }
+      return false;
+    },
+
     async loadModelOptions() {
       this.providersLoading = true;
       this.modelsLoading = true;
@@ -331,22 +463,43 @@ function evolutionPage() {
     executingAll: false,
 
     async executeSuggestion(analysisId, suggestion) {
+      // Optimistically mark local row; the SSE/poll updates take over once
+      // the server confirms the queued entry.
       suggestion._executing = true;
       try {
-        var data = await OpenFangAPI.post('/api/evolve/execute', {
+        await OpenFangAPI.post('/api/evolve/execute', {
           analysis_id: analysisId,
           kind: (suggestion.kind || 'fix').toLowerCase(),
           target_skill: suggestion.target_skill || null,
           description: suggestion.description || '',
           priority: suggestion.priority || 0
         });
-        OpenFangToast.success('Evolution complete: ' + (data.change_summary || 'success'));
-        await Promise.all([this.loadSkillRecords(), this.loadStats(), this.loadAnalyses()]);
-        this.buildSkillClasses();
+        // Seed the local queue so the progress card shows the new item even
+        // if the SSE 'queued' event hasn't arrived yet.
+        var key = (analysisId || '') + '|' + (suggestion.kind || '').toLowerCase() + '|' + (suggestion.description || '');
+        var q = this.executeProgress.queue;
+        var present = q.some(function(x) {
+          return ((x.analysis_id || '') + '|' + (x.kind || '') + '|' + (x.description || '')) === key;
+        });
+        if (!present) {
+          q.push({
+            analysis_id: analysisId || null,
+            kind: (suggestion.kind || '').toLowerCase(),
+            description: suggestion.description || '',
+            target_skill: suggestion.target_skill || null,
+            status: 'queued',
+            failure_reason: null,
+            change_summary: null,
+          });
+          this.executeProgress.total = Math.max(this.executeProgress.total, q.length);
+        }
+        this.executeProgress.running = true;
+        this._startExecuteStream();
+        this._startExecutePolling();
       } catch (e) {
-        OpenFangToast.error('Evolution failed: ' + (e.message || e));
+        suggestion._executing = false;
+        OpenFangToast.error('Evolution failed to queue: ' + (e.message || e));
       }
-      suggestion._executing = false;
     },
 
     async deleteSuggestion(analysisId, suggestion) {
@@ -372,13 +525,18 @@ function evolutionPage() {
         var data = await OpenFangAPI.post('/api/evolve/execute-all', {
           analysis_id: analysis.id
         });
-        var msg = 'Executed ' + (data.succeeded || 0) + '/' + (data.executed || 0) + ' evolutions';
-        if (data.failed > 0) msg += ' (' + data.failed + ' failed)';
-        OpenFangToast.success(msg);
-        await Promise.all([this.loadSkillRecords(), this.loadStats(), this.loadAnalyses()]);
-        this.buildSkillClasses();
+        OpenFangToast.success('Queued ' + (data.queued || 0) + ' evolutions');
+        this.executeProgress.running = true;
+        // Refresh snapshot so the queue list is fully populated before SSE
+        // starts firing item-level events.
+        try {
+          var s = await OpenFangAPI.get('/api/evolve/execute/status');
+          if (s) this._applyExecuteSnapshot(s);
+        } catch (_) {}
+        this._startExecuteStream();
+        this._startExecutePolling();
       } catch (e) {
-        OpenFangToast.error('Batch evolution failed: ' + (e.message || e));
+        OpenFangToast.error('Batch evolution failed to queue: ' + (e.message || e));
       }
       this.executingAll = false;
     },

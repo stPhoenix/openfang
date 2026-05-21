@@ -217,6 +217,10 @@ pub struct OpenFangKernel {
     active_loops: dashmap::DashSet<AgentId>,
     /// Execution evolution analyzer engine.
     pub evolve_engine: openfang_evolve::EvolveEngine,
+    /// Serializes calls to `execute_evolution`. There is exactly one shared
+    /// evolver agent — without this, concurrent callers race on
+    /// `reset_session(evolver_id)` and corrupt each other's session mid-loop.
+    evolver_exec_lock: Arc<tokio::sync::Mutex<()>>,
     /// Bounded LRU cache of completed async delegation outcomes.
     /// Written by the `delegate_async` background task; read by
     /// `await_delegations` to avoid the subscribe-after-event race.
@@ -1344,6 +1348,7 @@ impl OpenFangKernel {
             agent_msg_locks: dashmap::DashMap::new(),
             active_loops: dashmap::DashSet::new(),
             evolve_engine,
+            evolver_exec_lock: Arc::new(tokio::sync::Mutex::new(())),
             delegation_outcomes: Arc::new(tokio::sync::RwLock::new(lru::LruCache::new(
                 NonZeroUsize::new(1024).expect("1024 != 0"),
             ))),
@@ -2257,6 +2262,73 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
+        self.send_message_streaming_inner(
+            agent_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            sender_role,
+            content_blocks,
+            thinking_override,
+            already_persisted,
+            None,
+        )
+    }
+
+    /// Streaming variant that lets the caller pin the run to a specific
+    /// session id (e.g. A2A `tasks/sendSubscribe` derives a per-task session
+    /// UUID for isolation, mirroring `send_message_with_session`).
+    /// When `session_override` is `None` this behaves identically to
+    /// `send_message_streaming` and uses the agent's default session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_message_streaming_with_session(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        thinking_override: Option<openfang_types::config::ThinkingConfig>,
+        already_persisted: bool,
+        session_override: openfang_types::agent::SessionId,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        self.send_message_streaming_inner(
+            agent_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            sender_role,
+            content_blocks,
+            thinking_override,
+            already_persisted,
+            Some(session_override),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_message_streaming_inner(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        sender_role: Option<openfang_types::sender::SenderRole>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        thinking_override: Option<openfang_types::config::ThinkingConfig>,
+        already_persisted: bool,
+        session_override: Option<openfang_types::agent::SessionId>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
         // Enforce quota before spawning the streaming task
         self.scheduler
             .check_quota(agent_id)
@@ -2265,6 +2337,7 @@ impl OpenFangKernel {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        let active_session_id = session_override.unwrap_or(entry.session_id);
 
         let is_wasm = entry.manifest.module.starts_with("wasm:");
         let is_python = entry.manifest.module.starts_with("python:");
@@ -2323,10 +2396,10 @@ impl OpenFangKernel {
         // LLM agent: true streaming via agent loop
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(active_session_id)
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: active_session_id,
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -7487,6 +7560,13 @@ impl OpenFangKernel {
         if !self.evolve_engine.is_enabled() {
             return Err(openfang_evolve::EvolveError::NotEnabled);
         }
+
+        // Serialize concurrent evolutions: one shared evolver agent means
+        // overlapping `reset_session` + `send_message` loops would corrupt
+        // each other's session. Holding this lock across the whole pipeline
+        // (reset + LLM loop + persistence) makes execution safe regardless of
+        // entry point (API queue, cron, manual).
+        let _exec_guard = self.evolver_exec_lock.lock().await;
 
         // Materialize any bundled skills so the evolver has real files on disk.
         self.materialize_bundled_targets(std::slice::from_mut(&mut context));
