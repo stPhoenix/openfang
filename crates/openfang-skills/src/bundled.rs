@@ -1,6 +1,6 @@
 //! Bundled skills — compile-time embedded SKILL.md files.
 //!
-//! Ships 60 prompt-only skills inside the OpenFang binary via `include_str!()`.
+//! Ships 64 prompt-only skills inside the OpenFang binary via `include_str!()`.
 //! User-installed skills with the same name override bundled ones.
 
 use crate::openclaw_compat::convert_skillmd_str;
@@ -180,6 +180,22 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
             "wasm-expert",
             include_str!("../bundled/wasm-expert/SKILL.md"),
         ),
+        // Hand procedures — operating procedures extracted from bundled hands
+        // so the evolution engine can mutate them via SkillRegistry. The
+        // matching hand stub system prompt loads its procedure via ToolSearch
+        // + zero-arg procedure tool. See crates/openfang-hands/bundled/<hand>/HAND.toml.
+        (
+            "demiurg-procedure",
+            include_str!("../bundled/demiurg-procedure/SKILL.md"),
+        ),
+        (
+            "youtube-extract-procedure",
+            include_str!("../bundled/youtube-extract-procedure/SKILL.md"),
+        ),
+        (
+            "pro-researcher-procedure",
+            include_str!("../bundled/pro-researcher-procedure/SKILL.md"),
+        ),
     ]
 }
 
@@ -213,7 +229,7 @@ mod tests {
     #[test]
     fn test_bundled_skills_count() {
         let skills = bundled_skills();
-        assert_eq!(skills.len(), 61, "Expected 61 bundled skills");
+        assert_eq!(skills.len(), 64, "Expected 64 bundled skills");
     }
 
     #[test]
@@ -282,6 +298,49 @@ mod tests {
 
         // Non-existent skill
         assert!(get_bundled_content("nonexistent-skill-xyz").is_none());
+    }
+
+    #[test]
+    fn test_pro_researcher_procedure_skill_has_required_phases() {
+        // Coverage of the verbose phase content for the pro-researcher hand —
+        // the assertions used to live in openfang-hands/src/bundled.rs against
+        // `def.agent.system_prompt`. After the migration the content lives in
+        // this bundled skill instead, so the same assertions now run here.
+        let content = get_bundled_content("pro-researcher-procedure")
+            .expect("pro-researcher-procedure must be a bundled skill");
+        assert!(content.contains("Phase 1.5"), "missing goal extraction phase");
+        assert!(content.contains("required_coverage.md"));
+        assert!(content.contains("Phase 6.5a"), "missing citation chase");
+        assert!(content.contains("Phase 6.5b"), "missing integrator phase");
+        assert!(content.contains("Phase 7.0"), "missing coverage gate");
+        assert!(content.contains("Phase 7.1"), "missing source-quality floor");
+        assert!(content.contains("Phase 7.2"), "missing fabrication check");
+        assert!(content.contains("<DENIED_HOSTS>"), "deny list must be templated");
+        assert!(content.contains("integrator"));
+        assert!(content.contains("verifier"));
+        assert!(content.contains("fabrication_check.md"));
+        assert!(content.contains("narrative.md"));
+    }
+
+    #[test]
+    fn test_demiurg_procedure_skill_has_required_sections() {
+        let content = get_bundled_content("demiurg-procedure")
+            .expect("demiurg-procedure must be a bundled skill");
+        assert!(content.contains("Phase 0"), "missing bootstrap phase");
+        assert!(content.contains("Phase 7"), "missing return/cleanup phase");
+        assert!(content.contains("agent_delegate"));
+        assert!(content.contains("auto_kill_spawned"));
+        assert!(content.contains("classifier"));
+    }
+
+    #[test]
+    fn test_youtube_extract_procedure_skill_has_required_sections() {
+        let content = get_bundled_content("youtube-extract-procedure")
+            .expect("youtube-extract-procedure must be a bundled skill");
+        assert!(content.contains("yt-dlp"));
+        assert!(content.contains("transcript"));
+        assert!(content.contains("summary_style"));
+        assert!(content.contains("Phase 4"), "missing subtitle fetch phase");
     }
 
     #[test]

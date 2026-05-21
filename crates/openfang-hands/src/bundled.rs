@@ -33,7 +33,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "pro-researcher",
             include_str!("../bundled/pro-researcher/HAND.toml"),
-            include_str!("../bundled/pro-researcher/SKILL.md"),
+            // SKILL.md content moved to the `pro-researcher-procedure` skill in
+            // openfang-skills/bundled/. The hand stub system_prompt instructs
+            // the agent to load it via ToolSearch + procedure-skill call so the
+            // evolution engine can mutate the procedure.
+            "",
         ),
         (
             "twitter",
@@ -58,12 +62,16 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "demiurg",
             include_str!("../bundled/demiurg/HAND.toml"),
-            include_str!("../bundled/demiurg/SKILL.md"),
+            // SKILL.md content moved to the `demiurg-procedure` skill in
+            // openfang-skills/bundled/. See pro-researcher above for the
+            // rationale.
+            "",
         ),
         (
             "youtube-extract",
             include_str!("../bundled/youtube-extract/HAND.toml"),
-            include_str!("../bundled/youtube-extract/SKILL.md"),
+            // SKILL.md content moved to the `youtube-extract-procedure` skill.
+            "",
         ),
     ]
 }
@@ -109,7 +117,17 @@ mod tests {
         assert_eq!(def.id, "demiurg");
         assert_eq!(def.name, "Demiurg Orchestrator Hand");
         assert_eq!(def.category, crate::HandCategory::Productivity);
-        assert!(def.skill_content.is_some());
+        // SKILL.md content was moved to the `demiurg-procedure` bundled skill;
+        // the hand's stub system_prompt loads it via ToolSearch + zero-arg call.
+        assert!(def.skill_content.is_none());
+        assert!(
+            def.skills.iter().any(|s| s == "demiurg-procedure"),
+            "demiurg must allowlist its procedure skill"
+        );
+        let prompt = &def.agent.system_prompt;
+        assert!(prompt.contains("demiurg-procedure"));
+        assert!(prompt.contains("ToolSearch"));
+        assert!(prompt.contains("FIRST turn"));
         // Demiurg orchestrates — must NOT have domain-execution tools.
         assert!(!def.tools.contains(&"web_search".to_string()));
         assert!(!def.tools.contains(&"web_fetch".to_string()));
@@ -157,7 +175,13 @@ mod tests {
         assert_eq!(def.id, "pro-researcher");
         assert_eq!(def.name, "Pro Researcher Hand");
         assert_eq!(def.category, crate::HandCategory::Productivity);
-        assert!(def.skill_content.is_some());
+        // SKILL.md content was moved to the `pro-researcher-procedure` bundled
+        // skill; the hand's stub system_prompt loads it via ToolSearch.
+        assert!(def.skill_content.is_none());
+        assert!(
+            def.skills.iter().any(|s| s == "pro-researcher-procedure"),
+            "pro-researcher must allowlist its procedure skill"
+        );
         // yt-dlp binary is required so the yt-extractor subagent can pull
         // YouTube captions when search results include a YouTube URL.
         assert!(def.requires.iter().any(|r| r.check_value == "yt-dlp"));
@@ -220,20 +244,14 @@ mod tests {
             .find(|s| s.key == "max_total_input_tokens")
             .expect("pro-researcher must expose max_total_input_tokens setting");
         assert_eq!(max_tokens_setting.default, "1500000");
-        // Quality-upgrade phases present in the system prompt.
+        // Stub system_prompt: must direct the agent to load the procedure skill.
         let prompt = &def.agent.system_prompt;
-        assert!(prompt.contains("Phase 1.5"), "missing goal extraction phase");
-        assert!(prompt.contains("required_coverage.md"));
-        assert!(prompt.contains("Phase 6.5a"), "missing citation chase");
-        assert!(prompt.contains("Phase 6.5b"), "missing integrator phase");
-        assert!(prompt.contains("Phase 7.0"), "missing coverage gate");
-        assert!(prompt.contains("Phase 7.1"), "missing source-quality floor");
-        assert!(prompt.contains("Phase 7.2"), "missing fabrication check");
-        assert!(prompt.contains("<DENIED_HOSTS>"), "deny list must be templated");
-        assert!(prompt.contains("integrator"));
-        assert!(prompt.contains("verifier"));
-        assert!(prompt.contains("fabrication_check.md"));
-        assert!(prompt.contains("narrative.md"));
+        assert!(prompt.contains("pro-researcher-procedure"));
+        assert!(prompt.contains("ToolSearch"));
+        assert!(prompt.contains("FIRST turn"));
+        // Quality-upgrade phases moved into pro-researcher-procedure skill —
+        // see test_pro_researcher_procedure_skill_has_required_phases in
+        // crates/openfang-skills/src/bundled.rs.
         // Dashboard wired.
         assert!(!def.dashboard.metrics.is_empty());
         let metric_keys: Vec<&str> = def
@@ -398,6 +416,11 @@ mod tests {
 
     #[test]
     fn all_bundled_hands_parse() {
+        // These hands moved their SKILL.md content into a matching bundled
+        // skill (`<hand>-procedure`) in openfang-skills/. They have no inline
+        // skill_content; their stub system_prompt loads the procedure via
+        // ToolSearch + zero-arg call.
+        let hands_without_inline_skill = ["demiurg", "youtube-extract", "pro-researcher"];
         for (id, toml_content, skill_content) in bundled_hands() {
             let def = parse_bundled(id, toml_content, skill_content)
                 .unwrap_or_else(|e| panic!("Failed to parse hand '{}': {}", id, e));
@@ -405,7 +428,19 @@ mod tests {
             assert!(!def.name.is_empty());
             assert!(!def.tools.is_empty());
             assert!(!def.agent.system_prompt.is_empty());
-            assert!(def.skill_content.is_some());
+            if hands_without_inline_skill.contains(&id) {
+                assert!(
+                    def.skill_content.is_none(),
+                    "hand '{}' should NOT carry inline skill_content — its procedure lives in the skill registry",
+                    id
+                );
+            } else {
+                assert!(
+                    def.skill_content.is_some(),
+                    "hand '{}' must carry inline skill_content",
+                    id
+                );
+            }
         }
     }
 
@@ -598,7 +633,16 @@ mod tests {
         assert_eq!(def.id, "youtube-extract");
         assert_eq!(def.name, "YouTube Extract Hand");
         assert_eq!(def.category, crate::HandCategory::Content);
-        assert!(def.skill_content.is_some());
+        // SKILL.md content was moved to the `youtube-extract-procedure` skill.
+        assert!(def.skill_content.is_none());
+        assert!(
+            def.skills.iter().any(|s| s == "youtube-extract-procedure"),
+            "youtube-extract must allowlist its procedure skill"
+        );
+        let prompt = &def.agent.system_prompt;
+        assert!(prompt.contains("youtube-extract-procedure"));
+        assert!(prompt.contains("ToolSearch"));
+        assert!(prompt.contains("FIRST turn"));
         // Single yt-dlp binary requirement
         assert_eq!(def.requires.len(), 1);
         assert_eq!(def.requires[0].key, "yt-dlp");
