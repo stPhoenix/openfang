@@ -2651,14 +2651,15 @@
           <div x-show="tab === 'installed'">
             <div class="card-grid" x-show="skills.length">
               <template x-for="skill in skills" :key="skill.name">
-                <div class="card">
+                <div @click="showInstalledDetail(skill.name)" class="card" style="cursor:pointer">
                   <div class="flex justify-between items-center mb-2">
                     <div class="flex items-center gap-2">
                       <div class="card-header" style="margin:0" x-text="skill.name"></div>
                       <span class="runtime-badge" :class="runtimeBadge(skill.runtime).cls" x-text="runtimeBadge(skill.runtime).text"></span>
                       <span class="badge" :class="sourceBadge(skill.source).cls" x-text="sourceBadge(skill.source).text" style="font-size:0.65rem"></span>
                     </div>
-                    <div class="toggle" :class="{ active: skill.enabled }" @click="skill.enabled = !skill.enabled"></div>
+                    <div :class="{ active: skill.enabled }" @click.stop="skill.enabled = !skill.enabled"
+                         class="toggle"></div>
                   </div>
                   <div class="card-meta" x-text="skill.description"></div>
                   <div class="flex justify-between items-center mt-2">
@@ -2669,8 +2670,10 @@
                       <span class="text-xs text-dim" x-show="skill.config_declared_count > 0" x-text="skill.config_declared_count + ' config var(s)'"></span>
                     </div>
                     <div class="flex gap-2">
-                      <button class="btn btn-ghost btn-sm" x-show="skill.config_declared_count > 0" @click="openSkillConfig(skill)" title="Configure skill variables">&#9881; Configure</button>
-                      <button class="btn btn-danger btn-sm" @click="uninstallSkill(skill.name)">Uninstall</button>
+                      <button @click.stop="openSkillConfig(skill)" class="btn btn-ghost btn-sm"
+                              title="Configure skill variables" x-show="skill.config_declared_count > 0">&#9881; Configure
+                      </button>
+                      <button @click.stop="uninstallSkill(skill.name)" class="btn btn-danger btn-sm">Uninstall</button>
                     </div>
                   </div>
                 </div>
@@ -2944,6 +2947,84 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               </div>
             </div>
           </template>
+
+            <!-- Installed Skill Detail Modal (prompt + file list) -->
+            <template x-if="installedDetail || installedDetailLoading">
+              <div @click.self="closeInstalledDetail()" @keydown.escape.window="closeInstalledDetail()"
+                   class="modal-overlay">
+                <div class="modal" style="max-width:760px">
+                  <div class="loading-state" style="padding:40px 0" x-show="installedDetailLoading">
+                    <div class="spinner"></div>
+                    <span>Loading skill&hellip;</span></div>
+                  <template x-if="installedDetail">
+                    <div>
+                      <div class="modal-header">
+                        <h3 x-text="installedDetail.name"></h3>
+                        <button @click="closeInstalledDetail()" class="modal-close">
+                          <svg fill="none" height="18" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"
+                               stroke-width="2" viewBox="0 0 24 24" width="18">
+                            <line x1="18" x2="6" y1="6" y2="18"></line>
+                            <line x1="6" x2="18" y1="6" y2="18"></line>
+                          </svg>
+                        </button>
+                      </div>
+                      <div class="mb-3 flex gap-2 items-center flex-wrap">
+                        <span :class="runtimeBadge(installedDetail.runtime).cls" class="runtime-badge"
+                              x-text="runtimeBadge(installedDetail.runtime).text"></span>
+                        <span :class="sourceBadge(installedDetail.source).cls" class="badge"
+                              style="font-size:0.65rem" x-text="sourceBadge(installedDetail.source).text"></span>
+                        <span class="text-xs text-dim" x-show="installedDetail.version"
+                              x-text="'v' + installedDetail.version"></span>
+                        <span class="text-xs text-dim" x-show="installedDetail.author"
+                              x-text="'by ' + installedDetail.author"></span>
+                      </div>
+                      <p class="mb-3" x-show="installedDetail.description" x-text="installedDetail.description"></p>
+
+                      <div class="form-group" style="margin-bottom:6px"><label>Prompt (SKILL.md)</label></div>
+                      <pre style="margin:0 0 12px 0;padding:12px;font-size:12px;line-height:1.5;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;border:1px solid var(--border);border-radius:8px;background:var(--bg-inset)"
+                           x-text="installedDetail.prompt || '(empty)'"></pre>
+
+                      <div class="form-group" style="margin-bottom:6px"><label
+                              x-text="'Files (' + (installedDetail.files ? installedDetail.files.length : 0) + (installedDetail.truncated ? ', truncated' : '') + ')'"></label>
+                      </div>
+                      <div style="max-height:200px;overflow:auto;border:1px solid var(--border);border-radius:8px">
+                        <template :key="f.path" x-for="f in installedDetail.files">
+                          <div @click="viewInstalledFile(f.path)"
+                               class="flex justify-between items-center"
+                               style="padding:6px 12px;border-bottom:1px solid var(--border);cursor:pointer">
+                            <span class="text-sm" x-text="f.path"></span>
+                            <span class="text-xs text-dim" x-text="f.size + ' B'"></span>
+                          </div>
+                        </template>
+                      </div>
+
+                      <div class="loading-state mt-3" x-show="installedFileLoading">
+                        <div class="spinner"></div>
+                        <span>Loading file&hellip;</span></div>
+                      <div class="error-state mt-3" x-show="installedFileError"><span class="error-icon">!</span>
+                        <p x-text="installedFileError"></p></div>
+                      <div class="mt-3" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-inset)" x-show="installedFile"
+                           x-transition>
+                        <div class="flex justify-between items-center"
+                             style="padding:6px 12px;border-bottom:1px solid var(--border)">
+                          <span class="text-xs text-dim" x-text="installedFile && installedFile.path"></span>
+                          <button @click="installedFile = null" class="btn btn-ghost btn-sm">Close file</button>
+                        </div>
+                        <template x-if="installedFile && installedFile.binary">
+                          <div class="text-xs text-dim" style="padding:12px">Binary file &mdash; preview unavailable
+                            (<span x-text="installedFile.size + ' B'"></span>)
+                          </div>
+                        </template>
+                        <template x-if="installedFile && !installedFile.binary">
+                          <pre style="margin:0;padding:12px;font-size:12px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word"
+                               x-text="installedFile.content"></pre>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
 
           <!-- Skill Config Modal (SKILL.md frontmatter `config:` variables) -->
           <template x-if="configSkill">

@@ -462,6 +462,14 @@ pub async fn build_router(
             axum::routing::delete(routes::delete_skill_config_var),
         )
         .route(
+            "/api/skills/{id}/detail",
+            axum::routing::get(routes::get_skill_detail),
+        )
+        .route(
+            "/api/skills/{id}/file",
+            axum::routing::get(routes::get_skill_file),
+        )
+        .route(
             "/api/marketplace/search",
             axum::routing::get(routes::marketplace_search),
         )

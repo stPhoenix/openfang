@@ -3849,6 +3849,348 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(serde_json::json!({ "skills": skills, "total": skills.len() }))
 }
 
+/// Convert a `SkillSource` to a JSON tag matching the shape used by `list_skills`.
+fn skill_source_json(src: &Option<openfang_skills::SkillSource>) -> serde_json::Value {
+    match src {
+        Some(openfang_skills::SkillSource::ClawHub { slug, version }) => {
+            serde_json::json!({"type": "clawhub", "slug": slug, "version": version})
+        }
+        Some(openfang_skills::SkillSource::OpenClaw) => serde_json::json!({"type": "openclaw"}),
+        Some(openfang_skills::SkillSource::Bundled) => serde_json::json!({"type": "bundled"}),
+        Some(openfang_skills::SkillSource::Evolution { parents }) => {
+            serde_json::json!({"type": "evolution", "parents": parents})
+        }
+        Some(openfang_skills::SkillSource::Native) | None => serde_json::json!({"type": "local"}),
+    }
+}
+
+/// Snapshot returned by `read_or_materialize_skill` — minimum needed to walk the FS.
+struct SkillFsSnapshot {
+    path: std::path::PathBuf,
+    name: String,
+    version: String,
+    description: String,
+    author: String,
+    runtime: String,
+    source: serde_json::Value,
+}
+
+/// Look up a skill on the kernel registry. If it's bundled (path == `<bundled>`),
+/// materialize it to disk so the directory is readable. Returns a snapshot or
+/// `None` if the skill does not exist; second tuple element is an error string
+/// when materialization fails.
+fn read_or_materialize_skill(
+    state: &AppState,
+    name: &str,
+) -> Result<Option<SkillFsSnapshot>, String> {
+    let bundled_sentinel = std::path::Path::new("<bundled>");
+    {
+        let mut reg = state
+            .kernel
+            .skill_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let needs_materialize = match reg.get(name) {
+            None => return Ok(None),
+            Some(s) => s.path == bundled_sentinel,
+        };
+        if needs_materialize {
+            reg.materialize_bundled(name)
+                .map_err(|e| format!("Failed to materialize bundled skill: {e}"))?;
+        }
+    }
+    let reg = state
+        .kernel
+        .skill_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let s = match reg.get(name) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    Ok(Some(SkillFsSnapshot {
+        path: s.path.clone(),
+        name: s.manifest.skill.name.clone(),
+        version: s.manifest.skill.version.clone(),
+        description: s.manifest.skill.description.clone(),
+        author: s.manifest.skill.author.clone(),
+        runtime: format!("{:?}", s.manifest.runtime.runtime_type),
+        source: skill_source_json(&s.manifest.source),
+    }))
+}
+
+/// Walk a skill directory, returning relative paths with sizes. Bounded by
+/// `max_depth` and `max_entries` to keep responses cheap. Relative paths use
+/// `/` separators regardless of platform. Returns `(files, truncated)`.
+fn walk_skill_dir(
+    base: &std::path::Path,
+    max_depth: usize,
+    max_entries: usize,
+) -> std::io::Result<(Vec<(String, u64)>, bool)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
+    let mut truncated = false;
+    while let Some((dir, depth)) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                if depth + 1 < max_depth {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let rel = match path.strip_prefix(base) {
+                Ok(r) => r.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
+                Err(_) => continue,
+            };
+            out.push((rel, meta.len()));
+            if out.len() >= max_entries {
+                truncated = true;
+                return Ok((out, truncated));
+            }
+        }
+    }
+    Ok((out, truncated))
+}
+
+/// GET /api/skills/{id}/detail — Manifest summary, SKILL.md text, and file list.
+///
+/// Used by the Skills tab to render a click-through detail modal for installed
+/// skills. Bundled skills (path sentinel `<bundled>`) are materialized to disk
+/// on first view so the file list always reflects on-disk content.
+pub async fn get_skill_detail(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+) -> impl IntoResponse {
+    let snap = match read_or_materialize_skill(&state, &skill_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            );
+        }
+    };
+
+    let (mut files, truncated) = match walk_skill_dir(&snap.path, 4, 500) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to read skill directory: {e}")
+                })),
+            );
+        }
+    };
+
+    // Sort: SKILL.md first, skill.toml / prompt_context.md next, then alphabetical.
+    fn rank(name: &str) -> u8 {
+        match name {
+            "SKILL.md" => 0,
+            "skill.toml" => 1,
+            "prompt_context.md" => 2,
+            _ => 3,
+        }
+    }
+    files.sort_by(|a, b| {
+        rank(&a.0)
+            .cmp(&rank(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let prompt = std::fs::read_to_string(snap.path.join("SKILL.md")).unwrap_or_default();
+    let files_json: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(p, sz)| {
+            serde_json::json!({
+                "path": p,
+                "size": sz,
+                "is_prompt": p == "SKILL.md",
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": snap.name,
+            "version": snap.version,
+            "description": snap.description,
+            "author": snap.author,
+            "runtime": snap.runtime,
+            "source": snap.source,
+            "path": snap.path.display().to_string(),
+            "prompt": prompt,
+            "prompt_filename": "SKILL.md",
+            "files": files_json,
+            "truncated": truncated,
+        })),
+    )
+}
+
+/// GET /api/skills/{id}/file?path=<relpath> — Single file contents from a skill directory.
+///
+/// Enforces path-traversal safety: rejects `..`, absolute paths, null bytes;
+/// canonicalizes both sides and requires the target to remain under the skill
+/// directory. Files >2 MiB are refused. Binary files return `binary: true`
+/// with a null `content` so the UI can show a placeholder instead of garbage.
+pub async fn get_skill_file(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let rel = match params.get("path") {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'path' query parameter"})),
+            );
+        }
+    };
+
+    if rel.contains('\0') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Path contains null byte"})),
+        );
+    }
+    let rel_path = std::path::Path::new(&rel);
+    if rel_path.is_absolute() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Absolute paths are not allowed"})),
+        );
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Path escapes skill directory"})),
+        );
+    }
+
+    let snap = match read_or_materialize_skill(&state, &skill_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            );
+        }
+    };
+
+    let base = match std::fs::canonicalize(&snap.path) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Skill directory missing on disk"})),
+            );
+        }
+    };
+    let candidate = base.join(rel_path);
+    let target = match std::fs::canonicalize(&candidate) {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "File not found"})),
+            );
+        }
+    };
+    if !target.starts_with(&base) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Path escapes skill directory"})),
+        );
+    }
+
+    let meta = match std::fs::metadata(&target) {
+        Ok(m) => m,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "File not found"})),
+            );
+        }
+    };
+    if !meta.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Not a regular file"})),
+        );
+    }
+    const MAX_SIZE: u64 = 2 * 1024 * 1024;
+    if meta.len() > MAX_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "File too large",
+                "size": meta.len(),
+                "max": MAX_SIZE,
+            })),
+        );
+    }
+
+    let bytes = match std::fs::read(&target) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to read file: {e}")})),
+            );
+        }
+    };
+    let size = bytes.len() as u64;
+    match String::from_utf8(bytes) {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": rel,
+                "content": content,
+                "binary": false,
+                "size": size,
+            })),
+        ),
+        Err(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": rel,
+                "content": serde_json::Value::Null,
+                "binary": true,
+                "size": size,
+            })),
+        ),
+    }
+}
+
 /// POST /api/skills/install — Install a skill from FangHub (GitHub).
 pub async fn install_skill(
     State(state): State<Arc<AppState>>,

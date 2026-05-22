@@ -30,7 +30,14 @@ function skillsPage() {
     skillCodeFilename: '',
     skillCodeLoading: false,
 
-    // Skill config modal (local skill configuration from SKILL.md frontmatter)
+      // Installed skill detail modal (separate from ClawHub modal)
+      installedDetail: null,
+      installedDetailLoading: false,
+      installedFile: null,
+      installedFileLoading: false,
+      installedFileError: '',
+
+      // Skill config modal (local skill configuration from SKILL.md frontmatter)
     configSkill: null,          // skill object whose config is being edited
     configDeclared: {},         // { var_name: { description, env, default, required } }
     configResolved: {},         // { var_name: { value, source, is_secret } }
@@ -385,7 +392,44 @@ function skillsPage() {
       this.skillCodeFilename = '';
     },
 
-    async viewSkillCode(slug) {
+      // Installed-skill detail (prompt + file list).
+      async showInstalledDetail(name) {
+          this.installedDetailLoading = true;
+          this.installedDetail = null;
+          this.installedFile = null;
+          this.installedFileError = '';
+          try {
+              var data = await OpenFangAPI.get('/api/skills/' + encodeURIComponent(name) + '/detail');
+              this.installedDetail = data;
+          } catch (e) {
+              OpenFangToast.error('Failed to load skill detail');
+          }
+          this.installedDetailLoading = false;
+      },
+
+      closeInstalledDetail() {
+          this.installedDetail = null;
+          this.installedFile = null;
+          this.installedFileError = '';
+      },
+
+      async viewInstalledFile(relPath) {
+          if (!this.installedDetail) return;
+          this.installedFileLoading = true;
+          this.installedFile = null;
+          this.installedFileError = '';
+          try {
+              var url = '/api/skills/' + encodeURIComponent(this.installedDetail.name)
+                  + '/file?path=' + encodeURIComponent(relPath);
+              var data = await OpenFangAPI.get(url);
+              this.installedFile = data;
+          } catch (e) {
+              this.installedFileError = (e && e.message) || 'Failed to load file';
+          }
+          this.installedFileLoading = false;
+      },
+
+      async viewSkillCode(slug) {
       if (this.showSkillCode) {
         this.showSkillCode = false;
         return;
