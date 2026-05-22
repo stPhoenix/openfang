@@ -447,3 +447,53 @@ def test_a2a_send_task_subscribe_cancel_midstream(base_url: str) -> None:
         status_obj = body.get("status")
         poll_state = status_obj.get("state") if isinstance(status_obj, dict) else status_obj
         assert poll_state == state, (poll_state, state)
+
+
+# ── Evolve batch-apply (dedup + scheduled apply pipeline) ─────────────────────
+
+
+def test_evolve_batch_apply_routes_registered(client: httpx.Client) -> None:
+    """POST /api/evolve/batch-apply/run + GET .../preview must be wired in server.rs."""
+    # Engine usually disabled in test env → endpoint should respond with 400,
+    # NOT 404. 404 would mean the route isn't registered at all.
+    r = client.post("/api/evolve/batch-apply/run", json={})
+    assert r.status_code != 404, f"batch-apply/run route missing: {r.status_code} {r.text[:200]}"
+    r = client.get("/api/evolve/batch-apply/preview")
+    assert r.status_code != 404, f"batch-apply/preview route missing: {r.status_code} {r.text[:200]}"
+
+
+def test_evolve_config_accepts_schedules(client: httpx.Client) -> None:
+    """PUT /api/evolve/config with analyze_schedule + apply_schedule must round-trip
+    via /config GET and create matching cron jobs."""
+    cur = client.get("/api/evolve/config")
+    assert cur.status_code == 200, cur.text[:300]
+    body = cur.json()
+    body["analyze_schedule"] = {"kind": "cron", "expr": "*/15 * * * *", "tz": None}
+    body["apply_schedule"] = {"kind": "cron", "expr": "0 6 * * *", "tz": None}
+    body["dedup_enabled"] = True
+    body["apply_max_per_run"] = 7
+
+    r = client.put("/api/evolve/config", json=body)
+    assert r.status_code == 200, f"PUT config failed: {r.status_code} {r.text[:300]}"
+
+    after = client.get("/api/evolve/config").json()
+    assert after.get("dedup_enabled") is True
+    assert after.get("apply_max_per_run") == 7
+    assert after.get("analyze_schedule", {}).get("expr") == "*/15 * * * *"
+    assert after.get("apply_schedule", {}).get("expr") == "0 6 * * *"
+
+    jobs = client.get("/api/cron/jobs").json()
+    items = jobs if isinstance(jobs, list) else jobs.get("jobs", [])
+    names = {j.get("name") for j in items}
+    assert "evolve analyze sessions" in names, f"analyze cron not synced; got {names}"
+    assert "evolve batch apply" in names, f"batch-apply cron not synced; got {names}"
+
+
+def test_dashboard_wires_batch_apply(client: httpx.Client) -> None:
+    """Dashboard SPA must reference the new batch-apply UI bindings so the page
+    renders the controls when evolution.js mounts."""
+    r = client.get("/")
+    assert r.status_code == 200, r.status_code
+    html = r.text
+    for token in ("batchApply", "analyzeCronExpr", "applyCronExpr", "previewBatchApply"):
+        assert token in html, f"dashboard markup missing '{token}'"

@@ -172,6 +172,42 @@ th {
   white-space: nowrap;
 }
 
+.sortable-th {
+    cursor: pointer;
+    user-select: none;
+}
+
+.sortable-th:hover {
+    background: var(--surface2, var(--surface));
+    color: var(--text);
+}
+
+.sort-indicator {
+    margin-left: 4px;
+    font-size: 9px;
+    opacity: 0.7;
+}
+
+.pagination-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.bulk-action-bar {
+    background: var(--surface3);
+    padding: 8px 12px;
+    border-radius: var(--radius-md, 6px);
+    margin-bottom: 8px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+}
+
 td {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
@@ -180,6 +216,24 @@ td {
 
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--surface2); }
+
+tr.active-row td {
+    background: var(--surface2);
+}
+
+tr.analysis-detail-row td {
+    background: var(--surface1);
+    padding: 0;
+    border-bottom: 1px solid var(--border);
+}
+
+tr.analysis-detail-row:hover td {
+    background: var(--surface1);
+}
+
+.analysis-detail-content {
+    padding: 16px;
+}
 
 /* Forms */
 .form-group {
@@ -2522,8 +2576,46 @@ mark.search-highlight {
 .message-file-link:hover { border-color: var(--accent); color: var(--text); }
 
 /* ── Setup Checklist Progress Bar ── */
-.progress-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.progress-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+    position: relative;
+}
 .progress-bar-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width 0.3s ease; }
+
+/* Indeterminate variant: a thin pill slides back and forth across the track. */
+.progress-bar-indeterminate {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+}
+
+.progress-bar-indeterminate::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 30%;
+    border-radius: 3px;
+    background: var(--accent);
+    animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+    0% {
+        left: -30%;
+    }
+    50% {
+        left: 50%;
+    }
+    100% {
+        left: 100%;
+    }
+}
 
 /* ── Tool Badge ── */
 .tool-badge { font-size: 10px; padding: 2px 6px; border-radius: 3px; background: var(--surface2); color: var(--text-dim); display: inline-block; margin: 1px; }

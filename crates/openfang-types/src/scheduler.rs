@@ -141,6 +141,8 @@ pub enum CronAction {
     EvolveCanaryCheck,
     /// Remove orphaned `captured-*` / `derived-*` skill directories not referenced by any record.
     EvolveGcStrandedSkills,
+    /// Dedup pending evolution suggestions and apply survivors via the execute queue.
+    EvolveBatchApply,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +403,8 @@ impl CronJob {
             | CronAction::EvolveToolDegradation
             | CronAction::EvolveMetricCheck
             | CronAction::EvolveCanaryCheck
-            | CronAction::EvolveGcStrandedSkills => { /* no fields to validate */ }
+            | CronAction::EvolveGcStrandedSkills
+            | CronAction::EvolveBatchApply => { /* no fields to validate */ }
         }
         Ok(())
     }

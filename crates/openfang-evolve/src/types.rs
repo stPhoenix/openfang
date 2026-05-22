@@ -184,7 +184,7 @@ impl std::str::FromStr for SkillQuality {
 // ---------------------------------------------------------------------------
 
 /// One proposed evolution action from the analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvolutionSuggestion {
     /// Type of evolution suggested.
     pub kind: SuggestionKind,
@@ -203,13 +203,64 @@ pub struct EvolutionSuggestion {
     /// Reason the execution failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Lifecycle status. Defaults to Pending. Set to Superseded by dedup,
+    /// Applied/Failed by execute pipeline.
+    #[serde(default)]
+    pub status: SuggestionStatus,
+    /// Row id of the survivor suggestion that superseded this one (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_id: Option<i64>,
+    /// Short reason explaining why this row was marked superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_reason: Option<String>,
+}
+
+/// Lifecycle states for an evolution suggestion in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionStatus {
+    #[default]
+    Pending,
+    Applied,
+    Failed,
+    /// Refused by the LLM confirmation gate or cost cap. Not a failure;
+    /// surface a distinct badge in the UI and don't re-try on next batch.
+    Declined,
+    Superseded,
+}
+
+impl std::fmt::Display for SuggestionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Applied => write!(f, "applied"),
+            Self::Failed => write!(f, "failed"),
+            Self::Declined => write!(f, "declined"),
+            Self::Superseded => write!(f, "superseded"),
+        }
+    }
+}
+
+impl std::str::FromStr for SuggestionStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "applied" => Ok(Self::Applied),
+            "failed" => Ok(Self::Failed),
+            "declined" => Ok(Self::Declined),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(format!("unknown suggestion status: {s}")),
+        }
+    }
 }
 
 /// Classification of evolution suggestions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionKind {
     /// In-place repair: skill instructions are incorrect or outdated.
+    #[default]
     Fix,
     /// Enhanced version: skill worked but execution revealed a better approach.
     Derived,
@@ -765,9 +816,7 @@ mod tests {
                 target_skill: Some("docker".into()),
                 description: "Update port mapping instructions".into(),
                 priority: 3,
-                executed_at: None,
-                failed_at: None,
-                failure_reason: None,
+                ..Default::default()
             }],
             model_used: "claude-haiku-4-5-20251001".into(),
             input_tokens: 1500,

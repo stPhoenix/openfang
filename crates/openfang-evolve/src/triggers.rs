@@ -285,18 +285,14 @@ mod tests {
                     target_skill: Some("docker".into()),
                     description: "Fix port mapping".into(),
                     priority: 4,
-                    executed_at: None,
-                    failed_at: None,
-                    failure_reason: None,
+                    ..Default::default()
                 },
                 EvolutionSuggestion {
                     kind: SuggestionKind::Captured,
                     target_skill: None,
                     description: "Capture debugging pattern".into(),
                     priority: 2,
-                    executed_at: None,
-                    failed_at: None,
-                    failure_reason: None,
+                    ..Default::default()
                 },
             ],
             model_used: "test".into(),

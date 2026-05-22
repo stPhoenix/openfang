@@ -231,6 +231,17 @@ impl EvolveStore {
         Ok(results)
     }
 
+    /// Total number of analyses (for paginated UIs).
+    pub fn count_analyses(&self) -> Result<i64, EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM execution_analyses",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Get a single analysis by ID with all child records.
     pub fn get_analysis(&self, id: &str) -> Result<Option<ExecutionAnalysis>, EvolveError> {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
@@ -544,7 +555,7 @@ impl EvolveStore {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE evolve_suggestions SET executed_at = ?1 \
+            "UPDATE evolve_suggestions SET executed_at = ?1, status = 'applied' \
              WHERE analysis_id = ?2 AND kind = ?3 AND description = ?4 AND executed_at IS NULL",
             rusqlite::params![now, analysis_id.to_string(), kind.to_string(), description],
         )?;
@@ -562,25 +573,61 @@ impl EvolveStore {
         let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE evolve_suggestions SET failed_at = ?1, failure_reason = ?2 \
+            "UPDATE evolve_suggestions SET failed_at = ?1, failure_reason = ?2, status = 'failed' \
              WHERE analysis_id = ?3 AND kind = ?4 AND description = ?5 AND executed_at IS NULL",
             rusqlite::params![now, reason, analysis_id.to_string(), kind.to_string(), description],
         )?;
         Ok(())
     }
 
+    /// Mark a suggestion as declined by the LLM confirmation gate or cost cap.
+    /// Distinct from `failed` so the UI can show a different badge and the
+    /// row is not re-tried on the next batch apply.
+    pub fn mark_suggestion_declined(
+        &self,
+        analysis_id: &AnalysisId,
+        kind: &SuggestionKind,
+        description: &str,
+        reason: &str,
+    ) -> Result<(), EvolveError> {
+        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE evolve_suggestions SET status = 'declined', dedup_reason = ?1 \
+             WHERE analysis_id = ?2 AND kind = ?3 AND description = ?4 \
+                AND executed_at IS NULL AND failed_at IS NULL \
+                AND COALESCE(status, 'pending') = 'pending'",
+            rusqlite::params![reason, analysis_id.to_string(), kind.to_string(), description],
+        )?;
+        Ok(())
+    }
+
     /// Delete a single suggestion by its composite key.
+    ///
+    /// `evolve_suggestions.supersedes_id` is a self-FK with no `ON DELETE`
+    /// action, so a straight DELETE fails with `FOREIGN KEY constraint failed`
+    /// whenever the target row was later superseded. Detach child refs first,
+    /// then delete — all in one transaction.
     pub fn delete_suggestion(
         &self,
         analysis_id: &AnalysisId,
         kind: &SuggestionKind,
         description: &str,
     ) -> Result<(), EvolveError> {
-        let conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|e| EvolveError::Other(e.to_string()))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE evolve_suggestions SET supersedes_id = NULL \
+             WHERE supersedes_id IN ( \
+                 SELECT id FROM evolve_suggestions \
+                 WHERE analysis_id = ?1 AND kind = ?2 AND description = ?3 \
+             )",
+            rusqlite::params![analysis_id.to_string(), kind.to_string(), description],
+        )?;
+        tx.execute(
             "DELETE FROM evolve_suggestions WHERE analysis_id = ?1 AND kind = ?2 AND description = ?3",
             rusqlite::params![analysis_id.to_string(), kind.to_string(), description],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -834,7 +881,9 @@ impl EvolveStore {
         analysis_id: &str,
     ) -> Result<Vec<EvolutionSuggestion>, EvolveError> {
         let mut stmt = conn.prepare(
-            "SELECT kind, target_skill, description, priority, executed_at, failed_at, failure_reason FROM evolve_suggestions WHERE analysis_id = ?1",
+            "SELECT kind, target_skill, description, priority, executed_at, failed_at, failure_reason, \
+                    COALESCE(status, 'pending'), supersedes_id, dedup_reason \
+             FROM evolve_suggestions WHERE analysis_id = ?1",
         )?;
         let rows = stmt
             .query_map([analysis_id], |row| {
@@ -849,11 +898,94 @@ impl EvolveStore {
                     executed_at: row.get(4)?,
                     failed_at: row.get(5)?,
                     failure_reason: row.get(6)?,
+                    status: row
+                        .get::<_, String>(7)?
+                        .parse()
+                        .unwrap_or(SuggestionStatus::Pending),
+                    supersedes_id: row.get(8)?,
+                    dedup_reason: row.get(9)?,
                 })
             })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// List all suggestions with status='pending' across every analysis.
+    /// Returns (row_id, analysis_id, suggestion). Sorted by priority desc, then id asc.
+    /// Used by the batch-apply runner to gather candidates for dedup + execution.
+    pub fn list_all_pending_suggestions(
+        &self,
+    ) -> Result<Vec<(i64, AnalysisId, EvolutionSuggestion)>, EvolveError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, analysis_id, kind, target_skill, description, priority, \
+                    executed_at, failed_at, failure_reason, \
+                    COALESCE(status, 'pending'), supersedes_id, dedup_reason \
+             FROM evolve_suggestions \
+             WHERE COALESCE(status, 'pending') = 'pending' \
+                AND executed_at IS NULL AND failed_at IS NULL \
+             ORDER BY priority DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let analysis_id_str: String = row.get(1)?;
+                let analysis_id: AnalysisId =
+                    analysis_id_str.parse().map_err(|e: uuid::Error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                let suggestion = EvolutionSuggestion {
+                    kind: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .unwrap_or(SuggestionKind::Fix),
+                    target_skill: row.get(3)?,
+                    description: row.get(4)?,
+                    priority: row.get::<_, i32>(5)? as u8,
+                    executed_at: row.get(6)?,
+                    failed_at: row.get(7)?,
+                    failure_reason: row.get(8)?,
+                    status: row
+                        .get::<_, String>(9)?
+                        .parse()
+                        .unwrap_or(SuggestionStatus::Pending),
+                    supersedes_id: row.get(10)?,
+                    dedup_reason: row.get(11)?,
+                };
+                Ok((id, analysis_id, suggestion))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Mark a suggestion row as superseded by another suggestion's row id.
+    /// Loser row keeps its analysis_id and content but is filtered out of pending lists.
+    pub fn mark_suggestion_superseded(
+        &self,
+        loser_id: i64,
+        survivor_id: i64,
+        reason: &str,
+    ) -> Result<(), EvolveError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        conn.execute(
+            "UPDATE evolve_suggestions \
+             SET status = 'superseded', supersedes_id = ?1, dedup_reason = ?2 \
+             WHERE id = ?3 AND status = 'pending'",
+            rusqlite::params![survivor_id, reason, loser_id],
+        )?;
+        Ok(())
     }
 
     /// Persist the evolve config to SQLite as a JSON blob.
@@ -949,7 +1081,10 @@ mod tests {
                 priority INTEGER NOT NULL DEFAULT 3,
                 executed_at TEXT,
                 failed_at TEXT,
-                failure_reason TEXT
+                failure_reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                supersedes_id INTEGER REFERENCES evolve_suggestions(id),
+                dedup_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS skill_records (
@@ -1007,9 +1142,7 @@ mod tests {
                 target_skill: Some("docker".into()),
                 description: "Update port mapping".into(),
                 priority: 3,
-                executed_at: None,
-                failed_at: None,
-                failure_reason: None,
+                ..Default::default()
             }],
             model_used: "test-model".into(),
             input_tokens: 100,

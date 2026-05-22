@@ -617,6 +617,9 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             openfang_types::scheduler::CronAction::EvolveGcStrandedSkills => {
                                 "Run stranded-skill GC".to_string()
                             }
+                            openfang_types::scheduler::CronAction::EvolveBatchApply => {
+                                "Run evolution batch apply".to_string()
+                            }
                         };
                         match self.kernel.send_message(j.agent_id, &message).await {
                             Ok(result) => {

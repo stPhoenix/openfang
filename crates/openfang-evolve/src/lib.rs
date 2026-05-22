@@ -5,8 +5,10 @@
 //! evolution suggestions. The analyzer agent is visible in the chat tab.
 
 pub mod analyzer;
+pub mod batch_apply;
 pub mod confirm;
 pub mod correction;
+pub mod dedup;
 pub mod evolver;
 pub mod patch;
 pub mod prompt;

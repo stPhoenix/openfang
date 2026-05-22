@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -65,6 +65,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 14 {
         migrate_v14(conn)?;
+    }
+
+    if current_version < 15 {
+        migrate_v15(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -530,6 +534,37 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
         "CREATE INDEX IF NOT EXISTS idx_sr_canary ON skill_records(is_canary);
          INSERT OR IGNORE INTO migrations (version, applied_at, description)
          VALUES (14, datetime('now'), 'Add canary columns to skill_records and parse_attempts to sessions');",
+    )?;
+    Ok(())
+}
+
+/// Version 15: Add status, supersedes_id, dedup_reason to evolve_suggestions
+/// for the batch-apply dedup pipeline. Status values: pending | applied | failed | superseded.
+fn migrate_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "evolve_suggestions", "status") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';",
+        )?;
+        // Backfill: any row with executed_at gets 'applied', failed_at gets 'failed', rest stay 'pending'.
+        conn.execute_batch(
+            "UPDATE evolve_suggestions SET status = 'applied' WHERE executed_at IS NOT NULL;
+             UPDATE evolve_suggestions SET status = 'failed' WHERE failed_at IS NOT NULL AND status = 'pending';",
+        )?;
+    }
+    if !column_exists(conn, "evolve_suggestions", "supersedes_id") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN supersedes_id INTEGER REFERENCES evolve_suggestions(id);",
+        )?;
+    }
+    if !column_exists(conn, "evolve_suggestions", "dedup_reason") {
+        conn.execute_batch(
+            "ALTER TABLE evolve_suggestions ADD COLUMN dedup_reason TEXT;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_es_status ON evolve_suggestions(status);
+         INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (15, datetime('now'), 'Add status, supersedes_id, dedup_reason to evolve_suggestions for batch-apply dedup');",
     )?;
     Ok(())
 }

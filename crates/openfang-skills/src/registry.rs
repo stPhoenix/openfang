@@ -313,6 +313,13 @@ impl SkillRegistry {
         self.skills.values().collect()
     }
 
+    /// Iterate installed skills with mutable access. Used by kernel-side
+    /// migrations (e.g. evolution-source backfill) that update manifest
+    /// fields in place after `load_all`.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item=&mut InstalledSkill> {
+        self.skills.values_mut()
+    }
+
     /// Remove a skill by name.
     pub fn remove(&mut self, name: &str) -> Result<(), SkillError> {
         let skill = self
@@ -365,10 +372,13 @@ impl SkillRegistry {
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), content)?;
 
-        // 4. Auto-convert SKILL.md → skill.toml + prompt_context.md
+        // 4. Auto-convert SKILL.md → skill.toml + prompt_context.md.
+        //    `convert_skillmd` defaults source to OpenClaw; override to Bundled
+        //    so a materialized bundled skill keeps its true provenance.
         if openclaw_compat::detect_skillmd(&skill_dir) {
-            let converted = openclaw_compat::convert_skillmd(&skill_dir)
+            let mut converted = openclaw_compat::convert_skillmd(&skill_dir)
                 .map_err(|e| SkillError::InvalidManifest(e.to_string()))?;
+            converted.manifest.source = Some(crate::SkillSource::Bundled);
             openclaw_compat::write_openfang_manifest(&skill_dir, &converted.manifest)?;
             openclaw_compat::write_prompt_context(&skill_dir, &converted.prompt_context)?;
         }

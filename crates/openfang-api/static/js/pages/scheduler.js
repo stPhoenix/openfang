@@ -112,11 +112,21 @@ function schedulerPage() {
           else if (j.schedule.kind === 'every') cron = 'every ' + j.schedule.every_secs + 's';
           else if (j.schedule.kind === 'at') cron = 'at ' + (j.schedule.at || '');
         }
+          // Evolve-action crons are owned by the Evolution config page; editing
+          // their schedule here causes silent overwrites since the two pages
+          // write to the same persisted row. The UI uses this flag to badge the
+          // row and steer the user toward the right edit surface.
+          var actionKind = j.action && j.action.kind ? j.action.kind : '';
+          var isEvolveManaged = actionKind.indexOf('evolve_') === 0;
         return {
           id: j.id,
           name: j.name,
           cron: cron,
           agent_id: j.agent_id,
+            action_kind: actionKind,
+            managed: isEvolveManaged,
+            managed_by: isEvolveManaged ? 'Evolution config' : '',
+            managed_href: isEvolveManaged ? '#evolution' : '',
           message: j.action ? j.action.message || '' : '',
           enabled: j.enabled,
           last_run: j.last_run,
@@ -231,7 +241,13 @@ function schedulerPage() {
     deleteJob(job) {
       var self = this;
       var jobName = job.name || job.id;
-      OpenFangToast.confirm('Delete Schedule', 'Delete "' + jobName + '"? This cannot be undone.', async function() {
+        var prompt = 'Delete "' + jobName + '"? This cannot be undone.';
+        if (job.managed) {
+            prompt = 'This cron is managed by ' + (job.managed_by || 'another page') +
+                '. Deleting it here will remove the row, and the managing page may recreate it on next save. ' +
+                'Edit the schedule from that page instead.\n\nDelete anyway?';
+        }
+        OpenFangToast.confirm('Delete Schedule', prompt, async function () {
         try {
           await OpenFangAPI.del('/api/cron/jobs/' + job.id);
           self.jobs = self.jobs.filter(function(j) { return j.id !== job.id; });

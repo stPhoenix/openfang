@@ -73,6 +73,9 @@ pub async fn build_router(
         evolve_execute_progress: evolve_execute_progress.clone(),
         evolve_execute_tx: Some(evolve_exec_tx),
         evolve_execute_events: Some(evolve_exec_events_tx.clone()),
+        batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(
+            routes::BatchApplySnapshot::default(),
+        )),
     });
 
     // Spawn the single evolve-execute worker. It drains the mpsc receiver
@@ -795,6 +798,18 @@ pub async fn build_router(
         .route(
             "/api/evolve/suggestion",
             axum::routing::delete(routes::evolve_delete_suggestion),
+        )
+        .route(
+            "/api/evolve/batch-apply/run",
+            axum::routing::post(routes::evolve_batch_apply_run),
+        )
+        .route(
+            "/api/evolve/batch-apply/preview",
+            axum::routing::get(routes::evolve_batch_apply_preview),
+        )
+        .route(
+            "/api/evolve/batch-apply/status",
+            axum::routing::get(routes::evolve_batch_apply_status),
         )
         // Webhook trigger endpoints (external event injection)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))

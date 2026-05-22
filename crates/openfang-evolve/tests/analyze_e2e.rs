@@ -62,7 +62,10 @@ fn setup_db() -> Arc<Mutex<Connection>> {
             priority INTEGER NOT NULL DEFAULT 3,
             executed_at TEXT,
             failed_at TEXT,
-            failure_reason TEXT
+            failure_reason TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            supersedes_id INTEGER REFERENCES evolve_suggestions(id),
+            dedup_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS skill_records (
             skill_id TEXT PRIMARY KEY,

@@ -60,6 +60,10 @@ pub struct AppState {
     /// The worker publishes `EvolveExecuteEvent`s here.
     pub evolve_execute_events:
         Option<tokio::sync::broadcast::Sender<EvolveExecuteEvent>>,
+    /// Snapshot of the most recent batch-apply preview / run / cron fire.
+    /// Survives across page reloads so the dashboard can show a persistent
+    /// spinner during in-flight runs and the last preview/summary after.
+    pub batch_apply_snapshot: Arc<tokio::sync::RwLock<BatchApplySnapshot>>,
 }
 
 /// Server-side snapshot of an evolve batch run.
@@ -79,6 +83,34 @@ pub struct EvolveProgressSnapshot {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub error: Option<String>,
+}
+
+/// Snapshot of the most recent batch-apply preview or run.
+///
+/// `last_preview` holds the JSON object returned by the Preview endpoint
+/// (dry-run; no DB writes). `last_run_summary` holds the human-readable
+/// summary string returned by the Run endpoint or the cron path. Both stick
+/// around after `running` flips false so a reloading page can show them.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BatchApplySnapshot {
+    pub running: bool,
+    /// Which operation produced the in-progress snapshot: "preview" or "run".
+    pub operation: Option<String>,
+    /// Current step in the run pipeline (1-based). 0 when not yet started.
+    /// Drives the determinate progress bar on the dashboard.
+    pub current: usize,
+    /// Total steps planned for the run. 0 when unknown (preview, or before
+    /// the survivor list is computed). The UI falls back to an indeterminate
+    /// bar when this is 0.
+    pub total: usize,
+    /// Free-form label of what's happening at `current` (e.g. "dedup judge",
+    /// "applying skill_id"). Shown next to the bar.
+    pub step_label: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_preview: Option<serde_json::Value>,
+    pub last_run_summary: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// Snapshot of the evolve-execution queue. Survives across page reloads.
@@ -9948,6 +9980,7 @@ fn cron_job_to_schedule_view(
         CronAction::EvolveMetricCheck => "evolve:metric_check".to_string(),
         CronAction::EvolveCanaryCheck => "evolve:canary_check".to_string(),
         CronAction::EvolveGcStrandedSkills => "evolve:gc_stranded".to_string(),
+        CronAction::EvolveBatchApply => "evolve:batch_apply".to_string(),
     };
     let meta = kernel.cron_scheduler.get_meta(job.id);
     let last_status = meta.as_ref().and_then(|m| m.last_status.clone());
@@ -13427,7 +13460,7 @@ pub async fn evolve_set_config(
                 .clone()
                 .unwrap_or_else(|| new_config.model.clone());
             let evolver_changed = old_effective_evolver != new_effective_evolver;
-            state.kernel.evolve_engine.update_config(new_config);
+            state.kernel.evolve_engine.update_config(new_config.clone());
             if (provider_changed || analyzer_model_changed)
                 && state.kernel.evolve_engine.analyzer_agent_id().is_some()
             {
@@ -13437,6 +13470,9 @@ pub async fn evolve_set_config(
                 && state.kernel.evolve_engine.evolver_agent_id().is_some()
             {
                 let _ = state.kernel.spawn_evolver_agent();
+            }
+            if let Err(e) = state.kernel.sync_evolve_schedules_to_cron(&new_config) {
+                tracing::warn!("failed to sync evolve schedules to cron: {e}");
             }
             (StatusCode::OK, Json(serde_json::json!({ "status": "updated" })))
         }
@@ -13713,13 +13749,23 @@ pub async fn evolve_list_analyses(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
 
-    match state.kernel.evolve_engine.store().list_analyses(limit, offset) {
+    let store = state.kernel.evolve_engine.store();
+    match store.list_analyses(limit, offset) {
         Ok(analyses) => {
+            let total = store.count_analyses().unwrap_or(analyses.len() as i64);
             let json_list: Vec<serde_json::Value> = analyses
                 .iter()
                 .map(|a| serde_json::to_value(a).unwrap_or_default())
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "analyses": json_list })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": json_list,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -14133,6 +14179,213 @@ pub async fn evolve_execute_all(
     )
 }
 
+/// POST /api/evolve/batch-apply/run — Run dedup + execute pipeline now.
+///
+/// Same path as the `EvolveBatchApply` cron job. Acquires the evolver
+/// exec lock for the duration so manual `/execute` and the batch run cannot
+/// race. Returns the human-readable summary on success.
+///
+/// Writes `state.batch_apply_snapshot` before and after the call so the
+/// dashboard can show a persistent spinner during the run and the resulting
+/// summary across page reloads.
+pub async fn evolve_batch_apply_run(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+    // Reject concurrent runs. The kernel no longer holds an outer lock across
+    // the batch (it would deadlock against `execute_evolution`'s per-call
+    // lock), so this check at the API layer is the only thing preventing two
+    // dedup passes interleaving on the same pending set.
+    {
+        let snap = state.batch_apply_snapshot.read().await;
+        if snap.running {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "batch apply already in progress",
+                    "operation": snap.operation.clone(),
+                    "started_at": snap.started_at,
+                })),
+            );
+        }
+    }
+    {
+        let mut snap = state.batch_apply_snapshot.write().await;
+        snap.running = true;
+        snap.operation = Some("run".into());
+        snap.started_at = Some(chrono::Utc::now());
+        snap.finished_at = None;
+        snap.last_error = None;
+        snap.current = 0;
+        snap.total = 0;
+        snap.step_label = None;
+    }
+    // Progress callback: synchronously try-lock the snapshot and update the
+    // counters. We use try_write to avoid blocking the kernel work loop if
+    // the GET /status endpoint happens to hold the read lock momentarily.
+    let snapshot_for_cb = state.batch_apply_snapshot.clone();
+    let progress_cb = move |current: usize, total: usize, label: &str| {
+        if let Ok(mut snap) = snapshot_for_cb.try_write() {
+            snap.current = current;
+            snap.total = total;
+            snap.step_label = Some(label.to_string());
+        }
+    };
+    let result = state
+        .kernel
+        .run_evolve_batch_apply_with_progress(progress_cb)
+        .await;
+    {
+        let mut snap = state.batch_apply_snapshot.write().await;
+        snap.running = false;
+        snap.finished_at = Some(chrono::Utc::now());
+        match &result {
+            Ok(msg) => {
+                snap.last_run_summary = Some(msg.clone());
+                snap.last_error = None;
+            }
+            Err(e) => {
+                snap.last_error = Some(e.clone());
+            }
+        }
+    }
+    // Clear the in-flight progress when the run finishes so the bar collapses.
+    {
+        let mut snap = state.batch_apply_snapshot.write().await;
+        snap.step_label = None;
+    }
+    match result {
+        Ok(msg) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "summary": msg })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
+/// GET /api/evolve/batch-apply/preview — Dry-run dedup over current pending
+/// suggestions. Computes the grouping in-memory; performs NO database writes.
+/// Use to preview what the next scheduled batch apply will do.
+///
+/// Stores the resulting JSON in `state.batch_apply_snapshot.last_preview` so a
+/// page reload restores the panel.
+pub async fn evolve_batch_apply_preview(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !state.kernel.evolve_engine.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "evolve engine is not enabled" })),
+        );
+    }
+    {
+        let snap = state.batch_apply_snapshot.read().await;
+        if snap.running {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "batch apply already in progress",
+                    "operation": snap.operation.clone(),
+                    "started_at": snap.started_at,
+                })),
+            );
+        }
+    }
+    {
+        let mut snap = state.batch_apply_snapshot.write().await;
+        snap.running = true;
+        snap.operation = Some("preview".into());
+        snap.started_at = Some(chrono::Utc::now());
+        snap.finished_at = None;
+        snap.last_error = None;
+        snap.current = 0;
+        snap.total = 0;
+        snap.step_label = Some("dedup judge".into());
+    }
+    let cfg = state.kernel.evolve_engine.config();
+    let analyzer_id = state.kernel.evolve_engine.analyzer_agent_id();
+    let kernel = state.kernel.clone();
+
+    let judge_fn = |prompt: String| async move {
+        let Some(agent_id) = analyzer_id else {
+            return Err::<String, String>("analyzer agent not spawned".into());
+        };
+        match kernel.send_message(agent_id, &prompt).await {
+            Ok(result) => Ok(result.response),
+            Err(e) => Err(format!("{e}")),
+        }
+    };
+
+    let outcome = openfang_evolve::batch_apply::run_batch_apply(
+        state.kernel.evolve_engine.store(),
+        cfg.dedup_enabled,
+        cfg.apply_max_per_run,
+        true,
+        judge_fn,
+    )
+        .await;
+
+    match outcome {
+        Ok(report) => {
+            let body = serde_json::json!({
+                "total_pending": report.total_pending,
+                "superseded": report.superseded,
+                "used_llm": report.used_llm,
+                "dedup_skipped": report.dedup_skipped,
+                "survivors": report.contexts.len(),
+                "groups": report.dedup_groups.iter().map(|g| serde_json::json!({
+                    "survivor_id": g.survivor_id,
+                    "loser_ids": g.loser_ids,
+                    "reason": g.reason,
+                })).collect::<Vec<_>>(),
+            });
+            {
+                let mut snap = state.batch_apply_snapshot.write().await;
+                snap.running = false;
+                snap.finished_at = Some(chrono::Utc::now());
+                snap.last_preview = Some(body.clone());
+                snap.last_error = None;
+            }
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let err_msg = format!("{e}");
+            {
+                let mut snap = state.batch_apply_snapshot.write().await;
+                snap.running = false;
+                snap.finished_at = Some(chrono::Utc::now());
+                snap.last_error = Some(err_msg.clone());
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err_msg })),
+            )
+        }
+    }
+}
+
+/// GET /api/evolve/batch-apply/status — Server-side snapshot of the last
+/// preview or run triggered through this API. Drives the dashboard spinner
+/// and lets the last-preview / last-summary panels survive page reloads.
+///
+/// Note: cron-triggered batch applies do not currently write this snapshot
+/// (kernel can't reach API-layer state without a cyclic dep). The cron
+/// scheduler's own run history is the source of truth for those.
+pub async fn evolve_batch_apply_status(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let snap = state.batch_apply_snapshot.read().await;
+    (StatusCode::OK, Json(serde_json::to_value(&*snap).unwrap()))
+}
+
 /// Push an `EvolutionContext` onto the execute queue. Updates the snapshot
 /// (queue + counters + running flag), broadcasts a queued `Item` event, and
 /// sends the context to the worker. Returns the 1-based queue position.
@@ -14342,8 +14595,25 @@ pub fn spawn_evolve_execute_worker(
                 ),
                 Err(e) if e.is_declined() => {
                     let reason = format!("{e}");
-                    // Declined = LLM/cost-cap gate refused. Not a failure;
-                    // surface a distinct badge and do NOT call mark_suggestion_failed.
+                    // Declined = LLM/cost-cap gate refused. Persist as
+                    // `status='declined'` so it's not re-tried on next batch.
+                    if let Some(ref aid) = context.source_analysis {
+                        if let Err(store_err) = kernel
+                            .evolve_engine
+                            .store()
+                            .mark_suggestion_declined(
+                                aid,
+                                &context.evolution_type,
+                                &context.direction,
+                                &reason,
+                            )
+                        {
+                            tracing::warn!(
+                                error = %store_err,
+                                "failed to mark suggestion declined"
+                            );
+                        }
+                    }
                     ("declined".to_string(), Some(reason), None)
                 }
                 Err(e) => {

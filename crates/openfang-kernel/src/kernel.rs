@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Outcome of a single async delegation. Cached so `await_delegations`
 /// can return immediately when the completion event already fired
@@ -1261,6 +1261,13 @@ impl OpenFangKernel {
             evolve_engine.sync_skills_from_registry(imports);
         }
 
+        // Backfill skill source provenance: older captured/derived skills
+        // (created before `stamp_evolution_source` existed) still carry the
+        // default `OpenClaw` source written by `convert_skillmd`. Cross-
+        // reference the evolution store and rewrite any mislabeled
+        // `skill.toml` so the Skills tab badges them as Evolution.
+        backfill_skill_sources(&mut skill_registry, evolve_engine.store());
+
         // Initialize cgroup sandbox BEFORE moving `config` into the struct.
         let cgroup_session = {
             let policy = &config.exec_policy.cgroup_policy;
@@ -1636,6 +1643,12 @@ impl OpenFangKernel {
             if let Err(e) = kernel.seed_default_evolve_crons() {
                 warn!("failed to seed default evolve crons: {e}");
             }
+            // Eagerly spawn the analyzer agent so the first batch apply /
+            // session analysis after boot has an LLM-capable judge instead
+            // of falling back to the heuristic. Cheap if it's already there.
+            if let Err(e) = kernel.ensure_evolve_agent() {
+                warn!("failed to eagerly spawn evolution analyzer: {e}");
+            }
         }
 
         info!("OpenFang kernel booted successfully");
@@ -1677,11 +1690,12 @@ impl OpenFangKernel {
             .unwrap_or_else(|| AgentId::from_string("evolution-analyzer"));
 
         let defaults: &[(&str, &str, CronAction)] = &[
-            ("evolve: analyze sessions", "0 */4 * * *", CronAction::EvolveAnalyze),
-            ("evolve: metric check", "0 3 * * *", CronAction::EvolveMetricCheck),
-            ("evolve: tool degradation", "0 4 * * *", CronAction::EvolveToolDegradation),
-            ("evolve: canary check", "0 * * * *", CronAction::EvolveCanaryCheck),
-            ("evolve: gc stranded skills", "30 5 * * *", CronAction::EvolveGcStrandedSkills),
+            ("evolve analyze sessions", "0 0 * * *", CronAction::EvolveAnalyze),
+            ("evolve batch apply", "0 5 * * *", CronAction::EvolveBatchApply),
+            ("evolve metric check", "0 3 * * *", CronAction::EvolveMetricCheck),
+            ("evolve tool degradation", "0 4 * * *", CronAction::EvolveToolDegradation),
+            ("evolve canary check", "0 * * * *", CronAction::EvolveCanaryCheck),
+            ("evolve gc stranded skills", "30 5 * * *", CronAction::EvolveGcStrandedSkills),
         ];
 
         let mut seeded = 0usize;
@@ -7779,7 +7793,7 @@ impl OpenFangKernel {
                 .map(|s| s.name.clone())
                 .collect();
             if let Err(e) = stamp_evolution_source(&skill_dir, parents) {
-                warn!(skill_dir = %skill_dir.display(), error = %e, "failed to stamp evolution source");
+                error!(skill_dir = %skill_dir.display(), error = %e, "failed to stamp evolution source");
             }
         }
 
@@ -8137,6 +8151,236 @@ impl OpenFangKernel {
     }
 
     /// Remove `captured-*` / `derived-*` skill directories not referenced by any
+    /// Run the batch-apply pipeline: dedup all pending suggestions via the
+    /// analyzer LLM (with heuristic fallback), then execute survivors
+    /// sequentially through `execute_evolution_with_confirmation`.
+    ///
+    /// Acquires `evolver_exec_lock` for the duration so concurrent manual
+    /// `/execute` calls do not race the cron-driven batch.
+    ///
+    /// Returns a human-readable summary, used by the cron job and the
+    /// `POST /api/evolve/batch-apply/run` endpoint.
+    pub async fn run_evolve_batch_apply(&self) -> Result<String, String> {
+        self.run_evolve_batch_apply_with_progress(|_, _, _| {}).await
+    }
+
+    /// Same as `run_evolve_batch_apply` but emits progress callbacks at each
+    /// pipeline step (`current`, `total`, `step_label`). Used by the HTTP
+    /// route handler to drive the dashboard progress bar.
+    ///
+    /// `total` reflects the final survivor count once dedup is done; before
+    /// that, callbacks pass `0` so the UI can show an indeterminate bar.
+    pub async fn run_evolve_batch_apply_with_progress<F>(
+        &self,
+        progress_cb: F,
+    ) -> Result<String, String>
+    where
+        F: Fn(usize, usize, &str) + Send + Sync,
+    {
+        use openfang_evolve::batch_apply::run_batch_apply;
+
+        let cfg = self.evolve_engine.config();
+
+        progress_cb(0, 0, "dedup judge");
+
+        // Judge closure: send the dedup prompt to the analyzer agent. The
+        // agent is already configured with provider/model/auth, so we get
+        // cost accounting for free.
+        let analyzer_id = self.evolve_engine.analyzer_agent_id();
+        let judge_fn = |prompt: String| async move {
+            let Some(agent_id) = analyzer_id else {
+                return Err::<String, String>("analyzer agent not spawned".into());
+            };
+            match self.send_message(agent_id, &prompt).await {
+                Ok(result) => Ok(result.response),
+                Err(e) => Err(format!("{e}")),
+            }
+        };
+
+        let report = run_batch_apply(
+            self.evolve_engine.store(),
+            cfg.dedup_enabled,
+            cfg.apply_max_per_run,
+            false,
+            judge_fn,
+        )
+            .await
+            .map_err(|e| format!("batch apply prep failed: {e}"))?;
+
+        let total = report.contexts.len();
+        let mut applied = 0u32;
+        let mut declined = 0u32;
+        let mut failed = 0u32;
+        for (i, ctx) in report.contexts.into_iter().enumerate() {
+            let label = ctx
+                .target_skills
+                .first()
+                .map(|s| s.skill_id.clone())
+                .unwrap_or_else(|| {
+                    // Fall back to a truncated form of the suggestion direction
+                    // when the target skill didn't resolve to a record.
+                    let mut d = ctx.direction.clone();
+                    if d.len() > 60 {
+                        d.truncate(60);
+                        d.push('…');
+                    }
+                    d
+                });
+            progress_cb(i + 1, total, &format!("applying {label}"));
+            // Capture the suggestion identity before move so we can mark the
+            // store row on declined/failed outcomes (executed is marked inside
+            // `execute_evolution` on the Ok path).
+            let analysis_id = ctx.source_analysis;
+            let kind = ctx.evolution_type.clone();
+            let direction = ctx.direction.clone();
+            match self.execute_evolution_with_confirmation(ctx).await {
+                Ok(_) => applied += 1,
+                Err(e) if e.is_declined() => {
+                    declined += 1;
+                    info!("batch apply evolution declined: {e}");
+                    if let Some(aid) = analysis_id {
+                        if let Err(store_err) = self
+                            .evolve_engine
+                            .store()
+                            .mark_suggestion_declined(&aid, &kind, &direction, &format!("{e}"))
+                        {
+                            warn!(error = %store_err, "failed to mark suggestion declined");
+                        }
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!("batch apply evolution failed: {e}");
+                    if let Some(aid) = analysis_id {
+                        if let Err(store_err) = self
+                            .evolve_engine
+                            .store()
+                            .mark_suggestion_failed(&aid, &kind, &direction, &format!("{e}"))
+                        {
+                            warn!(error = %store_err, "failed to mark suggestion failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(format!(
+            "batch apply: {} pending, {} superseded (used_llm={}), {} applied, {} declined, {} failed",
+            report.total_pending, report.superseded, report.used_llm, applied, declined, failed
+        ))
+    }
+
+    /// Upsert/remove the recurring evolve cron jobs to match the supplied
+    /// `EvolveConfig.analyze_schedule` / `apply_schedule`. Matched by job name
+    /// so user-renamed jobs are left alone.
+    ///
+    /// Also toggles the `enabled` flag on every evolve-action cron job
+    /// (analyze, batch_apply, metric_check, tool_degradation, canary_check,
+    /// gc_stranded_skills) to mirror `cfg.enabled`. Disabling evolve disables
+    /// all evolve crons so they no longer fire; re-enabling restores them.
+    ///
+    /// Called from `evolve_set_config` after config changes are persisted.
+    pub fn sync_evolve_schedules_to_cron(
+        &self,
+        cfg: &openfang_types::config::EvolveConfig,
+    ) -> KernelResult<()> {
+        use openfang_types::scheduler::{CronAction, CronDelivery, CronJob, CronJobId};
+
+        // Master toggle: enable/disable all evolve-action cron jobs based on
+        // the engine's enabled flag. Jobs stay in the scheduler list (so the
+        // schedule survives the off→on cycle) but are skipped by the tick loop.
+        for job in self.cron_scheduler.list_all_jobs() {
+            let is_evolve_action = matches!(
+                job.action,
+                CronAction::EvolveAnalyze
+                    | CronAction::EvolveBatchApply
+                    | CronAction::EvolveMetricCheck
+                    | CronAction::EvolveToolDegradation
+                    | CronAction::EvolveCanaryCheck
+                    | CronAction::EvolveGcStrandedSkills
+            );
+            if is_evolve_action && job.enabled != cfg.enabled {
+                if let Err(e) = self.cron_scheduler.set_enabled(job.id, cfg.enabled) {
+                    warn!("failed to toggle cron job '{}' enabled={}: {e}", job.name, cfg.enabled);
+                }
+            }
+        }
+
+        let owner = self
+            .evolve_engine
+            .analyzer_agent_id()
+            .unwrap_or_else(|| AgentId::from_string("evolution-analyzer"));
+
+        let targets = [
+            (
+                "evolve analyze sessions",
+                cfg.analyze_schedule.clone(),
+                CronAction::EvolveAnalyze,
+            ),
+            (
+                "evolve batch apply",
+                cfg.apply_schedule.clone(),
+                CronAction::EvolveBatchApply,
+            ),
+        ];
+
+        let existing = self.cron_scheduler.list_all_jobs();
+        for (name, schedule, action) in targets {
+            let existing_job = existing.iter().find(|j| j.name == name);
+            match (schedule, existing_job) {
+                (Some(sched), Some(job)) => {
+                    // Update in-place: remove then re-add (scheduler exposes no
+                    // direct mutate). Preserve owner/agent_id from existing.
+                    let new = CronJob {
+                        id: job.id,
+                        agent_id: job.agent_id,
+                        name: name.to_string(),
+                        enabled: job.enabled,
+                        schedule: sched,
+                        action: action.clone(),
+                        delivery: job.delivery.clone(),
+                        delivery_targets: job.delivery_targets.clone(),
+                        created_at: job.created_at,
+                        last_run: job.last_run,
+                        next_run: None,
+                    };
+                    if let Err(e) = self.cron_scheduler.remove_job(job.id) {
+                        warn!("failed to remove cron job '{name}' for update: {e}");
+                    }
+                    if let Err(e) = self.cron_scheduler.add_job(new, false) {
+                        warn!("failed to re-add cron job '{name}' after update: {e}");
+                    }
+                }
+                (Some(sched), None) => {
+                    let job = CronJob {
+                        id: CronJobId::new(),
+                        agent_id: owner,
+                        name: name.to_string(),
+                        enabled: true,
+                        schedule: sched,
+                        action: action.clone(),
+                        delivery: CronDelivery::None,
+                        delivery_targets: vec![],
+                        created_at: chrono::Utc::now(),
+                        last_run: None,
+                        next_run: None,
+                    };
+                    if let Err(e) = self.cron_scheduler.add_job(job, false) {
+                        warn!("failed to add cron job '{name}' from evolve config: {e}");
+                    }
+                }
+                (None, Some(job)) => {
+                    if let Err(e) = self.cron_scheduler.remove_job(job.id) {
+                        warn!("failed to remove cron job '{name}' (config cleared): {e}");
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        let _ = self.cron_scheduler.persist();
+        Ok(())
+    }
+
     /// active or inactive record. Called by the `EvolveGcStrandedSkills` cron.
     pub fn gc_stranded_skill_dirs(&self) -> usize {
         let skills_dir = self.config.home_dir.join("skills");
@@ -8485,6 +8729,23 @@ impl OpenFangKernel {
                 self.cron_scheduler.record_success(job_id);
                 Ok(msg)
             }
+            CronAction::EvolveBatchApply => {
+                if !self.evolve_engine.is_enabled() {
+                    self.cron_scheduler.record_success(job_id);
+                    return Ok("evolve engine not enabled".into());
+                }
+                match self.run_evolve_batch_apply().await {
+                    Ok(msg) => {
+                        self.cron_scheduler.record_success(job_id);
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let err_msg = format!("batch apply failed: {e}");
+                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        Err(err_msg)
+                    }
+                }
+            }
         }
     }
 }
@@ -8518,6 +8779,108 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
 /// wholesale, so the parent's `skill.toml` (with its own source field) was
 use crate::evolve::{restore_skill_dir, snapshot_skill_dir};
 
+
+/// Boot-time migration: ensure every skill's `source` reflects its true
+/// provenance. `convert_skillmd` defaults to `OpenClaw` for any SKILL.md
+/// it processes — so pre-`stamp_evolution_source` captured/derived skills
+/// and pre-fix `materialize_bundled` runs both ended up tagged OpenClaw
+/// on disk. Resolve those here:
+///
+///   - captured/derived (evolve-store record or folder-name prefix)
+///     → `SkillSource::Evolution`
+///   - skill name present in the bundled set
+///     → `SkillSource::Bundled`
+///   - anything else (true OpenClaw import, ClawHub, Native) → left alone
+///
+/// Idempotent — entries whose source already matches are skipped.
+fn backfill_skill_sources(
+    registry: &mut openfang_skills::registry::SkillRegistry,
+    store: &openfang_evolve::store::EvolveStore,
+) {
+    use openfang_evolve::types::SkillOrigin;
+    use openfang_skills::openclaw_compat;
+    use openfang_skills::{bundled, SkillSource};
+
+    let records = match store.list_skill_records(false) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "backfill_skill_sources: list_skill_records failed");
+            Vec::new()
+        }
+    };
+    let mut origin_by_path: std::collections::HashMap<String, SkillOrigin> =
+        std::collections::HashMap::new();
+    for rec in &records {
+        origin_by_path.insert(rec.path.clone(), rec.lineage.origin.clone());
+    }
+
+    let mut rewritten = 0usize;
+    for entry in registry.iter_mut() {
+        let path_str = entry.path.to_string_lossy().to_string();
+        let dir_name = entry
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        let is_evolved = matches!(
+            origin_by_path.get(&path_str),
+            Some(SkillOrigin::Captured) | Some(SkillOrigin::Derived)
+        ) || dir_name.starts_with("captured-")
+            || dir_name.starts_with("derived-");
+
+        let desired: Option<SkillSource> = if is_evolved {
+            Some(SkillSource::Evolution { parents: vec![] })
+        } else if bundled::get_bundled_content(&entry.manifest.skill.name).is_some() {
+            Some(SkillSource::Bundled)
+        } else {
+            None
+        };
+
+        let Some(desired) = desired else { continue };
+
+        // Already correct — Evolution match is variant-only (parents may differ
+        // and are not surfaced by the UI), Bundled is a unit variant.
+        let already_correct = matches!(
+            (&entry.manifest.source, &desired),
+            (Some(SkillSource::Evolution { .. }), SkillSource::Evolution { .. })
+                | (Some(SkillSource::Bundled), SkillSource::Bundled)
+        );
+        if already_correct {
+            continue;
+        }
+
+        let label = match &desired {
+            SkillSource::Evolution { .. } => "Evolution",
+            SkillSource::Bundled => "Bundled",
+            _ => "?",
+        };
+        entry.manifest.source = Some(desired);
+        match openclaw_compat::write_openfang_manifest(&entry.path, &entry.manifest) {
+            Ok(()) => {
+                rewritten += 1;
+                info!(
+                    skill = %entry.manifest.skill.name,
+                    path = %entry.path.display(),
+                    target = label,
+                    "backfilled skill source"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    skill = %entry.manifest.skill.name,
+                    path = %entry.path.display(),
+                    error = %e,
+                    "backfill_skill_sources: failed to rewrite skill.toml"
+                );
+            }
+        }
+    }
+
+    if rewritten > 0 {
+        info!("Backfilled source provenance for {rewritten} skill(s)");
+    }
+}
 
 /// carried over verbatim — without this stamp, the UI would badge a
 /// ClawHub-parented evolution as "ClawHub".

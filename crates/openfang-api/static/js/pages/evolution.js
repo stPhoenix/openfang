@@ -4,7 +4,40 @@ function evolutionPage() {
     evolutionView: 'overview',  // 'overview' | 'skills' | 'skill-detail' | 'suggestions'
 
     // ── Existing state ──
-    config: { enabled: false, provider: 'anthropic', model: 'claude-haiku-4-5-20251001', api_key: null, base_url: null, batch_size: 20 },
+      config: {
+          enabled: false,
+          provider: 'anthropic',
+          model: 'claude-haiku-4-5-20251001',
+          api_key: null,
+          base_url: null,
+          batch_size: 20,
+          dedup_enabled: true,
+          apply_max_per_run: 20,
+          analyze_schedule: null,
+          apply_schedule: null
+      },
+      // Schedule UI bindings: cron expression strings the user types. Empty = no schedule.
+      analyzeCronExpr: '',
+      applyCronExpr: '',
+      // Last batch-apply preview / run result for the panel. Hydrated on mount
+      // from /api/evolve/batch-apply/status so reload restores spinner + results.
+      batchApply: {
+          running: false,
+          operation: null,
+          current: 0,
+          total: 0,
+          stepLabel: null,
+          lastSummary: null,
+          lastPreview: null,
+          startedAt: null,
+          finishedAt: null,
+          error: null
+      },
+      _batchApplyPollHandle: null,
+      // Slow heartbeat: ~5s. Detects externally-triggered batch applies (cron,
+      // curl, other tabs) and starts the fast poller so the dashboard catches
+      // up without needing the user to reload.
+      _batchApplyHeartbeat: null,
     analyses: [],
     stats: { total_analyses: 0, sessions_analyzed: 0, sessions_pending: 0, avg_completion_rate: 0, total_suggestions: 0, total_tool_issues: 0 },
     providers: [],
@@ -48,7 +81,23 @@ function evolutionPage() {
     skillTagFilter: '',
     skillClasses: [],
 
-    // ── Skill detail state ──
+      // ── Pagination state (per tab) ──
+      overviewPage: 1,
+      overviewPageSize: 25,
+      overviewTotal: 0,
+      overviewSort: 'analyzed_at',
+      overviewSortDesc: true,
+      suggestionsPage: 1,
+      suggestionsPageSize: 25,
+      suggestionsSortDesc: true,
+      skillsPage: 1,
+      skillsPageSize: 25,
+      skillDetailPage: 1,
+      skillDetailPageSize: 25,
+      // Map of selected suggestion _key → true (for multi-select bulk delete).
+      selectedSuggestions: {},
+
+      // ── Skill detail state ──
     selectedClassName: null,
     selectedClassSkills: [],
     graphNodes: [],
@@ -72,7 +121,7 @@ function evolutionPage() {
       this.loading = true;
       this.loadError = '';
       try {
-          await Promise.all([this.loadConfig(), this.loadStats(), this.loadCost(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus(), this.loadExecuteStatus()]);
+          await Promise.all([this.loadConfig(), this.loadStats(), this.loadCost(), this.loadAnalyses(), this.loadModelOptions(), this.loadAgent(), this.loadSkillRecords(), this.loadRunStatus(), this.loadExecuteStatus(), this.loadBatchApplyStatus()]);
         this.buildSkillClasses();
       } catch (e) {
         this.loadError = e.message || 'Failed to load evolution data.';
@@ -105,6 +154,14 @@ function evolutionPage() {
               clearInterval(this._executePollHandle);
               this._executePollHandle = null;
           }
+          if (this._batchApplyPollHandle) {
+              clearInterval(this._batchApplyPollHandle);
+              this._batchApplyPollHandle = null;
+          }
+          if (this._batchApplyHeartbeat) {
+              clearInterval(this._batchApplyHeartbeat);
+              this._batchApplyHeartbeat = null;
+          }
       },
 
       destroy() {
@@ -126,6 +183,11 @@ function evolutionPage() {
     async loadConfig() {
       var data = await OpenFangAPI.get('/api/evolve/config');
       if (data) this.config = data;
+        // Hydrate schedule expression inputs from the persisted CronSchedule shape.
+        this.analyzeCronExpr = (this.config.analyze_schedule && this.config.analyze_schedule.kind === 'cron')
+            ? (this.config.analyze_schedule.expr || '') : '';
+        this.applyCronExpr = (this.config.apply_schedule && this.config.apply_schedule.kind === 'cron')
+            ? (this.config.apply_schedule.expr || '') : '';
     },
     async saveConfig() {
       this.saving = true;
@@ -133,6 +195,7 @@ function evolutionPage() {
           // Send the full config so server-side defaults aren't reset on PUT.
           var body = Object.assign({}, this.config);
           body.enabled = !!this.config.enabled;
+          body.dedup_enabled = !!this.config.dedup_enabled;
           body.batch_size = parseInt(this.config.batch_size) || 20;
           if (!body.api_key) delete body.api_key;
           if (!body.base_url) delete body.base_url;
@@ -140,12 +203,147 @@ function evolutionPage() {
           if (body.max_monthly_cost_usd === '' || body.max_monthly_cost_usd === null) {
               delete body.max_monthly_cost_usd;
           }
+          if (body.apply_max_per_run === '' || body.apply_max_per_run === null) {
+              delete body.apply_max_per_run;
+          } else {
+              body.apply_max_per_run = parseInt(body.apply_max_per_run) || 20;
+          }
+          // Pack schedule inputs into CronSchedule shape; empty = null (removes cron job).
+          body.analyze_schedule = this.analyzeCronExpr
+              ? {kind: 'cron', expr: this.analyzeCronExpr, tz: null}
+              : null;
+          body.apply_schedule = this.applyCronExpr
+              ? {kind: 'cron', expr: this.applyCronExpr, tz: null}
+              : null;
         await OpenFangAPI.put('/api/evolve/config', body);
         OpenFangToast.success('Configuration saved');
           await this.loadCost();
       } catch (e) { OpenFangToast.error('Failed to save: ' + (e.message || e)); }
       this.saving = false;
     },
+
+      // ── Batch apply controls ──
+      // Hydrate the batch-apply snapshot on mount so a reloading page resumes
+      // the spinner + last preview/summary without waiting for a click.
+      async loadBatchApplyStatus() {
+          try {
+              var s = await OpenFangAPI.get('/api/evolve/batch-apply/status');
+              if (!s) return;
+              this._applyBatchApplySnapshot(s);
+              if (s.running) this._startBatchApplyPolling();
+          } catch (_) { /* ignore — endpoint may be down */
+          }
+          // Heartbeat is started exactly once per page mount; subsequent calls
+          // (from buttons or the heartbeat itself) skip the guard.
+          this._startBatchApplyHeartbeat();
+      },
+      _startBatchApplyHeartbeat() {
+          if (this._batchApplyHeartbeat) return;
+          var self = this;
+          this._batchApplyHeartbeat = setInterval(async function () {
+              // Skip if the fast poller is already covering us.
+              if (self._batchApplyPollHandle) return;
+              try {
+                  var s = await OpenFangAPI.get('/api/evolve/batch-apply/status');
+                  if (!s) return;
+                  self._applyBatchApplySnapshot(s);
+                  if (s.running) self._startBatchApplyPolling();
+              } catch (_) {
+              }
+          }, 5000);
+      },
+      _applyBatchApplySnapshot(s) {
+          this.batchApply.running = !!s.running;
+          this.batchApply.operation = s.operation || null;
+          this.batchApply.current = s.current || 0;
+          this.batchApply.total = s.total || 0;
+          this.batchApply.stepLabel = s.step_label || null;
+          this.batchApply.lastPreview = s.last_preview || null;
+          this.batchApply.lastSummary = s.last_run_summary || null;
+          this.batchApply.startedAt = s.started_at || null;
+          this.batchApply.finishedAt = s.finished_at || null;
+          this.batchApply.error = s.last_error || null;
+      },
+      _startBatchApplyPolling() {
+          if (this._batchApplyPollHandle) return;
+          var self = this;
+          this._batchApplyPollHandle = setInterval(async function () {
+              try {
+                  var s = await OpenFangAPI.get('/api/evolve/batch-apply/status');
+                  if (!s) return;
+                  var wasRunning = self.batchApply.running;
+                  self._applyBatchApplySnapshot(s);
+                  if (!s.running && wasRunning) {
+                      clearInterval(self._batchApplyPollHandle);
+                      self._batchApplyPollHandle = null;
+                      // Refresh related data once the run finishes.
+                      try {
+                          await Promise.all([self.loadStats(), self.loadAnalyses(), self.loadSkillRecords()]);
+                          self.buildSkillClasses();
+                      } catch (_) {
+                      }
+                  }
+              } catch (_) {
+              }
+          }, 1500);
+      },
+      async previewBatchApply() {
+          this.batchApply.running = true;
+          this.batchApply.operation = 'preview';
+          this.batchApply.error = null;
+          // Start the poller before the request returns — server's snapshot
+          // already reflects running=true, so reload mid-call keeps the spinner.
+          this._startBatchApplyPolling();
+          try {
+              var data = await OpenFangAPI.get('/api/evolve/batch-apply/preview');
+              this.batchApply.lastPreview = data;
+              OpenFangToast.success('Preview: ' + (data.total_pending || 0) + ' pending, ' +
+                  (data.superseded || 0) + ' would dedup, ' + (data.survivors || 0) + ' survivors');
+          } catch (e) {
+              this.batchApply.error = e.message || String(e);
+              OpenFangToast.error('Preview failed: ' + this.batchApply.error);
+          }
+          // Final state is authoritative from the server — refresh now and stop
+          // the poller if the server already flipped running=false.
+          try {
+              var s = await OpenFangAPI.get('/api/evolve/batch-apply/status');
+              if (s) this._applyBatchApplySnapshot(s);
+              if (!s || !s.running) {
+                  if (this._batchApplyPollHandle) {
+                      clearInterval(this._batchApplyPollHandle);
+                      this._batchApplyPollHandle = null;
+                  }
+              }
+          } catch (_) {
+          }
+      },
+      async runBatchApply() {
+          if (!confirm('Run batch apply now? This will dedup pending suggestions and execute the survivors.')) return;
+          this.batchApply.running = true;
+          this.batchApply.operation = 'run';
+          this.batchApply.error = null;
+          this._startBatchApplyPolling();
+          try {
+              var data = await OpenFangAPI.post('/api/evolve/batch-apply/run', {});
+              this.batchApply.lastSummary = (data && data.summary) || JSON.stringify(data);
+              OpenFangToast.success('Batch apply complete');
+              await Promise.all([this.loadStats(), this.loadAnalyses(), this.loadSkillRecords()]);
+          } catch (e) {
+              this.batchApply.error = e.message || String(e);
+              OpenFangToast.error('Batch apply failed: ' + this.batchApply.error);
+          }
+          try {
+              var s = await OpenFangAPI.get('/api/evolve/batch-apply/status');
+              if (s) this._applyBatchApplySnapshot(s);
+              if (!s || !s.running) {
+                  if (this._batchApplyPollHandle) {
+                      clearInterval(this._batchApplyPollHandle);
+                      this._batchApplyPollHandle = null;
+                  }
+              }
+          } catch (_) {
+          }
+      },
     async loadStats() {
       var data = await OpenFangAPI.get('/api/evolve/stats');
       if (data) this.stats = data;
@@ -369,16 +567,19 @@ function evolutionPage() {
       } catch (e) { this.analyzerAgentId = null; }
     },
     async loadAnalyses() {
-      var data = await OpenFangAPI.get('/api/evolve/analyses?limit=50');
-      if (data && data.analyses) {
-        data.analyses.forEach(function(a) {
-          (a.evolution_suggestions || []).forEach(function(s) {
-            s._executing = false;
-            s._deleting = false;
-          });
+        var limit = this.overviewPageSize || 25;
+        var offset = (Math.max(1, this.overviewPage) - 1) * limit;
+        var data = await OpenFangAPI.get('/api/evolve/analyses?limit=' + limit + '&offset=' + offset);
+        // Response shape: { items, total, limit, offset }
+        var items = (data && (data.items || data.analyses)) || [];
+        items.forEach(function (a) {
+            (a.evolution_suggestions || []).forEach(function (s) {
+                s._executing = false;
+                s._deleting = false;
+            });
         });
-        this.analyses = data.analyses;
-      }
+        this.analyses = items;
+        this.overviewTotal = (data && typeof data.total === 'number') ? data.total : items.length;
     },
     async runAnalysis() {
       if (this.running) return;
@@ -509,11 +710,98 @@ function evolutionPage() {
             || (s.kind || '').toLowerCase().indexOf(q) !== -1;
         });
       }
-      var sort = this.suggestionsSort;
-      var desc = sort.charAt(0) === '-';
-      var field = desc ? sort.substring(1) : sort;
+        var desc = !!this.suggestionsSortDesc;
+        var field = this.suggestionsSort || 'priority';
+        list.sort(function (a, b) {
+            var va = self._sortValue(a, field);
+            var vb = self._sortValue(b, field);
+            if (va < vb) return desc ? 1 : -1;
+            if (va > vb) return desc ? -1 : 1;
+            return 0;
+        });
+        return list;
+    },
+
+      // ════════════════════════════════════════
+      // Pagination + sort helpers
+      // ════════════════════════════════════════
+      // Extracts a comparable value for a field across nested rows (e.g.
+      // suggestions reference their analysis via `_analysis` for session_id /
+      // analyzed_at). String fields lower-cased for stable ordering.
+      _sortValue(row, field) {
+          if (!row) return '';
+          var v;
+          if (field === 'session_id' || field === 'session') v = row._analysis ? row._analysis.session_id : '';
+          else if (field === 'analyzed_at' || field === 'analyzed') v = row._analysis ? row._analysis.analyzed_at : row.analyzed_at;
+          else if (field === 'status') {
+              v = row.executed_at ? 2 : (row.failed_at ? 1 : 0);
+          } else {
+              v = row[field];
+          }
+          if (v === null || v === undefined) v = '';
+          if (typeof v === 'string') return v.toLowerCase();
+          return v;
+      },
+
+      // Toggle sort: same field → flip direction; new field → set desc default.
+      toggleOverviewSort(field) {
+          if (this.overviewSort === field) {
+              this.overviewSortDesc = !this.overviewSortDesc;
+          } else {
+              this.overviewSort = field;
+              this.overviewSortDesc = true;
+          }
+          // Only analyzed_at uses server-side ordering; other columns sort the
+          // current page client-side.
+      },
+      toggleSuggestionsSort(field) {
+          if (this.suggestionsSort === field) {
+              this.suggestionsSortDesc = !this.suggestionsSortDesc;
+          } else {
+              this.suggestionsSort = field;
+              this.suggestionsSortDesc = true;
+          }
+          this.suggestionsPage = 1;
+      },
+      sortGlyph(active, current, desc) {
+          if (active !== current) return '';
+          return desc ? '▼' : '▲';
+      },
+
+      // Analyses on the current page, sorted client-side by overviewSort.
+      get sortedAnalyses() {
+          var self = this;
+          var list = this.analyses.slice();
+          var desc = !!this.overviewSortDesc;
+          var field = this.overviewSort || 'analyzed_at';
       list.sort(function(a, b) {
-        var va = a[field] || 0, vb = b[field] || 0;
+          var va, vb;
+          if (field === 'session_id') {
+              va = a.session_id;
+              vb = b.session_id;
+          } else if (field === 'agent_id') {
+              va = a.agent_id;
+              vb = b.agent_id;
+          } else if (field === 'task_completed') {
+              va = a.task_completed ? 1 : 0;
+              vb = b.task_completed ? 1 : 0;
+          } else if (field === 'tool_issues') {
+              va = (a.tool_issues || []).length;
+              vb = (b.tool_issues || []).length;
+          } else if (field === 'evolution_suggestions') {
+              va = (a.evolution_suggestions || []).length;
+              vb = (b.evolution_suggestions || []).length;
+          } else if (field === 'model_used') {
+              va = a.model_used;
+              vb = b.model_used;
+          } else {
+              va = a.analyzed_at;
+              vb = b.analyzed_at;
+          }
+          if (va === null || va === undefined) va = '';
+          if (vb === null || vb === undefined) vb = '';
+          if (typeof va === 'string') va = va.toLowerCase();
+          if (typeof vb === 'string') vb = vb.toLowerCase();
         if (va < vb) return desc ? 1 : -1;
         if (va > vb) return desc ? -1 : 1;
         return 0;
@@ -521,7 +809,129 @@ function evolutionPage() {
       return list;
     },
 
-    // ════════════════════════════════════════
+      get overviewTotalPages() {
+          return Math.max(1, Math.ceil((this.overviewTotal || 0) / Math.max(1, this.overviewPageSize)));
+      },
+
+      // Suggestions slice for the current page.
+      get paginatedSuggestions() {
+          var size = Math.max(1, this.suggestionsPageSize);
+          var page = Math.max(1, this.suggestionsPage);
+          var list = this.filteredSuggestions;
+          // Clamp page if filters shrank the list past the current page.
+          var maxPage = Math.max(1, Math.ceil(list.length / size));
+          if (page > maxPage) {
+              this.suggestionsPage = maxPage;
+              page = maxPage;
+          }
+          var start = (page - 1) * size;
+          return list.slice(start, start + size);
+      },
+
+      get suggestionsTotalPages() {
+          return Math.max(1, Math.ceil(this.filteredSuggestions.length / Math.max(1, this.suggestionsPageSize)));
+      },
+
+      get paginatedSkillClasses() {
+          var size = Math.max(1, this.skillsPageSize);
+          var page = Math.max(1, this.skillsPage);
+          var list = this.filteredSkillClasses;
+          var maxPage = Math.max(1, Math.ceil(list.length / size));
+          if (page > maxPage) {
+              this.skillsPage = maxPage;
+              page = maxPage;
+          }
+          var start = (page - 1) * size;
+          return list.slice(start, start + size);
+      },
+
+      get skillsTotalPages() {
+          return Math.max(1, Math.ceil(this.filteredSkillClasses.length / Math.max(1, this.skillsPageSize)));
+      },
+
+      get paginatedClassSkills() {
+          var size = Math.max(1, this.skillDetailPageSize);
+          var page = Math.max(1, this.skillDetailPage);
+          var list = this.selectedClassSkills || [];
+          var maxPage = Math.max(1, Math.ceil(list.length / size));
+          if (page > maxPage) {
+              this.skillDetailPage = maxPage;
+              page = maxPage;
+          }
+          var start = (page - 1) * size;
+          return list.slice(start, start + size);
+      },
+
+      get skillDetailTotalPages() {
+          return Math.max(1, Math.ceil((this.selectedClassSkills || []).length / Math.max(1, this.skillDetailPageSize)));
+      },
+
+      // ════════════════════════════════════════
+      // Multi-select bulk delete (Suggestions tab)
+      // ════════════════════════════════════════
+      get selectedSuggestionCount() {
+          var n = 0;
+          for (var k in this.selectedSuggestions) {
+              if (this.selectedSuggestions[k]) n++;
+          }
+          return n;
+      },
+
+      isPageFullySelected() {
+          var page = this.paginatedSuggestions;
+          if (page.length === 0) return false;
+          for (var i = 0; i < page.length; i++) {
+              if (!this.selectedSuggestions[page[i]._key]) return false;
+          }
+          return true;
+      },
+
+      togglePageSelection(checked) {
+          var page = this.paginatedSuggestions;
+          for (var i = 0; i < page.length; i++) {
+              if (checked) this.selectedSuggestions[page[i]._key] = true;
+              else delete this.selectedSuggestions[page[i]._key];
+          }
+      },
+
+      clearSuggestionSelection() {
+          this.selectedSuggestions = {};
+      },
+
+      async deleteSelectedSuggestions() {
+          var keys = Object.keys(this.selectedSuggestions).filter((k) => this.selectedSuggestions[k]);
+          if (keys.length === 0) return;
+          if (!confirm('Delete ' + keys.length + ' suggestion(s)? This cannot be undone.')) return;
+          // Snapshot rows to delete by key — `allSuggestions` is rebuilt on each
+          // reload so we resolve identity now.
+          var keySet = {};
+          keys.forEach(function (k) {
+              keySet[k] = true;
+          });
+          var rows = this.allSuggestions.filter(function (r) {
+              return keySet[r._key];
+          });
+          var ok = 0, fail = 0;
+          for (var i = 0; i < rows.length; i++) {
+              var s = rows[i];
+              try {
+                  await OpenFangAPI.delete('/api/evolve/suggestion', {
+                      analysis_id: s._analysis.id,
+                      kind: (s.kind || 'fix').toLowerCase(),
+                      description: s.description || ''
+                  });
+                  ok++;
+              } catch (_) {
+                  fail++;
+              }
+          }
+          if (fail === 0) OpenFangToast.success('Deleted ' + ok + ' suggestion(s)');
+          else OpenFangToast.error('Deleted ' + ok + ', failed ' + fail);
+          this.selectedSuggestions = {};
+          await this.loadAnalyses();
+      },
+
+      // ════════════════════════════════════════
     // Evolution execution
     // ════════════════════════════════════════
     executingAll: false,
@@ -796,6 +1206,7 @@ function evolutionPage() {
       this.selectedClassName = className;
       var cls = this.skillClasses.find(function(c) { return c.name === className; });
       this.selectedClassSkills = cls ? cls.skills : [];
+        this.skillDetailPage = 1;
       this.evolutionView = 'skill-detail';
       this.buildLineageGraph();
       var self = this;

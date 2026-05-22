@@ -1,6 +1,7 @@
 //! Configuration types for the OpenFang kernel.
 
 use crate::prompt_guard::PromptGuardPolicy;
+use crate::scheduler::CronSchedule;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1425,6 +1426,23 @@ pub struct EvolveConfig {
     /// Canary completion rate must be ≥ `parent_birth_rate * canary_rate_floor`
     /// to be promoted. Below = automatic rollback.
     pub canary_rate_floor: f64,
+
+    // --- Scheduled batch analysis + batch apply (see openfang_evolve::batch_apply) ---
+    /// Schedule for the recurring batch analysis job. When set, kernel upserts
+    /// a cron job named `evolve: analyze sessions` matching this schedule.
+    /// `None` removes the cron job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyze_schedule: Option<CronSchedule>,
+    /// Schedule for the recurring batch apply job. When set, kernel upserts
+    /// a cron job named `evolve: batch apply` matching this schedule.
+    /// `None` removes the cron job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_schedule: Option<CronSchedule>,
+    /// Whether to run LLM-as-judge dedup before each batch apply.
+    pub dedup_enabled: bool,
+    /// Max suggestions enqueued per batch apply run. None = no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_max_per_run: Option<usize>,
 }
 
 impl Default for EvolveConfig {
@@ -1451,6 +1469,10 @@ impl Default for EvolveConfig {
             canary_traffic_split: 0.25,
             canary_min_completions: 10,
             canary_rate_floor: 0.7,
+            analyze_schedule: None,
+            apply_schedule: None,
+            dedup_enabled: true,
+            apply_max_per_run: Some(20),
         }
     }
 }

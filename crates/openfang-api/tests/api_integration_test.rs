@@ -84,6 +84,7 @@ async fn start_test_server_with_provider(
         evolve_execute_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
         evolve_execute_tx: None,
         evolve_execute_events: None,
+        batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(Default::default())),
     });
 
     let app = Router::new()
@@ -848,6 +849,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         evolve_execute_progress: Arc::new(tokio::sync::RwLock::new(Default::default())),
         evolve_execute_tx: None,
         evolve_execute_events: None,
+        batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(Default::default())),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();

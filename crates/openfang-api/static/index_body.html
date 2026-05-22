@@ -1911,6 +1911,11 @@
                       <tr>
                         <td>
                           <span class="font-bold" x-text="job.name || job.description || '(unnamed)'"></span>
+                            <a :href="job.managed_href" :title="'Managed by ' + job.managed_by + ' — edit the schedule there to avoid silent overwrites.'"
+                               class="badge badge-info" style="margin-left:6px;font-size:10px;text-decoration:none"
+                               x-show="job.managed">
+                                managed
+                            </a>
                           <div class="text-xs text-dim" x-show="job.message" x-text="(job.message || '').substring(0, 60) + ((job.message || '').length > 60 ? '...' : '')" :title="job.message"></div>
                           <div x-show="expandedJobId === job.id" style="margin-top:8px;padding:8px;background:rgba(148,163,184,0.06);border-left:3px solid var(--accent);border-radius:3px">
                             <div class="font-bold" style="font-size:12px;margin-bottom:6px">Delivery Log</div>
@@ -5960,6 +5965,100 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   </div>
                 </div>
 
+                  <!-- Batch schedules + dedup -->
+                  <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-color);display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                      <div>
+                          <label class="form-label"
+                                 title="Cron expression for the recurring analysis batch (e.g. '0 */4 * * *')">Analyze
+                              schedule (cron)</label>
+                          <input class="form-input" placeholder="0 */4 * * *" type="text" x-model="analyzeCronExpr">
+                      </div>
+                      <div>
+                          <label class="form-label"
+                                 title="Cron expression for the recurring batch apply (e.g. '0 5 * * *')">Batch apply
+                              schedule (cron)</label>
+                          <input class="form-input" placeholder="0 5 * * *" type="text" x-model="applyCronExpr">
+                      </div>
+                      <div>
+                          <label class="form-label" title="Max suggestions to enqueue per batch apply run">Max applied
+                              per run</label>
+                          <input class="form-input" max="500" min="1" type="number" x-model="config.apply_max_per_run">
+                      </div>
+                      <div style="display:flex;align-items:end">
+                          <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                              <input type="checkbox" x-model="config.dedup_enabled"> LLM dedup before apply
+                          </label>
+                      </div>
+                  </div>
+
+                  <!-- Batch apply manual controls + preview -->
+                  <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-color)">
+                      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                          <button :disabled="batchApply.running" @click="previewBatchApply()"
+                                  class="btn btn-ghost btn-sm">
+                              <span x-text="batchApply.running && batchApply.operation === 'preview' ? 'Previewing...' : 'Preview dedup'"></span>
+                          </button>
+                          <button :disabled="batchApply.running" @click="runBatchApply()"
+                                  class="btn btn-primary btn-sm">
+                              <span x-text="batchApply.running && batchApply.operation === 'run' ? 'Running...' : 'Run batch apply now'"></span>
+                          </button>
+                          <span class="text-xs text-dim" x-show="batchApply.lastSummary && !batchApply.running">
+                              Last run: <span x-text="batchApply.lastSummary"></span>
+                          </span>
+                          <span class="text-xs" style="color:var(--color-danger,#ef4444)" x-show="batchApply.error"
+                                x-text="'Error: ' + batchApply.error"></span>
+                      </div>
+                      <div class="text-xs text-dim" style="margin-top:4px;font-style:italic">
+                          Preview is a dry run — no changes saved until you click Run.
+                      </div>
+                      <!-- Animated progress bar while running. Determinate when total>0 (run path), indeterminate otherwise (preview / pre-dedup). -->
+                      <div style="margin-top:8px" x-show="batchApply.running">
+                          <div class="progress-bar">
+                              <template x-if="batchApply.total > 0">
+                                  <div :style="'width:' + Math.round((batchApply.current / batchApply.total) * 100) + '%'"
+                                       class="progress-bar-fill"></div>
+                              </template>
+                              <template x-if="!batchApply.total">
+                                  <div class="progress-bar-indeterminate"></div>
+                              </template>
+                          </div>
+                          <div class="text-xs text-dim" style="margin-top:4px">
+                              <template x-if="batchApply.total > 0">
+                                  <span><span x-text="batchApply.current"></span>/<span
+                                          x-text="batchApply.total"></span><template x-if="batchApply.stepLabel"><span> · </span></template></span>
+                              </template>
+                              <span x-show="batchApply.stepLabel" x-text="batchApply.stepLabel"></span>
+                          </div>
+                      </div>
+                      <div style="margin-top:8px;font-size:12px" x-show="batchApply.lastPreview">
+                          <div class="text-xs text-dim">
+                              <strong x-text="(batchApply.lastPreview && batchApply.lastPreview.total_pending) || 0"></strong>
+                              pending ·
+                              <strong x-text="(batchApply.lastPreview && batchApply.lastPreview.superseded) || 0"></strong>
+                              would dedup ·
+                              <strong x-text="(batchApply.lastPreview && batchApply.lastPreview.survivors) || 0"></strong>
+                              survivors
+                              <span x-show="batchApply.lastPreview && batchApply.lastPreview.used_llm">(LLM judge)</span>
+                              <span x-show="batchApply.lastPreview && !batchApply.lastPreview.used_llm && !batchApply.lastPreview.dedup_skipped">(heuristic fallback)</span>
+                          </div>
+                          <div class="text-xs text-dim" x-show="batchApply.finishedAt">
+                              Last preview: <span x-text="fmtTime(batchApply.finishedAt)"></span>
+                          </div>
+                          <template
+                                  x-if="batchApply.lastPreview && batchApply.lastPreview.groups && batchApply.lastPreview.groups.length">
+                              <ul style="margin:6px 0 0;padding-left:18px">
+                                  <template :key="g.survivor_id" x-for="g in batchApply.lastPreview.groups">
+                                      <li>
+                                          survivor <strong x-text="g.survivor_id"></strong> ←
+                                          <span x-text="g.loser_ids.join(', ')"></span>
+                                          <span class="text-dim" x-text="' · ' + g.reason"></span>
+                                      </li>
+                                  </template>
+                              </ul>
+                          </template>
+                      </div>
+                  </div>
+
                   <!-- Advanced thresholds (collapsible) -->
                   <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-color)">
                       <button @click="showAdvanced = !showAdvanced" class="btn btn-ghost btn-sm"
@@ -6155,17 +6254,32 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <table class="table" style="margin-top:8px">
                         <thead>
                           <tr>
-                            <th>Session</th>
-                            <th>Agent</th>
-                            <th>Completed</th>
-                            <th>Issues</th>
-                            <th>Suggestions</th>
-                            <th>Model</th>
-                            <th>Analyzed</th>
+                              <th @click="toggleOverviewSort('session_id')" class="sortable-th">Session<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('session_id', overviewSort, overviewSortDesc)"></span></th>
+                              <th @click="toggleOverviewSort('agent_id')" class="sortable-th">Agent<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('agent_id', overviewSort, overviewSortDesc)"></span></th>
+                              <th @click="toggleOverviewSort('task_completed')" class="sortable-th">Completed<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('task_completed', overviewSort, overviewSortDesc)"></span></th>
+                              <th @click="toggleOverviewSort('tool_issues')" class="sortable-th">Issues<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('tool_issues', overviewSort, overviewSortDesc)"></span></th>
+                              <th @click="toggleOverviewSort('evolution_suggestions')" class="sortable-th">
+                                  Suggestions<span class="sort-indicator"
+                                                   x-text="sortGlyph('evolution_suggestions', overviewSort, overviewSortDesc)"></span>
+                              </th>
+                              <th @click="toggleOverviewSort('model_used')" class="sortable-th">Model<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('model_used', overviewSort, overviewSortDesc)"></span></th>
+                              <th @click="toggleOverviewSort('analyzed_at')" class="sortable-th">Analyzed<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('analyzed_at', overviewSort, overviewSortDesc)"></span></th>
                           </tr>
                         </thead>
-                        <tbody>
-                          <template x-for="a in analyses" :key="a.id">
+                          <template :key="a.id" x-for="a in sortedAnalyses">
+                              <tbody>
                             <tr style="cursor:pointer" @click="selectAnalysis(a)" :class="{ 'active-row': selectedAnalysis && selectedAnalysis.id === a.id }">
                               <td><code x-text="shortId(a.session_id)"></code></td>
                               <td><code x-text="shortId(a.agent_id)"></code></td>
@@ -6177,111 +6291,169 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                               <td style="font-size:12px" x-text="a.model_used"></td>
                               <td style="font-size:12px" x-text="fmtTime(a.analyzed_at)"></td>
                             </tr>
+                            <tr class="analysis-detail-row" x-show="selectedAnalysis && selectedAnalysis.id === a.id">
+                                <td colspan="7">
+                                    <div class="analysis-detail-content">
+                                        <div class="card-header">Analysis Detail</div>
+
+                                        <div style="margin-top:12px">
+                                            <strong>Execution Note</strong>
+                                            <p style="margin:4px 0 12px;opacity:0.85" x-text="a.execution_note"></p>
+                                        </div>
+
+                                        <!-- Tool Issues -->
+                                        <template x-if="a.tool_issues && a.tool_issues.length > 0">
+                                            <div style="margin-bottom:12px">
+                                                <strong>Tool Issues</strong>
+                                                <table class="table" style="margin-top:4px">
+                                                    <thead>
+                                                    <tr>
+                                                        <th>Tool</th>
+                                                        <th>Type</th>
+                                                        <th>Description</th>
+                                                    </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                    <template :key="ti.tool_name + ti.issue_type"
+                                                              x-for="ti in a.tool_issues">
+                                                        <tr>
+                                                            <td><code x-text="ti.tool_name"></code></td>
+                                                            <td><span :class="issueClass(ti.issue_type)" class="badge"
+                                                                      x-text="ti.issue_type"></span></td>
+                                                            <td x-text="ti.description"></td>
+                                                        </tr>
+                                                    </template>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </template>
+
+                                        <!-- Skill Judgments -->
+                                        <template x-if="a.skill_judgments && a.skill_judgments.length > 0">
+                                            <div style="margin-bottom:12px">
+                                                <strong>Skill Judgments</strong>
+                                                <table class="table" style="margin-top:4px">
+                                                    <thead>
+                                                    <tr>
+                                                        <th>Skill</th>
+                                                        <th>Applied</th>
+                                                        <th>Quality</th>
+                                                        <th>Note</th>
+                                                    </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                    <template :key="sj.skill_name" x-for="sj in a.skill_judgments">
+                                                        <tr>
+                                                            <td><code x-text="sj.skill_name"></code></td>
+                                                            <td><span :class="sj.applied ? 'badge-success' : 'badge-dim'"
+                                                                      class="badge"
+                                                                      x-text="sj.applied ? 'Yes' : 'No'"></span></td>
+                                                            <td><span :class="qualityClass(sj.quality)" class="badge"
+                                                                      x-text="sj.quality"></span></td>
+                                                            <td x-text="sj.note"></td>
+                                                        </tr>
+                                                    </template>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </template>
+
+                                        <!-- Evolution Suggestions -->
+                                        <template x-if="a.evolution_suggestions && a.evolution_suggestions.length > 0">
+                                            <div style="margin-bottom:12px">
+                                                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                                                    <strong>Evolution Suggestions</strong>
+                                                    <button :disabled="executingAll"
+                                                            @click="executeAllSuggestions(a)"
+                                                            class="btn btn-xs btn-accent">
+                                                        <span class="loading loading-spinner loading-xs"
+                                                              x-show="executingAll"></span>
+                                                        <span x-show="!executingAll">Execute All</span>
+                                                    </button>
+                                                </div>
+                                                <table class="table" style="margin-top:4px">
+                                                    <thead>
+                                                    <tr>
+                                                        <th>Kind</th>
+                                                        <th>Target</th>
+                                                        <th>Priority</th>
+                                                        <th>Description</th>
+                                                        <th>Action</th>
+                                                    </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                    <template :key="es.description"
+                                                              x-for="es in a.evolution_suggestions">
+                                                        <tr :class="es.executed_at || es.failed_at ? 'opacity-50' : ''">
+                                                            <td><span :class="kindClass(es.kind)" class="badge"
+                                                                      x-text="es.kind"></span></td>
+                                                            <td><code x-text="es.target_skill || '-'"></code></td>
+                                                            <td x-text="es.priority"></td>
+                                                            <td x-text="es.description"></td>
+                                                            <td>
+                                                                <template x-if="es.executed_at">
+                                                                    <span class="badge badge-success badge-sm">Done</span>
+                                                                </template>
+                                                                <template x-if="es.failed_at && !es.executed_at">
+                                                                    <span :title="es.failure_reason || ''"
+                                                                          class="badge badge-error badge-sm">Failed</span>
+                                                                </template>
+                                                                <template x-if="!es.executed_at && !es.failed_at">
+                                                                    <button :disabled="es._executing || isSuggestionExecuting(a.id, es) || (es.kind === 'fix' && !es.target_skill)"
+                                                                            :title="(es.kind === 'fix' && !es.target_skill) ? 'FIX requires a target skill — analyzer did not name one' : ''"
+                                                                            @click="executeSuggestion(a.id, es)"
+                                                                            class="btn btn-xs btn-primary">
+                                                                        <span class="loading loading-spinner loading-xs"
+                                                                              x-show="es._executing || isSuggestionExecuting(a.id, es)"></span>
+                                                                        <span x-show="!(es._executing || isSuggestionExecuting(a.id, es))">Evolve</span>
+                                                                    </button>
+                                                                </template>
+                                                            </td>
+                                                        </tr>
+                                                    </template>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </template>
+
+                                        <div style="font-size:12px;opacity:0.5;margin-top:8px">
+                                            Tokens: <span x-text="a.input_tokens"></span> in / <span
+                                                x-text="a.output_tokens"></span> out
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                              </tbody>
                           </template>
-                        </tbody>
                       </table>
                     </template>
-                  </div>
-
-                  <!-- Analysis Detail (below table) -->
-                  <template x-if="selectedAnalysis">
-                    <div class="card" style="margin-top:16px;padding:16px">
-                      <div class="card-header">Analysis Detail</div>
-
-                      <div style="margin-top:12px">
-                        <strong>Execution Note</strong>
-                        <p style="margin:4px 0 12px;opacity:0.85" x-text="selectedAnalysis.execution_note"></p>
-                      </div>
-
-                      <!-- Tool Issues -->
-                      <template x-if="selectedAnalysis.tool_issues && selectedAnalysis.tool_issues.length > 0">
-                        <div style="margin-bottom:12px">
-                          <strong>Tool Issues</strong>
-                          <table class="table" style="margin-top:4px">
-                            <thead><tr><th>Tool</th><th>Type</th><th>Description</th></tr></thead>
-                            <tbody>
-                              <template x-for="ti in selectedAnalysis.tool_issues" :key="ti.tool_name + ti.issue_type">
-                                <tr>
-                                  <td><code x-text="ti.tool_name"></code></td>
-                                  <td><span class="badge" :class="issueClass(ti.issue_type)" x-text="ti.issue_type"></span></td>
-                                  <td x-text="ti.description"></td>
-                                </tr>
-                              </template>
-                            </tbody>
-                          </table>
-                        </div>
-                      </template>
-
-                      <!-- Skill Judgments -->
-                      <template x-if="selectedAnalysis.skill_judgments && selectedAnalysis.skill_judgments.length > 0">
-                        <div style="margin-bottom:12px">
-                          <strong>Skill Judgments</strong>
-                          <table class="table" style="margin-top:4px">
-                            <thead><tr><th>Skill</th><th>Applied</th><th>Quality</th><th>Note</th></tr></thead>
-                            <tbody>
-                              <template x-for="sj in selectedAnalysis.skill_judgments" :key="sj.skill_name">
-                                <tr>
-                                  <td><code x-text="sj.skill_name"></code></td>
-                                  <td><span class="badge" :class="sj.applied ? 'badge-success' : 'badge-dim'" x-text="sj.applied ? 'Yes' : 'No'"></span></td>
-                                  <td><span class="badge" :class="qualityClass(sj.quality)" x-text="sj.quality"></span></td>
-                                  <td x-text="sj.note"></td>
-                                </tr>
-                              </template>
-                            </tbody>
-                          </table>
-                        </div>
-                      </template>
-
-                      <!-- Evolution Suggestions -->
-                      <template x-if="selectedAnalysis.evolution_suggestions && selectedAnalysis.evolution_suggestions.length > 0">
-                        <div style="margin-bottom:12px">
-                          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                            <strong>Evolution Suggestions</strong>
-                            <button class="btn btn-xs btn-accent"
-                                    @click="executeAllSuggestions(selectedAnalysis)"
-                                    :disabled="executingAll">
-                              <span x-show="executingAll" class="loading loading-spinner loading-xs"></span>
-                              <span x-show="!executingAll">Execute All</span>
-                            </button>
+                      <!-- Pagination footer (server-side; reloads on page/size change) -->
+                      <div class="pagination-bar" x-show="overviewTotal > 0">
+                          <div>
+                              <label>Per page:
+                                  <select @change="overviewPage=1; loadAnalyses()" class="form-input"
+                                          style="width:auto;display:inline-block;margin-left:4px"
+                                          x-model.number="overviewPageSize">
+                                      <option :value="10">10</option>
+                                      <option :value="25">25</option>
+                                      <option :value="50">50</option>
+                                      <option :value="100">100</option>
+                                  </select>
+                              </label>
+                              <span style="margin-left:12px;opacity:0.6" x-text="overviewTotal + ' total'"></span>
                           </div>
-                          <table class="table" style="margin-top:4px">
-                            <thead><tr><th>Kind</th><th>Target</th><th>Priority</th><th>Description</th><th>Action</th></tr></thead>
-                            <tbody>
-                              <template x-for="es in selectedAnalysis.evolution_suggestions" :key="es.description">
-                                <tr :class="es.executed_at || es.failed_at ? 'opacity-50' : ''">
-                                  <td><span class="badge" :class="kindClass(es.kind)" x-text="es.kind"></span></td>
-                                  <td><code x-text="es.target_skill || '-'"></code></td>
-                                  <td x-text="es.priority"></td>
-                                  <td x-text="es.description"></td>
-                                  <td>
-                                    <template x-if="es.executed_at">
-                                      <span class="badge badge-success badge-sm">Done</span>
-                                    </template>
-                                    <template x-if="es.failed_at && !es.executed_at">
-                                      <span class="badge badge-error badge-sm" :title="es.failure_reason || ''">Failed</span>
-                                    </template>
-                                    <template x-if="!es.executed_at && !es.failed_at">
-                                      <button class="btn btn-xs btn-primary"
-                                              @click="executeSuggestion(selectedAnalysis.id, es)"
-                                              :disabled="es._executing || isSuggestionExecuting(selectedAnalysis.id, es) || (es.kind === 'fix' && !es.target_skill)"
-                                              :title="(es.kind === 'fix' && !es.target_skill) ? 'FIX requires a target skill — analyzer did not name one' : ''">
-                                        <span x-show="es._executing || isSuggestionExecuting(selectedAnalysis.id, es)" class="loading loading-spinner loading-xs"></span>
-                                        <span x-show="!(es._executing || isSuggestionExecuting(selectedAnalysis.id, es))">Evolve</span>
-                                      </button>
-                                    </template>
-                                  </td>
-                                </tr>
-                              </template>
-                            </tbody>
-                          </table>
-                        </div>
-                      </template>
-
-                      <div style="font-size:12px;opacity:0.5;margin-top:8px">
-                        Tokens: <span x-text="selectedAnalysis.input_tokens"></span> in / <span x-text="selectedAnalysis.output_tokens"></span> out
+                          <div style="display:flex;gap:6px;align-items:center">
+                              <button :disabled="overviewPage===1"
+                                      @click="overviewPage=Math.max(1,overviewPage-1); loadAnalyses()"
+                                      class="btn btn-xs">Prev
+                              </button>
+                              <span x-text="'Page ' + overviewPage + ' / ' + overviewTotalPages"></span>
+                              <button :disabled="overviewPage >= overviewTotalPages" @click="overviewPage=overviewPage+1; loadAnalyses()"
+                                      class="btn btn-xs">Next
+                              </button>
+                          </div>
                       </div>
-                    </div>
-                  </template>
+                  </div>
                 </div>
               </template>
 
@@ -6293,9 +6465,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <div>
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                      <input type="text" class="form-input" x-model="suggestionsSearch" placeholder="Filter suggestions..."
+                        <input @input="suggestionsPage=1" class="form-input" placeholder="Filter suggestions..." type="text"
+                               x-model="suggestionsSearch"
                         style="min-width:200px;max-width:320px">
-                      <select class="form-input" x-model="suggestionsKindFilter" style="width:auto;min-width:100px">
+                        <select @change="suggestionsPage=1" class="form-input" style="width:auto;min-width:100px"
+                                x-model="suggestionsKindFilter">
                         <option value="">All Types</option>
                         <option value="fix">Fix</option>
                         <option value="derived">Derived</option>
@@ -6305,7 +6479,18 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     <span style="font-size:12px;opacity:0.6" x-text="filteredSuggestions.length + ' suggestions'"></span>
                   </div>
 
-                  <template x-if="filteredSuggestions.length === 0">
+                    <!-- Bulk action bar (visible only with selection) -->
+                    <div class="bulk-action-bar" style="display:flex;justify-content:space-between;align-items:center"
+                         x-show="selectedSuggestionCount > 0">
+                        <span><strong x-text="selectedSuggestionCount"></strong> selected</span>
+                        <div style="display:flex;gap:6px">
+                            <button @click="clearSuggestionSelection()" class="btn btn-xs btn-ghost">Clear</button>
+                            <button @click="deleteSelectedSuggestions()" class="btn btn-xs btn-error">Delete Selected
+                            </button>
+                        </div>
+                    </div>
+
+                    <template x-if="filteredSuggestions.length === 0">
                     <div style="text-align:center;padding:40px;opacity:0.5">No evolution suggestions found.</div>
                   </template>
 
@@ -6314,19 +6499,43 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <table class="table" style="width:100%">
                         <thead>
                           <tr>
-                            <th style="cursor:pointer" @click="suggestionsSort = suggestionsSort === 'priority' ? '-priority' : 'priority'">Priority</th>
-                            <th>Kind</th>
-                            <th>Target Skill</th>
-                            <th style="min-width:240px">Description</th>
-                            <th>Status</th>
-                            <th>Session</th>
-                            <th>Analyzed</th>
+                              <th style="width:32px"><input :checked="isPageFullySelected()" @change="togglePageSelection($event.target.checked)"
+                                                            type="checkbox"></th>
+                              <th @click="toggleSuggestionsSort('priority')" class="sortable-th">Priority<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('priority', suggestionsSort, suggestionsSortDesc)"></span></th>
+                              <th @click="toggleSuggestionsSort('kind')" class="sortable-th">Kind<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('kind', suggestionsSort, suggestionsSortDesc)"></span></th>
+                              <th @click="toggleSuggestionsSort('target_skill')" class="sortable-th">Target Skill<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('target_skill', suggestionsSort, suggestionsSortDesc)"></span>
+                              </th>
+                              <th @click="toggleSuggestionsSort('description')" class="sortable-th"
+                                  style="min-width:240px">Description<span class="sort-indicator"
+                                                                                                 x-text="sortGlyph('description', suggestionsSort, suggestionsSortDesc)"></span>
+                              </th>
+                              <th @click="toggleSuggestionsSort('status')" class="sortable-th">Status<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('status', suggestionsSort, suggestionsSortDesc)"></span></th>
+                              <th @click="toggleSuggestionsSort('session_id')" class="sortable-th">Session<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('session_id', suggestionsSort, suggestionsSortDesc)"></span>
+                              </th>
+                              <th @click="toggleSuggestionsSort('analyzed_at')" class="sortable-th">Analyzed<span
+                                      class="sort-indicator"
+                                      x-text="sortGlyph('analyzed_at', suggestionsSort, suggestionsSortDesc)"></span>
+                              </th>
                             <th>Action</th>
                           </tr>
                         </thead>
                         <tbody>
-                          <template x-for="row in filteredSuggestions" :key="row._key">
+                        <template :key="row._key" x-for="row in paginatedSuggestions">
                             <tr :class="row.executed_at || row.failed_at ? 'opacity-50' : ''">
+                                <td @click.stop style="text-align:center">
+                                    <input :checked="!!selectedSuggestions[row._key]" @change="selectedSuggestions[row._key] = $event.target.checked || undefined"
+                                           type="checkbox">
+                                </td>
                               <td x-text="row.priority" style="text-align:center"></td>
                               <td><span class="badge" :class="kindClass(row.kind)" x-text="row.kind"></span></td>
                               <td><code style="font-size:12px" x-text="row.target_skill || '-'"></code></td>
@@ -6372,6 +6581,31 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                           </template>
                         </tbody>
                       </table>
+                        <div class="pagination-bar">
+                            <div>
+                                <label>Per page:
+                                    <select @change="suggestionsPage=1" class="form-input"
+                                            style="width:auto;display:inline-block;margin-left:4px"
+                                            x-model.number="suggestionsPageSize">
+                                        <option :value="10">10</option>
+                                        <option :value="25">25</option>
+                                        <option :value="50">50</option>
+                                        <option :value="100">100</option>
+                                    </select>
+                                </label>
+                                <span style="margin-left:12px;opacity:0.6"
+                                      x-text="filteredSuggestions.length + ' total'"></span>
+                            </div>
+                            <div style="display:flex;gap:6px;align-items:center">
+                                <button :disabled="suggestionsPage===1" @click="suggestionsPage=Math.max(1,suggestionsPage-1)"
+                                        class="btn btn-xs">Prev
+                                </button>
+                                <span x-text="'Page ' + suggestionsPage + ' / ' + suggestionsTotalPages"></span>
+                                <button :disabled="suggestionsPage >= suggestionsTotalPages" @click="suggestionsPage=suggestionsPage+1"
+                                        class="btn btn-xs">Next
+                                </button>
+                            </div>
+                        </div>
                     </div>
                   </template>
                 </div>
@@ -6385,20 +6619,24 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <div>
                   <!-- Search + Filter Bar -->
                   <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center">
-                    <input type="text" class="form-input" x-model="skillSearch" placeholder="Search skills..."
+                      <input @input="skillsPage=1" class="form-input" placeholder="Search skills..." type="text"
+                             x-model="skillSearch"
                       style="flex:1;min-width:200px;max-width:400px">
-                    <select class="form-select" x-model="skillSort" style="width:auto;min-width:120px">
+                      <select @change="skillsPage=1" class="form-select" style="width:auto;min-width:120px"
+                              x-model="skillSort">
                       <option value="score">Sort: Score</option>
                       <option value="updated">Sort: Updated</option>
                       <option value="name">Sort: Name</option>
                     </select>
-                    <select class="form-select" x-model="skillOriginFilter" style="width:auto;min-width:120px">
+                      <select @change="skillsPage=1" class="form-select" style="width:auto;min-width:120px"
+                              x-model="skillOriginFilter">
                       <option value="">All Origins</option>
                       <template x-for="o in allOrigins" :key="o">
                         <option :value="o" x-text="o"></option>
                       </template>
                     </select>
-                    <select class="form-select" x-model="skillTagFilter" style="width:auto;min-width:120px">
+                      <select @change="skillsPage=1" class="form-select" style="width:auto;min-width:120px"
+                              x-model="skillTagFilter">
                       <option value="">All Tags</option>
                       <template x-for="t in allTags" :key="t">
                         <option :value="t" x-text="t"></option>
@@ -6434,7 +6672,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     </div>
                   </template>
                   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px">
-                    <template x-for="c in filteredSkillClasses" :key="c.name">
+                      <template :key="c.name" x-for="c in paginatedSkillClasses">
                       <div class="card" style="padding:16px;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s"
                         @click="navigateToSkillClass(c.name)"
                         @mouseenter="$el.style.transform='scale(1.01)';$el.style.boxShadow='0 4px 12px rgba(0,0,0,0.15)'"
@@ -6482,6 +6720,30 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       </div>
                     </template>
                   </div>
+                    <div class="pagination-bar" style="margin-top:14px" x-show="filteredSkillClasses.length > 0">
+                        <div>
+                            <label>Per page:
+                                <select @change="skillsPage=1" class="form-input" style="width:auto;display:inline-block;margin-left:4px"
+                                        x-model.number="skillsPageSize">
+                                    <option :value="10">10</option>
+                                    <option :value="25">25</option>
+                                    <option :value="50">50</option>
+                                    <option :value="100">100</option>
+                                </select>
+                            </label>
+                            <span style="margin-left:12px;opacity:0.6"
+                                  x-text="filteredSkillClasses.length + ' total'"></span>
+                        </div>
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <button :disabled="skillsPage===1" @click="skillsPage=Math.max(1,skillsPage-1)"
+                                    class="btn btn-xs">Prev
+                            </button>
+                            <span x-text="'Page ' + skillsPage + ' / ' + skillsTotalPages"></span>
+                            <button :disabled="skillsPage >= skillsTotalPages" @click="skillsPage=skillsPage+1"
+                                    class="btn btn-xs">Next
+                            </button>
+                        </div>
+                    </div>
                 </div>
               </template>
 
@@ -6565,7 +6827,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     All Versions <span class="badge badge-dim" style="margin-left:4px" x-text="selectedClassSkills.length"></span>
                   </div>
                   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px">
-                    <template x-for="s in selectedClassSkills" :key="s.skill_id">
+                      <template :key="s.skill_id" x-for="s in paginatedClassSkills">
                       <div class="card" style="padding:14px;cursor:pointer;transition:transform 0.15s"
                         @click="openVersionDrawer(s)"
                         @mouseenter="$el.style.transform='scale(1.01)'" @mouseleave="$el.style.transform=''">
@@ -6605,6 +6867,31 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         </template>
                       </div>
                     </template>
+                  </div>
+                    <div class="pagination-bar" style="margin-top:14px" x-show="selectedClassSkills.length > 0">
+                        <div>
+                            <label>Per page:
+                                <select @change="skillDetailPage=1" class="form-input"
+                                        style="width:auto;display:inline-block;margin-left:4px"
+                                        x-model.number="skillDetailPageSize">
+                                    <option :value="10">10</option>
+                                    <option :value="25">25</option>
+                                    <option :value="50">50</option>
+                                    <option :value="100">100</option>
+                                </select>
+                            </label>
+                            <span style="margin-left:12px;opacity:0.6"
+                                  x-text="selectedClassSkills.length + ' versions'"></span>
+                        </div>
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <button :disabled="skillDetailPage===1" @click="skillDetailPage=Math.max(1,skillDetailPage-1)"
+                                    class="btn btn-xs">Prev
+                            </button>
+                            <span x-text="'Page ' + skillDetailPage + ' / ' + skillDetailTotalPages"></span>
+                            <button :disabled="skillDetailPage >= skillDetailTotalPages" @click="skillDetailPage=skillDetailPage+1"
+                                    class="btn btn-xs">Next
+                            </button>
+                        </div>
                   </div>
                 </div>
               </template>
