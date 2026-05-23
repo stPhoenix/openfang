@@ -27,7 +27,7 @@ where
 }
 
 /// DM (direct message) policy for a channel.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
     /// Respond to all DMs.
@@ -40,7 +40,7 @@ pub enum DmPolicy {
 }
 
 /// Group message policy for a channel.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupPolicy {
     /// Respond to all group messages.
@@ -64,7 +64,7 @@ pub enum GroupPolicy {
 /// Platform-native identity (e.g. Slack per-message bot username override,
 /// Discord embed author field) is intentionally out of scope here and will be
 /// addressed in a follow-up.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PrefixStyle {
     /// No prefix — byte-identical to pre-feature behavior.
@@ -79,7 +79,7 @@ pub enum PrefixStyle {
 }
 
 /// Output format hint for channel-specific message formatting.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     /// Standard Markdown (default).
@@ -94,7 +94,7 @@ pub enum OutputFormat {
 }
 
 /// Per-channel behavior overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ChannelOverrides {
     /// Model override (uses agent's default if None).
@@ -151,7 +151,7 @@ impl Default for ChannelOverrides {
 }
 
 /// Controls what usage info appears in response footers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageFooterMode {
     /// Don't show usage info.
@@ -166,7 +166,7 @@ pub enum UsageFooterMode {
 }
 
 /// Kernel operating mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum KernelMode {
     /// Conservative mode — no auto-updates, pinned models, stability-first.
@@ -179,7 +179,7 @@ pub enum KernelMode {
 }
 
 /// User configuration for RBAC multi-user support.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UserConfig {
     /// User display name.
     pub name: String,
@@ -200,7 +200,7 @@ fn default_role() -> String {
 }
 
 /// Web search provider selection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchProvider {
     /// Brave Search API.
@@ -219,7 +219,7 @@ pub enum SearchProvider {
 }
 
 /// Web tools configuration (search + fetch).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WebConfig {
     /// Which search provider to use.
@@ -253,7 +253,7 @@ impl Default for WebConfig {
 }
 
 /// Brave Search API configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct BraveSearchConfig {
     /// Env var name holding the API key.
@@ -281,7 +281,7 @@ impl Default for BraveSearchConfig {
 }
 
 /// Tavily Search API configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TavilySearchConfig {
     /// Env var name holding the API key.
@@ -306,7 +306,7 @@ impl Default for TavilySearchConfig {
 }
 
 /// Perplexity Search API configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PerplexitySearchConfig {
     /// Env var name holding the API key.
@@ -325,7 +325,7 @@ impl Default for PerplexitySearchConfig {
 }
 
 /// SearXNG self-hosted search configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct SearxngSearchConfig {
     /// Base URL of the SearXNG instance (e.g., "https://search.example.com").
@@ -333,7 +333,7 @@ pub struct SearxngSearchConfig {
 }
 
 /// Web fetch configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WebFetchConfig {
     /// Maximum characters to return in content.
@@ -379,7 +379,7 @@ impl Default for WebFetchConfig {
 }
 
 /// Browser automation configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Enable the built-in CDP browser tools (browser_navigate, browser_click,
@@ -418,7 +418,7 @@ impl Default for BrowserConfig {
 }
 
 /// Config hot-reload mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReloadMode {
     /// No automatic reloading.
@@ -433,7 +433,7 @@ pub enum ReloadMode {
 }
 
 /// Configuration for config file watching and hot-reload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ReloadConfig {
     /// Reload mode. Default: hybrid.
@@ -455,7 +455,7 @@ impl Default for ReloadConfig {
 ///
 /// Controls the `/hooks/wake` and `/hooks/agent` endpoints for external
 /// systems to trigger agent actions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WebhookTriggerConfig {
     /// Enable webhook trigger endpoints. Default: false.
@@ -488,7 +488,7 @@ impl Default for WebhookTriggerConfig {
 /// provider = "ollama"
 /// model = "llama3.2:latest"
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FallbackProviderConfig {
     /// Provider name (e.g., "ollama", "groq").
     pub provider: String,
@@ -512,7 +512,7 @@ pub struct FallbackProviderConfig {
 }
 
 /// Text-to-speech configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TtsConfig {
     /// Enable TTS. Default: false.
@@ -543,7 +543,7 @@ impl Default for TtsConfig {
 }
 
 /// OpenAI TTS settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TtsOpenAiConfig {
     /// Voice: alloy, echo, fable, onyx, nova, shimmer. Default: "alloy".
@@ -568,7 +568,7 @@ impl Default for TtsOpenAiConfig {
 }
 
 /// ElevenLabs TTS settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TtsElevenLabsConfig {
     /// Voice ID. Default: "21m00Tcm4TlvDq8ikWAM" (Rachel).
@@ -593,7 +593,7 @@ impl Default for TtsElevenLabsConfig {
 }
 
 /// Docker container sandbox configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DockerSandboxConfig {
     /// Enable Docker sandbox. Default: false.
@@ -676,7 +676,7 @@ impl Default for DockerSandboxConfig {
 }
 
 /// Device pairing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PairingConfig {
     /// Enable device pairing. Default: false.
@@ -707,7 +707,7 @@ impl Default for PairingConfig {
 }
 
 /// Extensions & integrations configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ExtensionsConfig {
     /// Enable auto-reconnect for MCP integrations.
@@ -732,12 +732,13 @@ impl Default for ExtensionsConfig {
 }
 
 /// Credential vault configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct VaultConfig {
     /// Whether the vault is enabled (auto-detected if vault.enc exists).
     pub enabled: bool,
     /// Custom vault file path (default: ~/.openfang/vault.enc).
+    #[schema(value_type = Option<String>)]
     pub path: Option<PathBuf>,
 }
 
@@ -751,7 +752,7 @@ impl Default for VaultConfig {
 }
 
 /// Agent binding — routes specific channel/account/peer patterns to agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentBinding {
     /// Target agent name or ID.
     pub agent: String,
@@ -764,7 +765,7 @@ pub struct AgentBinding {
 /// `#[serde(deny_unknown_fields)]` is intentional: a typo like `channnel_id` or
 /// `chan_id` would otherwise be silently dropped, producing a wide-open binding
 /// that matches every message. Failing loudly at config load is the safer default.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BindingMatchRule {
     /// Channel type (e.g., "discord", "telegram", "slack").
@@ -822,7 +823,7 @@ impl BindingMatchRule {
 }
 
 /// Broadcast config — send same message to multiple agents.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct BroadcastConfig {
     /// Broadcast strategy.
@@ -832,7 +833,7 @@ pub struct BroadcastConfig {
 }
 
 /// Broadcast delivery strategy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BroadcastStrategy {
     /// Send to all agents simultaneously.
@@ -843,7 +844,7 @@ pub enum BroadcastStrategy {
 }
 
 /// Auto-reply engine configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct AutoReplyConfig {
     /// Enable auto-reply engine. Default: false.
@@ -868,7 +869,7 @@ impl Default for AutoReplyConfig {
 }
 
 /// Canvas (Agent-to-UI) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct CanvasConfig {
     /// Enable canvas tool. Default: false.
@@ -891,7 +892,7 @@ impl Default for CanvasConfig {
 }
 
 /// Shell/exec security mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecSecurityMode {
     /// Block all shell execution.
@@ -911,7 +912,7 @@ pub enum ExecSecurityMode {
 /// These limits are enforced in the subprocess sandbox to prevent resource
 /// abuse (fork bombs, memory exhaustion, CPU hogging) by shell commands
 /// and Python/Node.js skill processes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ResourceLimits {
     /// Maximum virtual memory in bytes. Default: 512 MB.
@@ -944,7 +945,7 @@ impl Default for ResourceLimits {
 /// exec. `pids.max` then caps the *agent's* subprocess tree independently
 /// of what the daemon UID is doing globally — `RLIMIT_NPROC` cannot do this
 /// because it is per-UID and counts the daemon's own tokio threads.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(default)]
 pub struct CgroupPolicy {
     /// Enable cgroup placement. Defaults to true on Linux, false elsewhere.
@@ -971,7 +972,7 @@ impl Default for CgroupPolicy {
 }
 
 /// Shell/exec security policy.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ExecPolicy {
     /// Security mode: "deny" blocks all, "allowlist" only allows listed,
@@ -1051,7 +1052,7 @@ pub enum TerminationReason {
 ///
 /// Multiple profiles can be configured per provider to enable key rotation
 /// when one key gets rate-limited or has billing issues.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AuthProfile {
     /// Profile name (e.g., "primary", "secondary").
     pub name: String,
@@ -1078,7 +1079,7 @@ impl std::fmt::Debug for AuthProfile {
 // ---------------------------------------------------------------------------
 
 /// Docker sandbox activation mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DockerSandboxMode {
     /// Docker sandbox disabled.
@@ -1091,7 +1092,7 @@ pub enum DockerSandboxMode {
 }
 
 /// Docker container lifecycle scope.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DockerScope {
     /// Container per session (destroyed when session ends).
@@ -1108,7 +1109,7 @@ pub enum DockerScope {
 // ---------------------------------------------------------------------------
 
 /// Typing indicator behavior mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TypingMode {
     /// Send typing indicator immediately on message receipt (default).
@@ -1127,7 +1128,7 @@ pub enum TypingMode {
 // ---------------------------------------------------------------------------
 
 /// Extended thinking configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ThinkingConfig {
     /// Maximum tokens for thinking (budget).
@@ -1146,12 +1147,14 @@ impl Default for ThinkingConfig {
 }
 
 /// Top-level kernel configuration.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct KernelConfig {
     /// OpenFang home directory (default: ~/.openfang).
+    #[schema(value_type = String)]
     pub home_dir: PathBuf,
     /// Data directory for databases (default: ~/.openfang/data).
+    #[schema(value_type = String)]
     pub data_dir: PathBuf,
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
@@ -1213,6 +1216,7 @@ pub struct KernelConfig {
     pub vault: VaultConfig,
     /// Root directory for agent workspaces. Default: `~/.openfang/workspaces`
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub workspaces_dir: Option<PathBuf>,
     /// Media understanding configuration.
     #[serde(default)]
@@ -1289,6 +1293,7 @@ pub struct KernelConfig {
     /// Directory for auto-loading workflow JSON files on startup.
     /// Defaults to `~/.openfang/workflows`. Set to empty string to disable.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub workflows_dir: Option<PathBuf>,
     /// Heartbeat monitor settings.
     #[serde(default)]
@@ -1330,7 +1335,7 @@ pub struct KernelConfig {
 /// `request.tools`. The model uses the built-in `ToolSearch` meta-tool
 /// to fetch schemas on demand. Discovered tools become available with
 /// full schemas on subsequent turns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ToolSearchConfig {
     /// Master switch. Disable to send all tool schemas every turn (legacy).
@@ -1365,7 +1370,7 @@ impl Default for ToolSearchConfig {
 /// Controls the LLM-powered analyzer that reviews completed agent sessions
 /// and produces structured analyses with skill judgments and evolution
 /// suggestions. Configure in `[evolve]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct EvolveConfig {
     /// Whether the evolution analyzer is enabled.
@@ -1443,6 +1448,16 @@ pub struct EvolveConfig {
     /// Max suggestions enqueued per batch apply run. None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_max_per_run: Option<usize>,
+    /// Per-evolution timeout in seconds for batch apply. If
+    /// `execute_evolution_with_confirmation` doesn't return within this many
+    /// seconds (e.g. analyzer/evolver LLM stalled), the suggestion is marked
+    /// failed and the loop moves on instead of hanging the whole batch.
+    #[serde(default = "default_apply_evolution_timeout_secs")]
+    pub apply_evolution_timeout_secs: u64,
+}
+
+fn default_apply_evolution_timeout_secs() -> u64 {
+    600
 }
 
 impl Default for EvolveConfig {
@@ -1473,6 +1488,7 @@ impl Default for EvolveConfig {
             apply_schedule: None,
             dedup_enabled: true,
             apply_max_per_run: Some(20),
+            apply_evolution_timeout_secs: default_apply_evolution_timeout_secs(),
         }
     }
 }
@@ -1490,7 +1506,7 @@ impl Default for EvolveConfig {
 /// - `OPENFANG_DISABLE_COMPACT` — disables all compaction
 /// - `OPENFANG_DISABLE_AUTO_COMPACT` — disables auto-compact only
 /// - `OPENFANG_MAX_CONTEXT_TOKENS` — override context window size
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct CompactionSettings {
     /// Master switch for all compaction (auto and manual).
@@ -1587,7 +1603,7 @@ impl CompactionSettings {
 ///
 /// Clears old tool result content before the API call, without summarization.
 /// Configure in `[compaction.microcompact]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MicrocompactConfig {
     /// Enable time-based microcompaction.
@@ -1612,13 +1628,14 @@ impl Default for MicrocompactConfig {
 ///
 /// Controls whether ML-based NER is used alongside regex for PII detection.
 /// Configure in `[pii]` section of config.toml.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PiiConfig {
     /// Enable ML-based NER detection globally. Individual agents can override
     /// via `taint_policy.ner_enabled`.
     pub ner_enabled: bool,
     /// Directory containing the ONNX NER model files (model.onnx, tokenizer.json).
+    #[schema(value_type = String)]
     pub model_dir: PathBuf,
     /// Minimum confidence threshold for NER detections (0.0–1.0).
     pub confidence_threshold: f32,
@@ -1635,7 +1652,7 @@ impl Default for PiiConfig {
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HeartbeatSettings {
     /// Seconds of inactivity before a reactive agent is marked as unresponsive.
     /// Default: 180. Set higher to prevent idle hands from being marked as crashed.
@@ -1656,7 +1673,7 @@ impl Default for HeartbeatSettings {
 }
 
 /// Dashboard authentication (username/password login).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Enable username/password authentication for the dashboard.
@@ -1694,7 +1711,7 @@ impl Default for AuthConfig {
 /// google_client_id = "your-google-client-id"
 /// github_client_id = "your-github-client-id"
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct OAuthConfig {
     /// Google OAuth2 client ID for PKCE flow.
@@ -1710,7 +1727,7 @@ pub struct OAuthConfig {
 /// Global spending budget configuration.
 ///
 /// Set limits to 0.0 for unlimited. All limits apply across all agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct BudgetConfig {
     /// Maximum total cost in USD per hour (0.0 = unlimited).
@@ -1747,7 +1764,7 @@ fn default_max_cron_jobs() -> usize {
 ///
 /// This is the config.toml representation. The runtime `McpServerConfig`
 /// struct is constructed from this during kernel boot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct McpServerConfigEntry {
     /// Display name for this server.
     pub name: String,
@@ -1770,7 +1787,7 @@ fn default_mcp_timeout() -> u64 {
 }
 
 /// Transport configuration for an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpTransportEntry {
     /// Subprocess with JSON-RPC over stdin/stdout.
@@ -1786,7 +1803,7 @@ pub enum McpTransportEntry {
 }
 
 /// A2A (Agent-to-Agent) protocol configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct A2aConfig {
     /// Whether A2A is enabled.
@@ -1804,7 +1821,7 @@ fn default_a2a_path() -> String {
 }
 
 /// An external A2A agent to discover and interact with.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ExternalAgent {
     /// Display name.
     pub name: String,
@@ -2024,7 +2041,7 @@ fn openfang_home_dir() -> PathBuf {
 }
 
 /// Default LLM model configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DefaultModelConfig {
     /// Provider name (e.g., "anthropic", "openai").
@@ -2059,10 +2076,11 @@ impl Default for DefaultModelConfig {
 }
 
 /// Memory substrate configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MemoryConfig {
     /// Path to SQLite database file.
+    #[schema(value_type = Option<String>)]
     pub sqlite_path: Option<PathBuf>,
     /// Embedding model for semantic search.
     pub embedding_model: String,
@@ -2117,7 +2135,7 @@ impl Default for MemoryConfig {
 }
 
 /// Network layer configuration.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct NetworkConfig {
     /// libp2p listen addresses.
@@ -2165,7 +2183,7 @@ impl std::fmt::Debug for NetworkConfig {
 }
 
 /// Channel bridge configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ChannelsConfig {
     /// Telegram bot configuration (None = disabled).
@@ -2309,7 +2327,7 @@ impl ChannelsConfig {
 }
 
 /// Telegram channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TelegramConfig {
     /// Env var name holding the bot token (NOT the token itself).
@@ -2350,7 +2368,7 @@ impl Default for TelegramConfig {
 }
 
 /// Discord channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DiscordConfig {
     /// Env var name holding the bot token (NOT the token itself).
@@ -2399,7 +2417,7 @@ impl Default for DiscordConfig {
 }
 
 /// Slack channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct SlackConfig {
     /// Env var name holding the app-level token (xapp-) for Socket Mode.
@@ -2441,7 +2459,7 @@ impl Default for SlackConfig {
 }
 
 /// WhatsApp Cloud API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WhatsAppConfig {
     /// Env var name holding the access token (Cloud API mode).
@@ -2481,7 +2499,7 @@ impl Default for WhatsAppConfig {
 }
 
 /// Signal channel adapter configuration (via signal-cli REST API).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct SignalConfig {
     /// URL of the signal-cli REST API (e.g., "http://localhost:8080").
@@ -2511,7 +2529,7 @@ impl Default for SignalConfig {
 }
 
 /// Matrix protocol channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g., `"https://matrix.org"`).
@@ -2548,7 +2566,7 @@ impl Default for MatrixConfig {
 }
 
 /// Email (IMAP/SMTP) channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct EmailConfig {
     /// IMAP server host.
@@ -2597,7 +2615,7 @@ impl Default for EmailConfig {
 }
 
 /// Microsoft Teams (Bot Framework v3) channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TeamsConfig {
     /// Azure Bot App ID.
@@ -2630,7 +2648,7 @@ impl Default for TeamsConfig {
 }
 
 /// Mattermost channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MattermostConfig {
     /// Mattermost server URL (e.g., `"https://mattermost.example.com"`).
@@ -2660,7 +2678,7 @@ impl Default for MattermostConfig {
 }
 
 /// IRC channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct IrcConfig {
     /// IRC server hostname.
@@ -2699,7 +2717,7 @@ impl Default for IrcConfig {
 }
 
 /// Google Chat channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct GoogleChatConfig {
     /// Env var name holding the service account JSON key.
@@ -2729,7 +2747,7 @@ impl Default for GoogleChatConfig {
 }
 
 /// Twitch chat channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TwitchConfig {
     /// Env var name holding the OAuth token.
@@ -2759,7 +2777,7 @@ impl Default for TwitchConfig {
 }
 
 /// Rocket.Chat channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct RocketChatConfig {
     /// Rocket.Chat server URL.
@@ -2792,7 +2810,7 @@ impl Default for RocketChatConfig {
 }
 
 /// Zulip channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ZulipConfig {
     /// Zulip server URL.
@@ -2825,7 +2843,7 @@ impl Default for ZulipConfig {
 }
 
 /// XMPP/Jabber channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct XmppConfig {
     /// JID (e.g., "bot@jabber.org").
@@ -2863,7 +2881,7 @@ impl Default for XmppConfig {
 // ── Wave 3 channel configs ─────────────────────────────────────────
 
 /// LINE Messaging API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct LineConfig {
     /// Env var name holding the channel secret.
@@ -2892,7 +2910,7 @@ impl Default for LineConfig {
 }
 
 /// Viber Bot API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ViberConfig {
     /// Env var name holding the auth token.
@@ -2921,7 +2939,7 @@ impl Default for ViberConfig {
 }
 
 /// Facebook Messenger Platform channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MessengerConfig {
     /// Env var name holding the page access token.
@@ -2950,7 +2968,7 @@ impl Default for MessengerConfig {
 }
 
 /// Reddit API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct RedditConfig {
     /// Reddit app client ID.
@@ -2986,7 +3004,7 @@ impl Default for RedditConfig {
 }
 
 /// Mastodon Streaming API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MastodonConfig {
     /// Mastodon instance URL (e.g., `"https://mastodon.social"`).
@@ -3012,7 +3030,7 @@ impl Default for MastodonConfig {
 }
 
 /// Bluesky/AT Protocol channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct BlueskyConfig {
     /// Bluesky identifier (handle or DID).
@@ -3041,7 +3059,7 @@ impl Default for BlueskyConfig {
 }
 
 /// Feishu inbound event receive mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FeishuMode {
     /// Receive events via HTTP webhook callback.
@@ -3055,7 +3073,7 @@ pub enum FeishuMode {
 ///
 /// Supports both Feishu (China domestic, `open.feishu.cn`) and Lark
 /// (International, `open.larksuite.com`) via the `region` field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct FeishuConfig {
     /// Feishu app ID.
@@ -3103,7 +3121,7 @@ impl Default for FeishuConfig {
 }
 
 /// WeCom/WeChat Work channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WeComConfig {
     /// WeCom corp ID.
@@ -3144,7 +3162,7 @@ impl Default for WeComConfig {
 ///
 /// Provides a generic MQTT pub/sub interface for IoT and messaging integration.
 /// Supports standard MQTT 3.1.1/5.0 brokers with optional TLS and authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MqttConfig {
     /// MQTT broker URL (e.g., `"tcp://broker.hivemq.com:1883"` or `"ssl://broker.example.com:8883"`).
@@ -3194,7 +3212,7 @@ impl Default for MqttConfig {
 }
 
 /// Revolt (Discord-like) channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct RevoltConfig {
     /// Env var name holding the bot token.
@@ -3229,7 +3247,7 @@ impl Default for RevoltConfig {
 // ── Wave 4 channel configs ─────────────────────────────────────────
 
 /// Nextcloud Talk channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct NextcloudConfig {
     /// Nextcloud server URL.
@@ -3259,7 +3277,7 @@ impl Default for NextcloudConfig {
 }
 
 /// Guilded bot channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct GuildedConfig {
     /// Env var name holding the bot token.
@@ -3286,7 +3304,7 @@ impl Default for GuildedConfig {
 }
 
 /// Keybase chat channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct KeybaseConfig {
     /// Keybase username.
@@ -3316,7 +3334,7 @@ impl Default for KeybaseConfig {
 }
 
 /// Threema Gateway channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ThreemaConfig {
     /// Threema Gateway ID.
@@ -3345,7 +3363,7 @@ impl Default for ThreemaConfig {
 }
 
 /// Nostr relay channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct NostrConfig {
     /// Env var name holding the private key (nsec or hex).
@@ -3372,7 +3390,7 @@ impl Default for NostrConfig {
 }
 
 /// Webex bot channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WebexConfig {
     /// Env var name holding the bot token.
@@ -3399,7 +3417,7 @@ impl Default for WebexConfig {
 }
 
 /// Pumble bot channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PumbleConfig {
     /// Env var name holding the bot token.
@@ -3425,7 +3443,7 @@ impl Default for PumbleConfig {
 }
 
 /// Flock bot channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct FlockConfig {
     /// Env var name holding the bot token.
@@ -3451,7 +3469,7 @@ impl Default for FlockConfig {
 }
 
 /// Twist API v3 channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TwistConfig {
     /// Env var name holding the API token.
@@ -3483,7 +3501,7 @@ impl Default for TwistConfig {
 // ── Wave 5 channel configs ─────────────────────────────────────────
 
 /// Mumble text chat channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MumbleConfig {
     /// Mumble server hostname.
@@ -3518,7 +3536,7 @@ impl Default for MumbleConfig {
 }
 
 /// DingTalk Robot API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DingTalkConfig {
     /// Env var name holding the webhook access token.
@@ -3551,7 +3569,7 @@ impl Default for DingTalkConfig {
 /// Uses the DingTalk Stream Mode (WebSocket long-connection) instead of
 /// the legacy webhook approach. Requires an Enterprise Internal App with
 /// Stream Mode enabled in the DingTalk Open Platform console.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DingTalkStreamConfig {
     /// Env var holding the App Key (client_id).
@@ -3580,7 +3598,7 @@ impl Default for DingTalkStreamConfig {
 }
 
 /// Discourse forum channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct DiscourseConfig {
     /// Discourse base URL.
@@ -3613,7 +3631,7 @@ impl Default for DiscourseConfig {
 }
 
 /// Gitter Streaming API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct GitterConfig {
     /// Env var name holding the auth token.
@@ -3639,7 +3657,7 @@ impl Default for GitterConfig {
 }
 
 /// ntfy.sh pub/sub channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct NtfyConfig {
     /// ntfy server URL.
@@ -3668,7 +3686,7 @@ impl Default for NtfyConfig {
 }
 
 /// Gotify WebSocket channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct GotifyConfig {
     /// Gotify server URL.
@@ -3697,7 +3715,7 @@ impl Default for GotifyConfig {
 }
 
 /// Generic webhook channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct WebhookConfig {
     /// Env var name holding the HMAC signing secret.
@@ -3726,7 +3744,7 @@ impl Default for WebhookConfig {
 }
 
 /// LinkedIn Messaging API channel adapter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct LinkedInConfig {
     /// Env var name holding the OAuth2 access token.

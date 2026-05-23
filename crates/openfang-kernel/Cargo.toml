@@ -38,6 +38,7 @@ rustls = { workspace = true }
 cron = "0.16"
 lru = "0.12"
 zeroize = { workspace = true }
+utoipa = { workspace = true }
 
 [features]
 default = []

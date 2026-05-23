@@ -51,7 +51,7 @@ pub const SHELL_PATTERNS: &[&str] = &["rm -rf", "chmod ", "sudo "];
 // ---------------------------------------------------------------------------
 
 /// Severity of a scan finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum FindingSeverity {
     /// Likely prompt injection — should be blocked or sanitized.
     Critical,
@@ -122,7 +122,7 @@ impl ScanVerdict {
 }
 
 /// Enforcement mode for the prompt guard.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptGuardMode {
     /// No scanning performed.
@@ -137,7 +137,7 @@ pub enum PromptGuardMode {
 }
 
 /// Per-agent prompt guard policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PromptGuardPolicy {
     /// Enforcement mode.

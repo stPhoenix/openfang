@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Unique identifier for a memory fragment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MemoryId(pub Uuid);
 
 impl MemoryId {
@@ -31,7 +31,7 @@ impl std::fmt::Display for MemoryId {
 }
 
 /// Where a memory came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemorySource {
     /// From a conversation/interaction.
@@ -49,7 +49,7 @@ pub enum MemorySource {
 }
 
 /// A single unit of memory stored in the semantic store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MemoryFragment {
     /// Unique ID.
     pub id: MemoryId,
@@ -76,7 +76,7 @@ pub struct MemoryFragment {
 }
 
 /// Filter criteria for memory recall.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MemoryFilter {
     /// Filter by agent ID.
     pub agent_id: Option<AgentId>,
@@ -113,7 +113,7 @@ impl MemoryFilter {
 }
 
 /// An entity in the knowledge graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Entity {
     /// Unique entity ID.
     pub id: String,
@@ -130,7 +130,7 @@ pub struct Entity {
 }
 
 /// Types of entities in the knowledge graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
     /// A person.
@@ -154,7 +154,7 @@ pub enum EntityType {
 }
 
 /// A relation between two entities in the knowledge graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Relation {
     /// Source entity ID.
     pub source: String,
@@ -171,7 +171,7 @@ pub struct Relation {
 }
 
 /// Types of relations in the knowledge graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationType {
     /// Entity works at an organization.
@@ -199,7 +199,7 @@ pub enum RelationType {
 }
 
 /// A pattern for querying the knowledge graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphPattern {
     /// Optional source entity filter.
     pub source: Option<String>,
@@ -212,7 +212,7 @@ pub struct GraphPattern {
 }
 
 /// A result from a graph query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphMatch {
     /// The source entity.
     pub source: Entity,
@@ -223,7 +223,7 @@ pub struct GraphMatch {
 }
 
 /// Report from memory consolidation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ConsolidationReport {
     /// Number of memories merged.
     pub memories_merged: u64,
@@ -234,7 +234,7 @@ pub struct ConsolidationReport {
 }
 
 /// Format for memory export/import.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum ExportFormat {
     /// JSON format.
     Json,
@@ -243,7 +243,7 @@ pub enum ExportFormat {
 }
 
 /// Report from memory import.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImportReport {
     /// Number of entities imported.
     pub entities_imported: u64,

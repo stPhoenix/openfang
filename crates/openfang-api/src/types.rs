@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Request to spawn an agent from a TOML manifest string or a template name.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SpawnRequest {
     /// Agent manifest as TOML string (optional if `template` is provided).
     #[serde(default)]
@@ -19,14 +19,14 @@ pub struct SpawnRequest {
 }
 
 /// Response after spawning an agent.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SpawnResponse {
     pub agent_id: String,
     pub name: String,
 }
 
 /// A file attachment reference (from a prior upload).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct AttachmentRef {
     pub file_id: String,
     #[serde(default)]
@@ -36,7 +36,7 @@ pub struct AttachmentRef {
 }
 
 /// Request to send a message to an agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct MessageRequest {
     pub message: String,
     /// Optional file attachments (uploaded via /upload endpoint).
@@ -55,7 +55,7 @@ pub struct MessageRequest {
 }
 
 /// Response from sending a message.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct MessageResponse {
     pub response: String,
     pub input_tokens: u64,
@@ -66,31 +66,31 @@ pub struct MessageResponse {
 }
 
 /// Request to install a skill from the marketplace.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SkillInstallRequest {
     pub name: String,
 }
 
 /// Request to uninstall a skill.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SkillUninstallRequest {
     pub name: String,
 }
 
 /// Request to update an agent's manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AgentUpdateRequest {
     pub manifest_toml: String,
 }
 
 /// Request to change an agent's operational mode.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SetModeRequest {
     pub mode: openfang_types::agent::AgentMode,
 }
 
 /// Request to run a migration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct MigrateRequest {
     pub source: String,
     pub source_dir: String,
@@ -100,20 +100,20 @@ pub struct MigrateRequest {
 }
 
 /// Request to scan a directory for migration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct MigrateScanRequest {
     pub path: String,
 }
 
 /// Request to install a skill from ClawHub.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
 }
 
 /// Query parameters for `GET /api/commands`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CommandsQuery {
     /// Surface filter: `web` (default), `cli`, `channel`, or `all`.
     #[serde(default)]

@@ -71,7 +71,18 @@ pub const AZURE_OPENAI_BASE_URL: &str = "";
 pub const BEDROCK_BASE_URL: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
 
 /// A model's capability tier.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     /// Cutting-edge, most capable models (e.g. Claude Opus, GPT-4.1).
@@ -103,7 +114,7 @@ impl fmt::Display for ModelTier {
 }
 
 /// Provider authentication status.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthStatus {
     /// API key is present in the environment.
@@ -126,7 +137,7 @@ impl fmt::Display for AuthStatus {
 }
 
 /// A single model entry in the catalog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ModelCatalogEntry {
     /// Canonical model identifier (e.g. "claude-sonnet-4-20250514").
     pub id: String,
@@ -175,7 +186,7 @@ impl Default for ModelCatalogEntry {
 }
 
 /// Provider metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ProviderInfo {
     /// Provider identifier (e.g. "anthropic").
     pub id: String,

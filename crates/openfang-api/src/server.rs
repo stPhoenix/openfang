@@ -76,6 +76,7 @@ pub async fn build_router(
         batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(
             routes::BatchApplySnapshot::default(),
         )),
+        batch_apply_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Spawn the single evolve-execute worker. It drains the mpsc receiver
@@ -818,6 +819,10 @@ pub async fn build_router(
         .route(
             "/api/evolve/batch-apply/status",
             axum::routing::get(routes::evolve_batch_apply_status),
+        )
+        .route(
+            "/api/evolve/batch-apply/cancel",
+            axum::routing::post(routes::evolve_batch_apply_cancel),
         )
         // Webhook trigger endpoints (external event injection)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))

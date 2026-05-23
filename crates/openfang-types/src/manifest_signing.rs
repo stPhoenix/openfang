@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 /// A signed manifest envelope containing the original manifest text,
 /// its content hash, the Ed25519 signature, and the signer's public key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SignedManifest {
     /// The raw manifest content (typically TOML).
     pub manifest: String,

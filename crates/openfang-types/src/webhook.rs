@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Wake mode for system event injection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WakeMode {
     /// Trigger immediate processing.
@@ -14,7 +14,7 @@ pub enum WakeMode {
 }
 
 /// Payload for POST /hooks/wake — inject a system event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WakePayload {
     /// Event text to inject (max 4096 chars).
     pub text: String,
@@ -24,7 +24,7 @@ pub struct WakePayload {
 }
 
 /// Payload for POST /hooks/agent — run an isolated agent turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentHookPayload {
     /// Message to send to the agent (max 16384 chars).
     pub message: String,

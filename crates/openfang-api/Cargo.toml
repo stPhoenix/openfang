@@ -41,6 +41,7 @@ argon2 = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

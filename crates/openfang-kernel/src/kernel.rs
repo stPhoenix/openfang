@@ -8161,7 +8161,7 @@ impl OpenFangKernel {
     /// Returns a human-readable summary, used by the cron job and the
     /// `POST /api/evolve/batch-apply/run` endpoint.
     pub async fn run_evolve_batch_apply(&self) -> Result<String, String> {
-        self.run_evolve_batch_apply_with_progress(|_, _, _| {}).await
+        self.run_evolve_batch_apply_with_progress(|_, _, _| {}, None).await
     }
 
     /// Same as `run_evolve_batch_apply` but emits progress callbacks at each
@@ -8170,9 +8170,17 @@ impl OpenFangKernel {
     ///
     /// `total` reflects the final survivor count once dedup is done; before
     /// that, callbacks pass `0` so the UI can show an indeterminate bar.
+    ///
+    /// `cancel` is an optional cooperative cancel flag. When `Some(flag)`,
+    /// the loop checks `flag.load(Acquire)` between evolutions and bails
+    /// early with the partial summary if it's true. Each evolution is also
+    /// wrapped in `tokio::time::timeout(cfg.apply_evolution_timeout_secs)`
+    /// so a hung analyzer/evolver LLM call can no longer freeze the batch
+    /// indefinitely — the suggestion is marked failed and the loop moves on.
     pub async fn run_evolve_batch_apply_with_progress<F>(
         &self,
         progress_cb: F,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<String, String>
     where
         F: Fn(usize, usize, &str) + Send + Sync,
@@ -8211,7 +8219,16 @@ impl OpenFangKernel {
         let mut applied = 0u32;
         let mut declined = 0u32;
         let mut failed = 0u32;
+        let mut cancelled = false;
+        let timeout = std::time::Duration::from_secs(cfg.apply_evolution_timeout_secs);
         for (i, ctx) in report.contexts.into_iter().enumerate() {
+            if let Some(ref flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Acquire) {
+                    cancelled = true;
+                    info!(processed = i, total, "batch apply cancelled by request");
+                    break;
+                }
+            }
             let label = ctx
                 .target_skills
                 .first()
@@ -8228,14 +8245,19 @@ impl OpenFangKernel {
                 });
             progress_cb(i + 1, total, &format!("applying {label}"));
             // Capture the suggestion identity before move so we can mark the
-            // store row on declined/failed outcomes (executed is marked inside
-            // `execute_evolution` on the Ok path).
+            // store row on declined/failed/timeout outcomes (executed is
+            // marked inside `execute_evolution` on the Ok path).
             let analysis_id = ctx.source_analysis;
             let kind = ctx.evolution_type.clone();
             let direction = ctx.direction.clone();
-            match self.execute_evolution_with_confirmation(ctx).await {
-                Ok(_) => applied += 1,
-                Err(e) if e.is_declined() => {
+            let result = tokio::time::timeout(
+                timeout,
+                self.execute_evolution_with_confirmation(ctx),
+            )
+                .await;
+            match result {
+                Ok(Ok(_)) => applied += 1,
+                Ok(Err(e)) if e.is_declined() => {
                     declined += 1;
                     info!("batch apply evolution declined: {e}");
                     if let Some(aid) = analysis_id {
@@ -8248,7 +8270,7 @@ impl OpenFangKernel {
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     failed += 1;
                     warn!("batch apply evolution failed: {e}");
                     if let Some(aid) = analysis_id {
@@ -8261,11 +8283,33 @@ impl OpenFangKernel {
                         }
                     }
                 }
+                Err(_) => {
+                    // tokio::time::timeout elapsed — the underlying LLM call
+                    // is likely stalled (provider down, agent crashed). Mark
+                    // failed and continue with the next survivor instead of
+                    // hanging the whole batch.
+                    failed += 1;
+                    let msg = format!(
+                        "evolution exceeded {}s timeout",
+                        cfg.apply_evolution_timeout_secs
+                    );
+                    warn!("batch apply evolution timed out: {msg}");
+                    if let Some(aid) = analysis_id {
+                        if let Err(store_err) = self
+                            .evolve_engine
+                            .store()
+                            .mark_suggestion_failed(&aid, &kind, &direction, &msg)
+                        {
+                            warn!(error = %store_err, "failed to mark suggestion failed");
+                        }
+                    }
+                }
             }
         }
 
+        let suffix = if cancelled { " (cancelled)" } else { "" };
         Ok(format!(
-            "batch apply: {} pending, {} superseded (used_llm={}), {} applied, {} declined, {} failed",
+            "batch apply: {} pending, {} superseded (used_llm={}), {} applied, {} declined, {} failed{suffix}",
             report.total_pending, report.superseded, report.used_llm, applied, declined, failed
         ))
     }

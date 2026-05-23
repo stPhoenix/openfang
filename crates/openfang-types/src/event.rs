@@ -30,7 +30,7 @@ mod duration_ms {
 }
 
 /// Unique identifier for an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EventId(pub Uuid);
 
 impl EventId {
@@ -53,7 +53,7 @@ impl std::fmt::Display for EventId {
 }
 
 /// Where an event is directed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "value")]
 pub enum EventTarget {
     /// Send to a specific agent.
@@ -67,7 +67,7 @@ pub enum EventTarget {
 }
 
 /// The payload of an event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
     /// Direct agent-to-agent message.
@@ -89,7 +89,7 @@ pub enum EventPayload {
 }
 
 /// Task queue lifecycle event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "event")]
 pub enum TaskEvent {
     /// A task was posted to the queue.
@@ -109,7 +109,7 @@ pub enum TaskEvent {
 }
 
 /// A message between agents or from user to agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentMessage {
     /// The text content of the message.
     pub content: String,
@@ -120,7 +120,7 @@ pub struct AgentMessage {
 }
 
 /// Role of a message sender.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     /// A human user.
@@ -134,7 +134,7 @@ pub enum MessageRole {
 }
 
 /// Output from a tool execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolOutput {
     /// Which tool produced this output.
     pub tool_id: String,
@@ -149,7 +149,7 @@ pub struct ToolOutput {
 }
 
 /// A change in the memory substrate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MemoryDelta {
     /// What kind of memory operation.
     pub operation: MemoryOperation,
@@ -160,7 +160,7 @@ pub struct MemoryDelta {
 }
 
 /// The type of memory operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryOperation {
     /// A new value was created.
@@ -172,7 +172,7 @@ pub enum MemoryOperation {
 }
 
 /// Agent lifecycle event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "event")]
 pub enum LifecycleEvent {
     /// An agent was spawned.
@@ -214,7 +214,7 @@ pub enum LifecycleEvent {
 }
 
 /// Network-related event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "event")]
 pub enum NetworkEvent {
     /// A peer connected.
@@ -244,7 +244,7 @@ pub enum NetworkEvent {
 }
 
 /// System-level event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "event")]
 pub enum SystemEvent {
     /// The kernel has started.
@@ -324,7 +324,7 @@ pub enum SystemEvent {
 }
 
 /// A complete event in the OpenFang event system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Event {
     /// Unique event ID.
     pub id: EventId,

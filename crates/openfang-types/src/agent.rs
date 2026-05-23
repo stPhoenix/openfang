@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Unique identifier for a user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UserId(pub Uuid);
 
 impl UserId {
@@ -39,7 +39,7 @@ impl std::str::FromStr for UserId {
 }
 
 /// Model routing configuration — auto-selects cheap/mid/expensive models by complexity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ModelRoutingConfig {
     /// Model to use for simple queries.
@@ -67,7 +67,7 @@ impl Default for ModelRoutingConfig {
 }
 
 /// Autonomous agent configuration — guardrails for 24/7 agents.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(default)]
 pub struct AutonomousConfig {
     /// Cron expression for quiet hours (e.g., "0 22 * * *" to "0 6 * * *").
@@ -95,7 +95,7 @@ impl Default for AutonomousConfig {
 }
 
 /// Hook event types that can be intercepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
     /// Fires before a tool call is executed. Handler can block the call.
@@ -109,7 +109,7 @@ pub enum HookEvent {
 }
 
 /// Unique identifier for an agent instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
@@ -147,7 +147,7 @@ impl std::str::FromStr for AgentId {
 }
 
 /// Unique identifier for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -170,7 +170,7 @@ impl std::fmt::Display for SessionId {
 }
 
 /// The current lifecycle state of an agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     /// Agent has been created but not yet started.
@@ -186,7 +186,7 @@ pub enum AgentState {
 }
 
 /// Permission-based operational mode for an agent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMode {
     /// Read-only: agent can observe but cannot call any tools.
@@ -224,7 +224,7 @@ impl AgentMode {
 }
 
 /// How an agent is scheduled to run.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleMode {
     /// Agent wakes up when a message/event arrives (default).
@@ -246,7 +246,7 @@ fn default_check_interval() -> u64 {
 }
 
 /// Resource limits for an agent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ResourceQuota {
     /// Maximum WASM memory in bytes.
@@ -283,7 +283,19 @@ impl Default for ResourceQuota {
 }
 
 /// Agent priority level for scheduling.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema
+)]
 pub enum Priority {
     /// Low priority.
     Low = 0,
@@ -297,7 +309,7 @@ pub enum Priority {
 }
 
 /// Named tool presets — expand to tool lists + derived capabilities.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolProfile {
     Minimal,
@@ -369,7 +381,7 @@ impl ToolProfile {
 }
 
 /// LLM model configuration for an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ModelConfig {
     /// LLM provider name.
@@ -404,7 +416,7 @@ impl Default for ModelConfig {
 }
 
 /// A fallback model entry in a chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FallbackModel {
     pub provider: String,
     pub model: String,
@@ -415,14 +427,14 @@ pub struct FallbackModel {
 }
 
 /// Tool configuration within an agent manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolConfig {
     /// Tool-specific configuration parameters.
     pub params: HashMap<String, serde_json::Value>,
 }
 
 /// Complete agent manifest — defines everything about an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct AgentManifest {
     /// Human-readable agent name.
@@ -478,6 +490,7 @@ pub struct AgentManifest {
     /// Agent workspace directory. Auto-created on spawn.
     /// Default: `{workspaces_dir}/{agent_name}-{agent_id_prefix}/`
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub workspace: Option<PathBuf>,
     /// Whether to generate workspace identity files (SOUL.md, USER.md, etc.) on creation.
     #[serde(default = "default_true")]
@@ -550,7 +563,7 @@ impl Default for AgentManifest {
 }
 
 /// Capability declarations in a manifest (human-readable TOML format).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ManifestCapabilities {
     /// Allowed network hosts (e.g., ["api.anthropic.com:443"]).
@@ -582,7 +595,7 @@ pub struct ManifestCapabilities {
 
 /// Human-readable session label (e.g., "support inbox", "research").
 /// Max 128 chars, alphanumeric + spaces + hyphens + underscores only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, utoipa::ToSchema)]
 pub struct SessionLabel(String);
 
 impl SessionLabel {
@@ -618,7 +631,7 @@ impl std::fmt::Display for SessionLabel {
 }
 
 /// Visual identity for an agent — emoji, avatar, color, personality.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct AgentIdentity {
     /// Single emoji character for quick visual identification.
@@ -636,7 +649,7 @@ pub struct AgentIdentity {
 }
 
 /// A registered agent entry in the kernel's registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentEntry {
     /// Unique agent ID.
     pub id: AgentId,

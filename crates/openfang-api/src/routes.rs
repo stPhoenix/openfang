@@ -64,6 +64,12 @@ pub struct AppState {
     /// Survives across page reloads so the dashboard can show a persistent
     /// spinner during in-flight runs and the last preview/summary after.
     pub batch_apply_snapshot: Arc<tokio::sync::RwLock<BatchApplySnapshot>>,
+    /// Cooperative cancel flag for an in-flight batch-apply run. The detached
+    /// run task checks this between evolutions and bails early when set. The
+    /// `/api/evolve/batch-apply/cancel` endpoint flips it on and force-clears
+    /// the snapshot so the UI unsticks even if the current evolution future
+    /// is still hung on a stalled LLM call.
+    pub batch_apply_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Server-side snapshot of an evolve batch run.
@@ -177,6 +183,14 @@ pub enum EvolveExecuteEvent {
     },
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents — Spawn a new agent.
 pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
@@ -302,6 +316,14 @@ pub async fn spawn_agent(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents — List all agents.
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Snapshot catalog once for enrichment
@@ -468,6 +490,17 @@ pub fn inject_attachments_into_session(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/message",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/:id/message — Send a message to an agent.
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
@@ -612,6 +645,17 @@ pub async fn send_message(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/session",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/:id/session — Get agent session (conversation history).
 ///
 /// Query parameters:
@@ -856,6 +900,17 @@ pub async fn get_agent_session(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/context",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/:id/context — Detailed context window analysis.
 pub async fn get_agent_context(
     State(state): State<Arc<AppState>>,
@@ -897,6 +952,17 @@ pub async fn get_agent_context(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/agents/:id — Kill an agent.
 pub async fn kill_agent(
     State(state): State<Arc<AppState>>,
@@ -927,6 +993,17 @@ pub async fn kill_agent(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/restart",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/restart — Restart a crashed/stuck agent.
 ///
 /// Cancels any active task, resets agent state to Running, and updates last_active.
@@ -988,6 +1065,14 @@ pub async fn restart_agent(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/status — Kernel status.
 pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents: Vec<serde_json::Value> = state
@@ -1027,6 +1112,14 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shutdown",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/shutdown — Graceful shutdown.
 pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tracing::info!("Shutdown requested via API");
@@ -1047,6 +1140,14 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 // Workflow routes
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/workflows",
+    tag = "workflows",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/workflows — Register a new workflow.
 pub async fn create_workflow(
     State(state): State<Arc<AppState>>,
@@ -1149,6 +1250,14 @@ pub async fn create_workflow(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/workflows",
+    tag = "workflows",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/workflows — List all workflows.
 pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let workflows = state.kernel.workflows.list_workflows().await;
@@ -1167,6 +1276,17 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
     Json(list)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/workflows/{id}/run",
+    tag = "workflows",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/workflows/:id/run — Execute a workflow.
 pub async fn run_workflow(
     State(state): State<Arc<AppState>>,
@@ -1204,6 +1324,17 @@ pub async fn run_workflow(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/workflows/{id}/runs",
+    tag = "workflows",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/workflows/:id/runs — List runs for a workflow.
 pub async fn list_workflow_runs(
     State(state): State<Arc<AppState>>,
@@ -1226,6 +1357,17 @@ pub async fn list_workflow_runs(
     Json(list)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/workflows/{id}",
+    tag = "workflows",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/workflows/:id — Get a single workflow by ID.
 pub async fn get_workflow(
     State(state): State<Arc<AppState>>,
@@ -1259,6 +1401,17 @@ pub async fn get_workflow(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/workflows/{id}",
+    tag = "workflows",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/workflows/:id — Update a workflow definition.
 pub async fn update_workflow(
     State(state): State<Arc<AppState>>,
@@ -1364,6 +1517,17 @@ pub async fn update_workflow(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/workflows/{id}",
+    tag = "workflows",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/workflows/:id — Delete a workflow definition.
 pub async fn delete_workflow(
     State(state): State<Arc<AppState>>,
@@ -1396,6 +1560,14 @@ pub async fn delete_workflow(
 // Trigger routes
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/triggers",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/triggers — Register a new event trigger.
 pub async fn create_trigger(
     State(state): State<Arc<AppState>>,
@@ -1469,6 +1641,14 @@ pub async fn create_trigger(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/triggers",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/triggers — List all triggers (optionally filter by ?agent_id=...).
 pub async fn list_triggers(
     State(state): State<Arc<AppState>>,
@@ -1497,6 +1677,17 @@ pub async fn list_triggers(
     Json(list)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/triggers/{id}",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/triggers/:id — Remove a trigger.
 pub async fn delete_trigger(
     State(state): State<Arc<AppState>>,
@@ -1529,6 +1720,14 @@ pub async fn delete_trigger(
 // Profile + Mode endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/profiles",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/profiles — List all tool profiles and their tool lists.
 pub async fn list_profiles() -> impl IntoResponse {
     use openfang_types::agent::ToolProfile;
@@ -1555,6 +1754,17 @@ pub async fn list_profiles() -> impl IntoResponse {
     Json(result)
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/mode",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/:id/mode — Change an agent's operational mode.
 pub async fn set_agent_mode(
     State(state): State<Arc<AppState>>,
@@ -1591,6 +1801,14 @@ pub async fn set_agent_mode(
 // Version endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/version — Build & version info.
 pub async fn version() -> impl IntoResponse {
     Json(serde_json::json!({
@@ -1608,6 +1826,17 @@ pub async fn version() -> impl IntoResponse {
 // Single agent detail + SSE streaming
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/:id — Get a single agent's detailed info.
 pub async fn get_agent(
     State(state): State<Arc<AppState>>,
@@ -1667,6 +1896,17 @@ pub async fn get_agent(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/message/stream",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/:id/message/stream — SSE streaming response.
 pub async fn send_message_stream(
     State(state): State<Arc<AppState>>,
@@ -2798,6 +3038,14 @@ fn channel_config_values(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/channels",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/channels — List all 40 channel adapters with status and field metadata.
 pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Read the live channels config (updated on every hot-reload) instead of the
@@ -2855,6 +3103,17 @@ pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/channels/{name}/configure",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/channels/{name}/configure — Save channel secrets + config fields.
 pub async fn configure_channel(
     State(state): State<Arc<AppState>>,
@@ -2964,6 +3223,17 @@ pub async fn configure_channel(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/channels/{name}/configure",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/channels/{name}/configure — Remove channel secrets + config section.
 pub async fn remove_channel(
     State(state): State<Arc<AppState>>,
@@ -3027,6 +3297,19 @@ pub async fn remove_channel(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/channels/{name}/test",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    request_body(content = serde_json::Value, content_type = "application/json", description = "Optional JSON probe body"
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/channels/{name}/test — Connectivity check + optional live test message.
 ///
 /// Accepts an optional JSON body with `channel_id` (for Discord/Slack) or `chat_id`
@@ -3174,6 +3457,14 @@ async fn send_channel_test_message(channel_name: &str, target_id: &str) -> Resul
     Ok(())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/channels/reload",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/channels/reload — Manually trigger a channel hot-reload from disk config.
 pub async fn reload_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match crate::channel_bridge::reload_channels_from_disk(&state).await {
@@ -3198,6 +3489,14 @@ pub async fn reload_channels(State(state): State<Arc<AppState>>) -> impl IntoRes
 // WhatsApp QR login flow (OpenClaw-style)
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/channels/whatsapp/qr/start",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/channels/whatsapp/qr/start — Start a WhatsApp Web QR login session.
 ///
 /// If a WhatsApp Web gateway is available (e.g. a Baileys-based bridge process),
@@ -3252,6 +3551,14 @@ pub async fn whatsapp_qr_start() -> impl IntoResponse {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/channels/whatsapp/qr/status",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/channels/whatsapp/qr/status — Poll for QR scan completion.
 ///
 /// After calling `/qr/start`, the frontend polls this to check if the user
@@ -3397,6 +3704,14 @@ async fn gateway_http_get(url_with_path: &str) -> Result<serde_json::Value, Stri
 // Template endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/templates",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/templates — List available agent templates.
 pub async fn list_templates() -> impl IntoResponse {
     let agents_dir = openfang_kernel::config::openfang_home().join("agents");
@@ -3459,6 +3774,17 @@ fn get_template_category(name: &str) -> &str {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/templates/{name}",
+    tag = "agents",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/templates/:name — Get template details.
 pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
     let agents_dir = openfang_kernel::config::openfang_home().join("agents");
@@ -3516,6 +3842,17 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 // Memory endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/agents/{id}/kv",
+    tag = "memory",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/memory/agents/:id/kv — List KV pairs for an agent.
 ///
 /// Note: memory_store tool writes to a shared namespace, so we read from that
@@ -3544,6 +3881,18 @@ pub async fn get_agent_kv(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/agents/{id}/kv/{key}",
+    tag = "memory",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("key" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/memory/agents/:id/kv/:key — Get a specific KV value.
 pub async fn get_agent_kv_key(
     State(state): State<Arc<AppState>>,
@@ -3570,6 +3919,18 @@ pub async fn get_agent_kv_key(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/memory/agents/{id}/kv/{key}",
+    tag = "memory",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("key" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/memory/agents/:id/kv/:key — Set a KV value.
 pub async fn set_agent_kv_key(
     State(state): State<Arc<AppState>>,
@@ -3595,6 +3956,18 @@ pub async fn set_agent_kv_key(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/memory/agents/{id}/kv/{key}",
+    tag = "memory",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("key" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/memory/agents/:id/kv/:key — Delete a KV value.
 pub async fn delete_agent_kv_key(
     State(state): State<Arc<AppState>>,
@@ -3617,6 +3990,14 @@ pub async fn delete_agent_kv_key(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/health — Minimal liveness probe (public, no auth required).
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
@@ -3643,6 +4024,14 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/health/detail",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/health/detail — Full health diagnostics (requires auth).
 pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health = state.kernel.supervisor.health();
@@ -3676,6 +4065,14 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // Prometheus metrics endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/metrics",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/metrics — Prometheus text-format metrics.
 ///
 /// Returns counters and gauges for monitoring OpenFang in production:
@@ -3761,6 +4158,14 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 // Skills endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/skills",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/skills — List installed skills.
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
@@ -3964,6 +4369,17 @@ fn walk_skill_dir(
     Ok((out, truncated))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/skills/{id}/detail",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/skills/{id}/detail — Manifest summary, SKILL.md text, and file list.
 ///
 /// Used by the Skills tab to render a click-through detail modal for installed
@@ -4046,6 +4462,17 @@ pub async fn get_skill_detail(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/skills/{id}/file",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/skills/{id}/file?path=<relpath> — Single file contents from a skill directory.
 ///
 /// Enforces path-traversal safety: rejects `..`, absolute paths, null bytes;
@@ -4191,6 +4618,14 @@ pub async fn get_skill_file(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/skills/install",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/skills/install — Install a skill from FangHub (GitHub).
 pub async fn install_skill(
     State(state): State<Arc<AppState>>,
@@ -4223,6 +4658,14 @@ pub async fn install_skill(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/skills/uninstall",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/skills/uninstall — Uninstall a skill.
 pub async fn uninstall_skill(
     State(state): State<Arc<AppState>>,
@@ -4248,6 +4691,14 @@ pub async fn uninstall_skill(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/skills/reload",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/skills/reload — Hot-reload the skill registry from disk.
 ///
 /// Called by the CLI after `openfang skill install` to notify the running
@@ -4257,6 +4708,14 @@ pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoRespo
     Json(serde_json::json!({"status": "reloaded"}))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/marketplace/search",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/marketplace/search — Search the FangHub marketplace.
 pub async fn marketplace_search(
     Query(params): Query<HashMap<String, String>>,
@@ -4295,6 +4754,14 @@ pub async fn marketplace_search(
 // ClawHub (OpenClaw ecosystem) endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/clawhub/search",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/clawhub/search — Search ClawHub skills using vector/semantic search.
 ///
 /// Query parameters:
@@ -4372,6 +4839,14 @@ pub async fn clawhub_search(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/clawhub/browse",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/clawhub/browse — Browse ClawHub skills by sort order.
 ///
 /// Query parameters:
@@ -4446,6 +4921,17 @@ pub async fn clawhub_browse(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/clawhub/skill/{slug}",
+    tag = "skills",
+    params(
+        ("slug" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/clawhub/skill/{slug} — Get detailed info about a ClawHub skill.
 pub async fn clawhub_skill_detail(
     State(state): State<Arc<AppState>>,
@@ -4510,6 +4996,17 @@ pub async fn clawhub_skill_detail(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/clawhub/skill/{slug}/code",
+    tag = "skills",
+    params(
+        ("slug" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/clawhub/skill/{slug}/code — Fetch the source code (SKILL.md) of a ClawHub skill.
 pub async fn clawhub_skill_code(
     State(state): State<Arc<AppState>>,
@@ -4550,6 +5047,14 @@ pub async fn clawhub_skill_code(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/clawhub/install",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/clawhub/install — Install a skill from ClawHub.
 ///
 /// Runs the full security pipeline: SHA256 verification, format detection,
@@ -4661,6 +5166,14 @@ fn server_platform() -> &'static str {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands",
+    tag = "hands",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands — List all hand definitions (marketplace).
 pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let defs = state.kernel.hand_registry.list_definitions();
@@ -4706,6 +5219,14 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
     Json(serde_json::json!({ "hands": hands, "total": hands.len() }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands/active",
+    tag = "hands",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands/active — List active hand instances.
 pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let instances = state.kernel.hand_registry.list_instances();
@@ -4744,6 +5265,17 @@ pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoR
     Json(serde_json::json!({ "instances": items, "total": items.len() }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands/{hand_id}",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands/{hand_id} — Get a single hand definition with requirements check.
 pub async fn get_hand(
     State(state): State<Arc<AppState>>,
@@ -4825,6 +5357,17 @@ pub async fn get_hand(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/{hand_id}/check-deps",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/{hand_id}/check-deps — Re-check dependency status for a hand.
 pub async fn check_hand_deps(
     State(state): State<Arc<AppState>>,
@@ -4879,6 +5422,17 @@ pub async fn check_hand_deps(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/{hand_id}/install-deps",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/{hand_id}/install-deps — Auto-install missing dependencies for a hand.
 pub async fn install_hand_deps(
     State(state): State<Arc<AppState>>,
@@ -5117,6 +5671,14 @@ pub async fn install_hand_deps(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/install",
+    tag = "hands",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/install — Install a hand from TOML content.
 pub async fn install_hand(
     State(state): State<Arc<AppState>>,
@@ -5153,6 +5715,14 @@ pub async fn install_hand(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/upsert",
+    tag = "hands",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/upsert — Install or update a hand definition.
 ///
 /// Like `install_hand` but overwrites an existing definition with the same ID.
@@ -5193,6 +5763,17 @@ pub async fn upsert_hand(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/{hand_id}/activate",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/{hand_id}/activate — Activate a hand (spawns agent).
 pub async fn activate_hand(
     State(state): State<Arc<AppState>>,
@@ -5273,6 +5854,17 @@ pub async fn activate_hand(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/instances/{id}/pause",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/instances/{id}/pause — Pause a hand instance.
 pub async fn pause_hand(
     State(state): State<Arc<AppState>>,
@@ -5290,6 +5882,17 @@ pub async fn pause_hand(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/instances/{id}/resume",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/hands/instances/{id}/resume — Resume a paused hand instance.
 pub async fn resume_hand(
     State(state): State<Arc<AppState>>,
@@ -5308,11 +5911,22 @@ pub async fn resume_hand(
 }
 
 /// POST /api/hands/instances/{id}/autonomous-tick — Toggle autonomous tick loop.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct SetAutonomousTickRequest {
     pub enabled: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/hands/instances/{id}/autonomous-tick",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 pub async fn set_hand_autonomous_tick(
     State(state): State<Arc<AppState>>,
     Path(id): Path<uuid::Uuid>,
@@ -5334,6 +5948,17 @@ pub async fn set_hand_autonomous_tick(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/hands/instances/{id}",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/hands/instances/{id} — Deactivate a hand (kills agent).
 pub async fn deactivate_hand(
     State(state): State<Arc<AppState>>,
@@ -5351,6 +5976,17 @@ pub async fn deactivate_hand(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands/{hand_id}/settings",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands/{hand_id}/settings — Get settings schema and current values for a hand.
 pub async fn get_hand_settings(
     State(state): State<Arc<AppState>>,
@@ -5390,6 +6026,17 @@ pub async fn get_hand_settings(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/hands/{hand_id}/settings",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/hands/{hand_id}/settings — Update settings for a hand instance.
 pub async fn update_hand_settings(
     State(state): State<Arc<AppState>>,
@@ -5430,6 +6077,17 @@ pub async fn update_hand_settings(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands/instances/{id}/stats",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands/instances/{id}/stats — Get dashboard stats for a hand instance.
 pub async fn hand_stats(
     State(state): State<Arc<AppState>>,
@@ -5511,6 +6169,17 @@ pub async fn hand_stats(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/hands/instances/{id}/browser",
+    tag = "hands",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/hands/instances/{id}/browser — Get live browser state for a hand instance.
 pub async fn hand_instance_browser(
     State(state): State<Arc<AppState>>,
@@ -5612,6 +6281,14 @@ pub async fn hand_instance_browser(
 // MCP server endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/mcp/servers",
+    tag = "mcp",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/mcp/servers — List configured MCP servers and their tools.
 pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Get configured servers from config
@@ -5687,6 +6364,14 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
 // Audit endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/audit/recent",
+    tag = "audit",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/audit/recent — Get recent audit log entries.
 pub async fn audit_recent(
     State(state): State<Arc<AppState>>,
@@ -5723,6 +6408,14 @@ pub async fn audit_recent(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/audit/verify",
+    tag = "audit",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/audit/verify — Verify the audit chain integrity.
 pub async fn audit_verify(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let entry_count = state.kernel.audit_log.len();
@@ -5752,6 +6445,14 @@ pub async fn audit_verify(State(state): State<Arc<AppState>>) -> impl IntoRespon
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/logs/stream",
+    tag = "audit",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/logs/stream — SSE endpoint for real-time audit log streaming.
 ///
 /// Streams new audit entries as Server-Sent Events. Accepts optional query
@@ -5865,6 +6566,14 @@ fn classify_audit_level(action: &str) -> &'static str {
 // Peer endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/peers",
+    tag = "network",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/peers — List known OFP peers.
 pub async fn list_peers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Peers are tracked in the wire module's PeerRegistry.
@@ -5895,6 +6604,14 @@ pub async fn list_peers(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/network/status",
+    tag = "network",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/network/status — OFP network status summary.
 pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let enabled = state.kernel.config.network_enabled
@@ -5926,6 +6643,14 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 // Tools endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/tools",
+    tag = "tools",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/tools — List all tool definitions (built-in + MCP).
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut tools: Vec<serde_json::Value> = builtin_tool_definitions()
@@ -5958,6 +6683,14 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse
 // Config endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/config — Get kernel configuration (secrets redacted).
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return a redacted view of the kernel config
@@ -5981,6 +6714,14 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
 // Usage endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/usage",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/usage — Get per-agent usage statistics.
 pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents: Vec<serde_json::Value> = state
@@ -6006,6 +6747,14 @@ pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // Usage summary endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/usage/summary",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/usage/summary — Get overall usage summary from UsageStore.
 pub async fn usage_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.kernel.memory.usage().query_summary(None) {
@@ -6026,6 +6775,14 @@ pub async fn usage_summary(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/usage/by-model",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/usage/by-model — Get usage grouped by model.
 pub async fn usage_by_model(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.kernel.memory.usage().query_by_model() {
@@ -6048,6 +6805,14 @@ pub async fn usage_by_model(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/usage/daily",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/usage/daily — Get daily usage breakdown for the last 7 days.
 pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let days = state.kernel.memory.usage().query_daily_breakdown(7);
@@ -6080,6 +6845,14 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // Budget endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/budget",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let budget = state.budget_config.read().await;
@@ -6087,6 +6860,14 @@ pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/budget",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/budget — Update global budget limits (in-memory only, not persisted to config.toml).
 pub async fn update_budget(
     State(state): State<Arc<AppState>>,
@@ -6115,6 +6896,17 @@ pub async fn update_budget(
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/budget/agents/{id}",
+    tag = "budget",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/budget/agents/{id} — Per-agent budget/quota status.
 pub async fn agent_budget_status(
     State(state): State<Arc<AppState>>,
@@ -6179,6 +6971,14 @@ pub async fn agent_budget_status(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/budget/agents",
+    tag = "budget",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/budget/agents — Per-agent cost ranking (top spenders).
 pub async fn agent_budget_ranking(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let usage_store = openfang_memory::usage::UsageStore::new(state.kernel.memory.usage_conn());
@@ -6208,6 +7008,17 @@ pub async fn agent_budget_ranking(State(state): State<Arc<AppState>>) -> impl In
     Json(serde_json::json!({"agents": agents, "total": agents.len()}))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/budget/agents/{id}",
+    tag = "budget",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/budget/agents/{id} — Update per-agent budget limits at runtime.
 pub async fn update_agent_budget(
     State(state): State<Arc<AppState>>,
@@ -6264,6 +7075,14 @@ pub async fn update_agent_budget(
 // Session listing endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/sessions",
+    tag = "sessions",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/sessions — List all sessions with metadata.
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.kernel.memory.list_sessions() {
@@ -6272,6 +7091,17 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/sessions/{id}",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/sessions/:id — Delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
@@ -6299,6 +7129,17 @@ pub async fn delete_session(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/sessions/{id}/label",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/sessions/:id/label — Set a session label.
 pub async fn set_session_label(
     State(state): State<Arc<AppState>>,
@@ -6343,6 +7184,18 @@ pub async fn set_session_label(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/sessions/by-label/{label}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("label" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/sessions/by-label/:label — Find session by label (scoped to agent).
 pub async fn find_session_by_label(
     State(state): State<Arc<AppState>>,
@@ -6389,6 +7242,17 @@ pub async fn find_session_by_label(
 // Trigger update endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    put,
+    path = "/api/triggers/{id}",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/triggers/:id — Update a trigger (enable/disable toggle).
 pub async fn update_trigger(
     State(state): State<Arc<AppState>>,
@@ -6431,6 +7295,17 @@ pub async fn update_trigger(
 // Agent update endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/update",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/:id — Update an agent (currently: re-set manifest fields).
 pub async fn update_agent(
     State(state): State<Arc<AppState>>,
@@ -6476,6 +7351,17 @@ pub async fn update_agent(
     )
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PATCH /api/agents/{id} — Partial update of agent fields (name, description, model, system_prompt).
 pub async fn patch_agent(
     State(state): State<Arc<AppState>>,
@@ -6579,6 +7465,14 @@ pub async fn patch_agent(
 // Security dashboard endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/security",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/security — Security feature status for the dashboard.
 pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let auth_mode = if state.kernel.config.api_key.is_empty() {
@@ -6649,6 +7543,14 @@ pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoRes
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/migrate/detect",
+    tag = "migrate",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/migrate/detect — Auto-detect OpenClaw installation.
 pub async fn migrate_detect() -> impl IntoResponse {
     match openfang_migrate::openclaw::detect_openclaw_home() {
@@ -6674,6 +7576,14 @@ pub async fn migrate_detect() -> impl IntoResponse {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/migrate/scan",
+    tag = "migrate",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/migrate/scan — Scan a specific directory for OpenClaw workspace.
 pub async fn migrate_scan(Json(req): Json<MigrateScanRequest>) -> impl IntoResponse {
     let path = std::path::PathBuf::from(&req.path);
@@ -6687,6 +7597,14 @@ pub async fn migrate_scan(Json(req): Json<MigrateScanRequest>) -> impl IntoRespo
     (StatusCode::OK, Json(serde_json::json!(scan)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/migrate",
+    tag = "migrate",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/migrate — Run migration from another agent framework.
 pub async fn run_migrate(Json(req): Json<MigrateRequest>) -> impl IntoResponse {
     let source = match req.source.as_str() {
@@ -6759,6 +7677,14 @@ pub async fn run_migrate(Json(req): Json<MigrateRequest>) -> impl IntoResponse {
 
 // ── Model Catalog Endpoints ─────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/models",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/models — List all models in the catalog.
 ///
 /// Query parameters:
@@ -6868,6 +7794,14 @@ pub async fn list_models(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/models/aliases",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/models/aliases — List all alias-to-model mappings.
 pub async fn list_aliases(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let aliases = state
@@ -6896,6 +7830,17 @@ pub async fn list_aliases(State(state): State<Arc<AppState>>) -> impl IntoRespon
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/models/{id}",
+    tag = "providers",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/models/{id} — Get a single model by ID or alias.
 pub async fn get_model(
     State(state): State<Arc<AppState>>,
@@ -6952,6 +7897,14 @@ pub async fn get_model(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/providers",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/providers — List all providers with auth status.
 ///
 /// For local providers (ollama, vllm, lmstudio), also probes reachability and
@@ -7047,6 +8000,14 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/models/custom",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/models/custom — Add a custom model to the catalog.
 ///
 /// Persists to `~/.openfang/custom_models.json` and makes the model immediately
@@ -7148,6 +8109,17 @@ pub async fn add_custom_model(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/models/{id}",
+    tag = "providers",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/models/{id} — Upsert per-model values as a Custom-tier shadow.
 ///
 /// Accepts a sparse JSON patch — any field omitted is filled from the model's
@@ -7239,6 +8211,17 @@ pub async fn update_model(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/models/custom/{id}",
+    tag = "providers",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/models/custom/{id} — Remove a custom model.
 pub async fn remove_custom_model(
     State(state): State<Arc<AppState>>,
@@ -7270,6 +8253,14 @@ pub async fn remove_custom_model(
 
 // ── A2A (Agent-to-Agent) Protocol Endpoints ─────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/.well-known/agent.json",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /.well-known/agent.json — A2A Agent Card for the default agent.
 pub async fn a2a_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.kernel.registry.list();
@@ -7296,6 +8287,14 @@ pub async fn a2a_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/a2a/agents",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /a2a/agents — List all A2A agent cards.
 pub async fn a2a_list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.kernel.registry.list();
@@ -7319,6 +8318,14 @@ pub async fn a2a_list_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/a2a/tasks/send",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /a2a/tasks/send — Submit a task to an agent via A2A.
 ///
 /// Async-from-creation: the task is inserted as `Working` and returned
@@ -7462,6 +8469,14 @@ pub async fn a2a_send_task(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/a2a/tasks/sendSubscribe",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /a2a/tasks/sendSubscribe — Submit a task and stream updates over SSE.
 ///
 /// Same request shape as `a2a_send_task` but the response is an SSE stream
@@ -7815,6 +8830,17 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+#[utoipa::path(
+    get,
+    path = "/a2a/tasks/{id}",
+    tag = "a2a",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /a2a/tasks/{id} — Get task status from the task store.
 pub async fn a2a_get_task(
     State(state): State<Arc<AppState>>,
@@ -7832,6 +8858,18 @@ pub async fn a2a_get_task(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/a2a/tasks/{tid}/artifacts/{aid}",
+    tag = "a2a",
+    params(
+        ("tid" = String, Path, description = "Path parameter"),
+        ("aid" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/a2a/tasks/{tid}/artifacts/{aid} — Download an artifact's bytes.
 ///
 /// Auth: Bearer or X-API-Key (default `/api/*` middleware applies).
@@ -7915,6 +8953,17 @@ pub async fn a2a_get_artifact(
         .unwrap()
 }
 
+#[utoipa::path(
+    post,
+    path = "/a2a/tasks/{id}/cancel",
+    tag = "a2a",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /a2a/tasks/{id}/cancel — Cancel a tracked task.
 ///
 /// Flips the task store to `Cancelled` AND aborts the in-flight tokio task
@@ -7952,6 +9001,14 @@ pub async fn a2a_cancel_task(
 
 // ── A2A Management Endpoints (outbound) ─────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/a2a/agents",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/a2a/agents — List discovered external A2A agents.
 pub async fn a2a_list_external_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state
@@ -7974,6 +9031,14 @@ pub async fn a2a_list_external_agents(State(state): State<Arc<AppState>>) -> imp
     Json(serde_json::json!({"agents": items, "total": items.len()}))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/a2a/discover",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/a2a/discover — Discover a new external A2A agent by URL.
 pub async fn a2a_discover_external(
     State(state): State<Arc<AppState>>,
@@ -8022,6 +9087,14 @@ pub async fn a2a_discover_external(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/a2a/send",
+    tag = "a2a",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/a2a/send — Send a task to an external A2A agent.
 pub async fn a2a_send_external(
     State(_state): State<Arc<AppState>>,
@@ -8060,6 +9133,17 @@ pub async fn a2a_send_external(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/a2a/tasks/{id}/status",
+    tag = "a2a",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/a2a/tasks/{id}/status — Get task status from an external A2A agent.
 pub async fn a2a_external_task_status(
     State(_state): State<Arc<AppState>>,
@@ -8091,6 +9175,14 @@ pub async fn a2a_external_task_status(
 
 // ── MCP HTTP Endpoint ───────────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/mcp",
+    tag = "mcp",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /mcp — Handle MCP JSON-RPC requests over HTTP.
 ///
 /// Exposes the same MCP protocol normally served via stdio, allowing
@@ -8197,6 +9289,17 @@ pub async fn mcp_http(
 
 // ── Multi-Session Endpoints ─────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/sessions",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/sessions — List all sessions for an agent.
 pub async fn list_agent_sessions(
     State(state): State<Arc<AppState>>,
@@ -8223,6 +9326,17 @@ pub async fn list_agent_sessions(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/sessions",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/sessions — Create a new session for an agent.
 pub async fn create_agent_session(
     State(state): State<Arc<AppState>>,
@@ -8248,6 +9362,18 @@ pub async fn create_agent_session(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/sessions/{session_id}/switch",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("session_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/sessions/{session_id}/switch — Switch to an existing session.
 pub async fn switch_agent_session(
     State(state): State<Arc<AppState>>,
@@ -8285,6 +9411,17 @@ pub async fn switch_agent_session(
 
 // ── Extended Chat Command API Endpoints ─────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/session/reset",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/session/reset — Reset an agent's session.
 pub async fn reset_session(
     State(state): State<Arc<AppState>>,
@@ -8311,6 +9448,17 @@ pub async fn reset_session(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/history",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/agents/{id}/history — Clear ALL conversation history for an agent.
 pub async fn clear_agent_history(
     State(state): State<Arc<AppState>>,
@@ -8343,6 +9491,17 @@ pub async fn clear_agent_history(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/session/compact",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/session/compact — Trigger LLM session compaction.
 pub async fn compact_session(
     State(state): State<Arc<AppState>>,
@@ -8369,6 +9528,17 @@ pub async fn compact_session(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/stop",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/stop — Cancel an agent's current LLM run.
 pub async fn stop_agent(
     State(state): State<Arc<AppState>>,
@@ -8399,6 +9569,17 @@ pub async fn stop_agent(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/model",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/model — Switch an agent's model.
 pub async fn set_model(
     State(state): State<Arc<AppState>>,
@@ -8457,6 +9638,17 @@ pub async fn set_model(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/tools",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/tools — Get an agent's tool allowlist/blocklist.
 pub async fn get_agent_tools(
     State(state): State<Arc<AppState>>,
@@ -8489,6 +9681,17 @@ pub async fn get_agent_tools(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/tools",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/tools — Update an agent's tool allowlist/blocklist.
 pub async fn set_agent_tools(
     State(state): State<Arc<AppState>>,
@@ -8542,6 +9745,17 @@ pub async fn set_agent_tools(
 
 // ── Per-Agent Taint / PII Policy ──────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/taint-policy",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/taint-policy — Get an agent's taint/PII policy.
 pub async fn get_agent_taint_policy(
     State(state): State<Arc<AppState>>,
@@ -8583,6 +9797,17 @@ pub async fn get_agent_taint_policy(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/taint-policy",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/taint-policy — Update an agent's taint/PII policy.
 pub async fn set_agent_taint_policy(
     State(state): State<Arc<AppState>>,
@@ -8658,6 +9883,17 @@ pub async fn set_agent_taint_policy(
 
 // ── Per-Agent Skill & MCP Endpoints ────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/skills",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/skills — Get an agent's skill assignment info.
 pub async fn get_agent_skills(
     State(state): State<Arc<AppState>>,
@@ -8702,6 +9938,17 @@ pub async fn get_agent_skills(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/skills",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/skills — Update an agent's skill allowlist.
 pub async fn set_agent_skills(
     State(state): State<Arc<AppState>>,
@@ -8737,6 +9984,17 @@ pub async fn set_agent_skills(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/mcp_servers",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/mcp_servers — Get an agent's MCP server assignment info.
 pub async fn get_agent_mcp_servers(
     State(state): State<Arc<AppState>>,
@@ -8787,6 +10045,17 @@ pub async fn get_agent_mcp_servers(
     )
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/mcp_servers",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/mcp_servers — Update an agent's MCP server allowlist.
 pub async fn set_agent_mcp_servers(
     State(state): State<Arc<AppState>>,
@@ -8827,6 +10096,17 @@ pub async fn set_agent_mcp_servers(
 
 // ── Provider Key Management Endpoints ──────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/providers/{name}/key",
+    tag = "providers",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/providers/{name}/key — Save an API key for a provider.
 ///
 /// SECURITY: Writes to `~/.openfang/secrets.env`, sets env var in process,
@@ -9007,6 +10287,17 @@ pub async fn set_provider_key(
     (StatusCode::OK, Json(resp))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/providers/{name}/key",
+    tag = "providers",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/providers/{name}/key — Remove an API key for a provider.
 pub async fn delete_provider_key(
     State(state): State<Arc<AppState>>,
@@ -9063,6 +10354,17 @@ pub async fn delete_provider_key(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/providers/{name}/test",
+    tag = "providers",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/providers/{name}/test — Test a provider's connectivity.
 pub async fn test_provider(
     State(state): State<Arc<AppState>>,
@@ -9164,6 +10466,17 @@ pub async fn test_provider(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/providers/{name}/url",
+    tag = "providers",
+    params(
+        ("name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/providers/{name}/url — Set a custom base URL for a provider.
 pub async fn set_provider_url(
     State(state): State<Arc<AppState>>,
@@ -9273,6 +10586,14 @@ fn upsert_provider_url(
     Ok(())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/skills/create",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/skills/create — Create a local prompt-only skill.
 pub async fn create_skill(
     State(state): State<Arc<AppState>>,
@@ -9520,6 +10841,17 @@ fn build_skill_config_snapshot(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/skills/{id}/config",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/skills/{id}/config — Return declared + resolved per-skill config.
 ///
 /// Response shape:
@@ -9552,12 +10884,23 @@ pub async fn get_skill_config(
 }
 
 /// Request body for `PUT /api/skills/{id}/config`.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct SkillConfigPutRequest {
     /// New per-variable values. Keys must match declared variable names.
     pub values: std::collections::HashMap<String, String>,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/skills/{id}/config",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/skills/{id}/config — Write user overrides for a skill's config.
 ///
 /// The body is `{"values": {"<var_name>": "<value>"}}`. Only declared
@@ -9638,6 +10981,18 @@ pub async fn put_skill_config(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/skills/{id}/config/{var_name}",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("var_name" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/skills/{id}/config/{var_name} — Remove a single user override.
 ///
 /// After removal, the variable falls back to env or default on the next
@@ -10024,6 +11379,14 @@ fn remove_channel_config(
 // Integration management endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/integrations",
+    tag = "integrations",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/integrations — List installed integrations with status.
 pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state
@@ -10062,6 +11425,14 @@ pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoR
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/integrations/available",
+    tag = "integrations",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/integrations/available — List all available templates.
 pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state
@@ -10101,6 +11472,14 @@ pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> 
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/integrations/add",
+    tag = "integrations",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/integrations/add — Install an integration.
 pub async fn add_integration(
     State(state): State<Arc<AppState>>,
@@ -10169,6 +11548,17 @@ pub async fn add_integration(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/integrations/{id}",
+    tag = "integrations",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/integrations/:id — Remove an integration.
 pub async fn remove_integration(
     State(state): State<Arc<AppState>>,
@@ -10205,6 +11595,17 @@ pub async fn remove_integration(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/integrations/{id}/reconnect",
+    tag = "integrations",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/integrations/:id/reconnect — Reconnect an MCP server.
 pub async fn reconnect_integration(
     State(state): State<Arc<AppState>>,
@@ -10246,6 +11647,14 @@ pub async fn reconnect_integration(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/integrations/health",
+    tag = "integrations",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/integrations/health — Health status for all integrations.
 pub async fn integrations_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health_entries = state.kernel.extension_health.all_health();
@@ -10272,6 +11681,14 @@ pub async fn integrations_health(State(state): State<Arc<AppState>>) -> impl Int
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/integrations/reload",
+    tag = "integrations",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/integrations/reload — Hot-reload integration configs and reconnect MCP.
 pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.kernel.reload_extension_mcps().await {
@@ -10345,6 +11762,14 @@ fn cron_job_to_schedule_view(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/schedules",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/schedules — List all scheduled jobs from the cron scheduler.
 pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let jobs = state.kernel.cron_scheduler.list_all_jobs();
@@ -10356,6 +11781,14 @@ pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResp
     Json(serde_json::json!({"schedules": schedules, "total": total}))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/schedules",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/schedules — Create a new scheduled job in the cron scheduler.
 pub async fn create_schedule(
     State(state): State<Arc<AppState>>,
@@ -10527,6 +11960,17 @@ pub async fn create_schedule(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/schedules/{id}",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/schedules/:id — Update a scheduled job.
 ///
 /// Supports toggling `enabled`. Other fields are not mutable without a
@@ -10625,6 +12069,17 @@ pub async fn update_schedule(
     (StatusCode::OK, Json(body))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/schedules/{id}",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/schedules/:id — Remove a scheduled job from the cron scheduler.
 pub async fn delete_schedule(
     State(state): State<Arc<AppState>>,
@@ -10655,6 +12110,17 @@ pub async fn delete_schedule(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/schedules/{id}/run",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/schedules/:id/run — Manually run a scheduled job now.
 pub async fn run_schedule(
     State(state): State<Arc<AppState>>,
@@ -10708,6 +12174,17 @@ pub async fn run_schedule(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/schedules/{id}/delivery-log",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/schedules/{id}/delivery-log — Return the last N per-target
 /// delivery results for a schedule.
 ///
@@ -10780,7 +12257,7 @@ fn sanitize_schedule_job_name(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Request body for updating agent visual identity.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct UpdateIdentityRequest {
     pub emoji: Option<String>,
     pub avatar_url: Option<String>,
@@ -10793,6 +12270,17 @@ pub struct UpdateIdentityRequest {
     pub greeting_style: Option<String>,
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{id}/identity",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PATCH /api/agents/{id}/identity — Update an agent's visual identity.
 pub async fn update_agent_identity(
     State(state): State<Arc<AppState>>,
@@ -10865,7 +12353,7 @@ pub async fn update_agent_identity(
 // ---------------------------------------------------------------------------
 
 /// Request body for patching agent config (name, description, prompt, identity, model).
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct PatchAgentConfigRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -10883,6 +12371,17 @@ pub struct PatchAgentConfigRequest {
     pub fallback_models: Option<Vec<openfang_types::agent::FallbackModel>>,
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{id}/config",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PATCH /api/agents/{id}/config — Hot-update agent name, description, system prompt, and identity.
 pub async fn patch_agent_config(
     State(state): State<Arc<AppState>>,
@@ -11120,11 +12619,22 @@ pub async fn patch_agent_config(
 // ---------------------------------------------------------------------------
 
 /// Request body for cloning an agent.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct CloneAgentRequest {
     pub new_name: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/clone",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/clone — Clone an agent with its workspace files.
 pub async fn clone_agent(
     State(state): State<Arc<AppState>>,
@@ -11234,6 +12744,17 @@ const KNOWN_IDENTITY_FILES: &[&str] = &[
     "HEARTBEAT.md",
 ];
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/files",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/files — List workspace identity files.
 pub async fn list_agent_files(
     State(state): State<Arc<AppState>>,
@@ -11288,6 +12809,18 @@ pub async fn list_agent_files(
     (StatusCode::OK, Json(serde_json::json!({ "files": files })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/files/{filename}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("filename" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/{id}/files/{filename} — Read a workspace identity file.
 pub async fn get_agent_file(
     State(state): State<Arc<AppState>>,
@@ -11380,11 +12913,23 @@ pub async fn get_agent_file(
 }
 
 /// Request body for writing a workspace identity file.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct SetAgentFileRequest {
     pub content: String,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}/files/{filename}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+        ("filename" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/agents/{id}/files/{filename} — Write a workspace identity file.
 pub async fn set_agent_file(
     State(state): State<Arc<AppState>>,
@@ -11535,6 +13080,19 @@ fn is_allowed_content_type(ct: &str) -> bool {
         .any(|prefix| ct.starts_with(prefix))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/upload",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    request_body(content = String, content_type = "multipart/form-data", description = "File upload form"
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/agents/{id}/upload — Upload a file attachment.
 ///
 /// Accepts multipart/form-data. The client must include a file field with:
@@ -11708,6 +13266,17 @@ pub async fn upload_file(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/uploads/{file_id}",
+    tag = "files",
+    params(
+        ("file_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/uploads/{file_id} — Serve an uploaded file.
 pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
     // Validate file_id is a UUID to prevent path traversal
@@ -11765,6 +13334,14 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
 // Execution Approval System — backed by kernel.approval_manager
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/approvals",
+    tag = "approvals",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/approvals — List pending and recent approval requests.
 ///
 /// Transforms field names to match the dashboard template expectations:
@@ -11848,7 +13425,7 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
 /// Note: Most approval requests are created automatically by the tool_runner
 /// when an agent invokes a tool that requires approval. This endpoint exists
 /// for external integrations that need to inject approval gates.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct CreateApprovalRequest {
     pub agent_id: String,
     pub tool_name: String,
@@ -11858,6 +13435,14 @@ pub struct CreateApprovalRequest {
     pub action_summary: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/approvals",
+    tag = "approvals",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 pub async fn create_approval(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateApprovalRequest>,
@@ -11897,6 +13482,17 @@ pub async fn create_approval(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/approvals/{id}/approve",
+    tag = "approvals",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/approvals/{id}/approve — Approve a pending request.
 pub async fn approve_request(
     State(state): State<Arc<AppState>>,
@@ -11927,6 +13523,17 @@ pub async fn approve_request(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/approvals/{id}/reject",
+    tag = "approvals",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/approvals/{id}/reject — Reject a pending request.
 pub async fn reject_request(
     State(state): State<Arc<AppState>>,
@@ -11961,6 +13568,14 @@ pub async fn reject_request(
 // Config Reload endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/config/reload",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/config/reload — Reload configuration from disk and apply hot-reloadable changes.
 ///
 /// Reads the config file, diffs against current config, validates the new config,
@@ -12006,6 +13621,14 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // Config Schema endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/config/schema",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/config/schema — Return a simplified JSON description of the config structure.
 pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Build provider/model options from model catalog for dropdowns
@@ -12113,6 +13736,14 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // Config Set endpoint
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/config/set",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/config/set — Set a single config value and persist to config.toml.
 ///
 /// Accepts JSON `{ "path": "section.key", "value": "..." }`.
@@ -12260,6 +13891,17 @@ fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
 // Delivery tracking endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/deliveries",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/agents/:id/deliveries — List recent delivery receipts for an agent.
 pub async fn get_agent_deliveries(
     State(state): State<Arc<AppState>>,
@@ -12303,6 +13945,14 @@ pub async fn get_agent_deliveries(
 // Cron job management endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/cron/jobs",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/cron/jobs — List all cron jobs, optionally filtered by agent_id.
 pub async fn list_cron_jobs(
     State(state): State<Arc<AppState>>,
@@ -12335,6 +13985,14 @@ pub async fn list_cron_jobs(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/cron/jobs",
+    tag = "automation",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/cron/jobs — Create a new cron job.
 pub async fn create_cron_job(
     State(state): State<Arc<AppState>>,
@@ -12353,6 +14011,17 @@ pub async fn create_cron_job(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/cron/jobs/{id}",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/cron/jobs/{id} — Delete a cron job.
 pub async fn delete_cron_job(
     State(state): State<Arc<AppState>>,
@@ -12382,6 +14051,17 @@ pub async fn delete_cron_job(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/cron/jobs/{id}/enable",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/cron/jobs/{id}/enable — Enable or disable a cron job.
 pub async fn toggle_cron_job(
     State(state): State<Arc<AppState>>,
@@ -12413,6 +14093,17 @@ pub async fn toggle_cron_job(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/cron/jobs/{id}/status",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/cron/jobs/{id}/status — Get status of a specific cron job.
 pub async fn cron_job_status(
     State(state): State<Arc<AppState>>,
@@ -12443,6 +14134,17 @@ pub async fn cron_job_status(
 // Run cron job on demand
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/cron/jobs/{id}/run",
+    tag = "automation",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/cron/jobs/{id}/run — Trigger a cron job immediately.
 ///
 /// Returns `{"status": "triggered", "job_id": "..."}` and spawns the execution
@@ -12503,6 +14205,14 @@ pub async fn run_cron_job(
 // Webhook trigger endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/hooks/wake",
+    tag = "webhooks",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /hooks/wake — Inject a system event via webhook trigger.
 ///
 /// Publishes a custom event through the kernel's event system, which can
@@ -12562,6 +14272,14 @@ pub async fn webhook_wake(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/hooks/agent",
+    tag = "webhooks",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /hooks/agent — Run an isolated agent turn via webhook.
 ///
 /// Sends a message directly to the specified agent and returns the response.
@@ -12654,6 +14372,14 @@ pub async fn webhook_agent(
 
 // ─── Agent Bindings API ────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/bindings",
+    tag = "bindings",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/bindings — List all agent bindings.
 pub async fn list_bindings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let bindings = state.kernel.list_bindings();
@@ -12663,6 +14389,14 @@ pub async fn list_bindings(State(state): State<Arc<AppState>>) -> impl IntoRespo
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/bindings",
+    tag = "bindings",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/bindings — Add a new agent binding.
 pub async fn add_binding(
     State(state): State<Arc<AppState>>,
@@ -12683,6 +14417,17 @@ pub async fn add_binding(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/bindings/{index}",
+    tag = "bindings",
+    params(
+        ("index" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/bindings/:index — Remove a binding by index.
 pub async fn remove_binding(
     State(state): State<Arc<AppState>>,
@@ -12702,6 +14447,14 @@ pub async fn remove_binding(
 
 // ─── Device Pairing endpoints ───────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/pairing/request",
+    tag = "pairing",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/pairing/request — Create a new pairing request (returns token + QR URI).
 pub async fn pairing_request(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !state.kernel.config.pairing.enabled {
@@ -12729,6 +14482,14 @@ pub async fn pairing_request(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/pairing/complete",
+    tag = "pairing",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/pairing/complete — Complete pairing with token + device info.
 pub async fn pairing_complete(
     State(state): State<Arc<AppState>>,
@@ -12778,6 +14539,14 @@ pub async fn pairing_complete(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pairing/devices",
+    tag = "pairing",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/pairing/devices — List paired devices.
 pub async fn pairing_devices(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !state.kernel.config.pairing.enabled {
@@ -12805,6 +14574,17 @@ pub async fn pairing_devices(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(serde_json::json!({"devices": devices})).into_response()
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/pairing/devices/{id}",
+    tag = "pairing",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/pairing/devices/{id} — Remove a paired device.
 pub async fn pairing_remove_device(
     State(state): State<Arc<AppState>>,
@@ -12823,6 +14603,14 @@ pub async fn pairing_remove_device(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/pairing/notify",
+    tag = "pairing",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/pairing/notify — Push a notification to all paired devices.
 pub async fn pairing_notify(
     State(state): State<Arc<AppState>>,
@@ -12852,6 +14640,14 @@ pub async fn pairing_notify(
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/commands",
+    tag = "system",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/commands?surface=web|cli|channel|all — List slash commands from the
 /// unified command registry, filtered by surface.
 ///
@@ -12966,6 +14762,14 @@ struct CopilotFlowState {
 /// Active device flows, keyed by poll_id. Auto-expire after the flow's TTL.
 static COPILOT_FLOWS: LazyLock<DashMap<String, CopilotFlowState>> = LazyLock::new(DashMap::new);
 
+#[utoipa::path(
+    post,
+    path = "/api/providers/github-copilot/oauth/start",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/providers/github-copilot/oauth/start
 ///
 /// Initiates a GitHub device flow for Copilot authentication.
@@ -13005,6 +14809,17 @@ pub async fn copilot_oauth_start() -> impl IntoResponse {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/providers/github-copilot/oauth/poll/{poll_id}",
+    tag = "providers",
+    params(
+        ("poll_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/providers/github-copilot/oauth/poll/{poll_id}
 ///
 /// Poll the status of a GitHub device flow.
@@ -13110,6 +14925,14 @@ pub async fn copilot_oauth_poll(
 // Agent Communication (Comms) endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/comms/topology",
+    tag = "comms",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/comms/topology — Build agent topology graph from registry.
 pub async fn comms_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use openfang_types::comms::{EdgeKind, TopoEdge, TopoNode, Topology};
@@ -13324,6 +15147,14 @@ fn audit_to_comms_event(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/comms/events",
+    tag = "comms",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/comms/events — Return recent inter-agent communication events.
 ///
 /// Sources from both the event bus (for lifecycle events with full context)
@@ -13367,6 +15198,14 @@ pub async fn comms_events(
     Json(comms_events)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/comms/events/stream",
+    tag = "comms",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/comms/events/stream — SSE stream of inter-agent communication events.
 ///
 /// Polls the audit log every 500ms for new inter-agent events.
@@ -13417,6 +15256,14 @@ pub async fn comms_events_stream(State(state): State<Arc<AppState>>) -> axum::re
         .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/comms/send",
+    tag = "comms",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/comms/send — Send a message from one agent to another.
 pub async fn comms_send(
     State(state): State<Arc<AppState>>,
@@ -13481,6 +15328,14 @@ pub async fn comms_send(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/comms/task",
+    tag = "comms",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/comms/task — Post a task to the agent task queue.
 pub async fn comms_task(
     State(state): State<Arc<AppState>>,
@@ -13520,6 +15375,14 @@ pub async fn comms_task(
 
 // ── Dashboard Authentication (username/password sessions) ──
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/auth/login — Authenticate with username/password, returns session token.
 pub async fn auth_login(
     State(state): State<Arc<AppState>>,
@@ -13635,6 +15498,14 @@ pub async fn auth_login(
         .unwrap()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/auth/logout — Clear the session cookie.
 pub async fn auth_logout() -> impl IntoResponse {
     let cookie = "openfang_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
@@ -13645,6 +15516,14 @@ pub async fn auth_logout() -> impl IntoResponse {
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/auth/check",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/auth/check — Check current authentication state.
 pub async fn auth_check(
     State(state): State<Arc<AppState>>,
@@ -13726,6 +15605,14 @@ fn remove_toml_section(content: &str, section: &str) -> String {
 // Wizard API — expose SetupWizard as HTTP endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/api/wizard/plan",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/wizard/plan — generate a setup plan from a natural language intent.
 pub async fn wizard_plan(
     Json(intent): Json<openfang_kernel::wizard::AgentIntent>,
@@ -13736,6 +15623,14 @@ pub async fn wizard_plan(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/wizard/spawn",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/wizard/spawn — generate a plan and immediately spawn the agent.
 pub async fn wizard_spawn(
     State(state): State<Arc<AppState>>,
@@ -13774,6 +15669,14 @@ pub async fn wizard_spawn(
 // Evolution Analyzer Endpoints
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/config",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/config — Get the current evolve configuration.
 pub async fn evolve_get_config(
     State(state): State<Arc<AppState>>,
@@ -13781,6 +15684,14 @@ pub async fn evolve_get_config(
     Json(serde_json::to_value(state.kernel.evolve_engine.config()).unwrap_or_default())
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/evolve/config",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// PUT /api/evolve/config — Update evolve configuration.
 pub async fn evolve_set_config(
     State(state): State<Arc<AppState>>,
@@ -13825,6 +15736,14 @@ pub async fn evolve_set_config(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/run",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/run — Analyze all unanalyzed sessions.
 pub async fn evolve_run(
     State(state): State<Arc<AppState>>,
@@ -13878,6 +15797,14 @@ pub async fn evolve_run(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/run/stream",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/run/stream — Same batch as POST /api/evolve/run, streamed as SSE.
 ///
 /// Emits one `started` event, one `item` event per session processed (with
@@ -14002,6 +15929,14 @@ pub async fn evolve_run_stream(
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/run/status",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/run/status — Current snapshot of the most recent evolve batch.
 ///
 /// The dashboard calls this on page mount; if `running` is true it starts
@@ -14012,6 +15947,17 @@ pub async fn evolve_run_status(
     Json(state.evolve_progress.read().await.clone())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/analyze/{session_id}",
+    tag = "evolve",
+    params(
+        ("session_id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/analyze/{session_id} — Analyze a specific session.
 pub async fn evolve_analyze_session(
     State(state): State<Arc<AppState>>,
@@ -14076,6 +16022,14 @@ pub async fn evolve_analyze_session(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/analyses",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/analyses — List execution analyses (paginated).
 pub async fn evolve_list_analyses(
     State(state): State<Arc<AppState>>,
@@ -14116,6 +16070,17 @@ pub async fn evolve_list_analyses(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/analyses/{id}",
+    tag = "evolve",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/analyses/{id} — Get a single analysis by ID.
 pub async fn evolve_get_analysis(
     State(state): State<Arc<AppState>>,
@@ -14137,6 +16102,14 @@ pub async fn evolve_get_analysis(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/agent",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/agent — Get the analyzer agent ID.
 pub async fn evolve_get_agent(
     State(state): State<Arc<AppState>>,
@@ -14145,6 +16118,14 @@ pub async fn evolve_get_agent(
     Json(serde_json::json!({ "agent_id": agent_id.map(|id| id.to_string()) }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/cost",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/cost — Month-to-date USD spend on analyzer + evolver
 /// agents, plus the configured cap (if any).
 pub async fn evolve_cost(
@@ -14170,6 +16151,14 @@ pub async fn evolve_cost(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/stats",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/stats — Get aggregate evolution statistics.
 pub async fn evolve_stats(
     State(state): State<Arc<AppState>>,
@@ -14186,6 +16175,14 @@ pub async fn evolve_stats(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/skills",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/skills — List skill records with optional active-only filter.
 pub async fn evolve_list_skills(
     State(state): State<Arc<AppState>>,
@@ -14204,6 +16201,17 @@ pub async fn evolve_list_skills(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/skills/{id}",
+    tag = "evolve",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/skills/:id — Get a single skill record by ID.
 pub async fn evolve_get_skill(
     State(state): State<Arc<AppState>>,
@@ -14225,6 +16233,17 @@ pub async fn evolve_get_skill(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/evolve/skills/{id}",
+    tag = "evolve",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/evolve/skills/:id — Delete an evolved skill record and its files.
 pub async fn evolve_delete_skill(
     State(state): State<Arc<AppState>>,
@@ -14276,6 +16295,17 @@ pub async fn evolve_delete_skill(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/skills/{id}/rollback",
+    tag = "evolve",
+    params(
+        ("id" = String, Path, description = "Path parameter"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/skills/:id/rollback — Rollback to parent skill version.
 pub async fn evolve_rollback_skill(
     State(state): State<Arc<AppState>>,
@@ -14345,6 +16375,14 @@ pub async fn evolve_rollback_skill(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/trigger/metrics",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/trigger/metrics — Manually trigger skill metric check.
 pub async fn evolve_trigger_metrics(
     State(state): State<Arc<AppState>>,
@@ -14363,6 +16401,14 @@ pub async fn evolve_trigger_metrics(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/execute",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/execute — Execute a single evolution suggestion.
 pub async fn evolve_execute(
     State(state): State<Arc<AppState>>,
@@ -14443,6 +16489,14 @@ pub async fn evolve_execute(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/execute-all",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/execute-all — Enqueue all suggestions from an analysis.
 pub async fn evolve_execute_all(
     State(state): State<Arc<AppState>>,
@@ -14521,6 +16575,14 @@ pub async fn evolve_execute_all(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/batch-apply/run",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /api/evolve/batch-apply/run — Run dedup + execute pipeline now.
 ///
 /// Same path as the `EvolveBatchApply` cron job. Acquires the evolver
@@ -14543,6 +16605,7 @@ pub async fn evolve_batch_apply_run(
     // the batch (it would deadlock against `execute_evolution`'s per-call
     // lock), so this check at the API layer is the only thing preventing two
     // dedup passes interleaving on the same pending set.
+    let started_at = chrono::Utc::now();
     {
         let snap = state.batch_apply_snapshot.read().await;
         if snap.running {
@@ -14556,63 +16619,122 @@ pub async fn evolve_batch_apply_run(
             );
         }
     }
+    // Reset cancel flag for the new run before flipping running=true so the
+    // detached task starts in a clean state.
+    state
+        .batch_apply_cancel
+        .store(false, std::sync::atomic::Ordering::Release);
     {
         let mut snap = state.batch_apply_snapshot.write().await;
         snap.running = true;
         snap.operation = Some("run".into());
-        snap.started_at = Some(chrono::Utc::now());
+        snap.started_at = Some(started_at);
         snap.finished_at = None;
         snap.last_error = None;
         snap.current = 0;
         snap.total = 0;
         snap.step_label = None;
     }
-    // Progress callback: synchronously try-lock the snapshot and update the
-    // counters. We use try_write to avoid blocking the kernel work loop if
-    // the GET /status endpoint happens to hold the read lock momentarily.
+    // Detach the actual batch into a background task. Upstream proxies
+    // (k8s ingress, Cloudflare, etc.) have ~60s read timeouts; the batch
+    // can run for many minutes, so the HTTP request must return 202
+    // immediately and let the dashboard poll /status for progress.
+    let cancel = state.batch_apply_cancel.clone();
     let snapshot_for_cb = state.batch_apply_snapshot.clone();
-    let progress_cb = move |current: usize, total: usize, label: &str| {
-        if let Ok(mut snap) = snapshot_for_cb.try_write() {
-            snap.current = current;
-            snap.total = total;
-            snap.step_label = Some(label.to_string());
-        }
-    };
-    let result = state
-        .kernel
-        .run_evolve_batch_apply_with_progress(progress_cb)
-        .await;
-    {
-        let mut snap = state.batch_apply_snapshot.write().await;
+    let snapshot_for_finish = state.batch_apply_snapshot.clone();
+    let kernel = state.kernel.clone();
+    tokio::spawn(async move {
+        let progress_cb = move |current: usize, total: usize, label: &str| {
+            if let Ok(mut snap) = snapshot_for_cb.try_write() {
+                snap.current = current;
+                snap.total = total;
+                snap.step_label = Some(label.to_string());
+            }
+        };
+        let result = kernel
+            .run_evolve_batch_apply_with_progress(progress_cb, Some(cancel))
+            .await;
+        let mut snap = snapshot_for_finish.write().await;
         snap.running = false;
         snap.finished_at = Some(chrono::Utc::now());
-        match &result {
+        snap.step_label = None;
+        match result {
             Ok(msg) => {
-                snap.last_run_summary = Some(msg.clone());
+                snap.last_run_summary = Some(msg);
                 snap.last_error = None;
             }
             Err(e) => {
-                snap.last_error = Some(e.clone());
+                snap.last_error = Some(e);
             }
         }
-    }
-    // Clear the in-flight progress when the run finishes so the bar collapses.
-    {
-        let mut snap = state.batch_apply_snapshot.write().await;
-        snap.step_label = None;
-    }
-    match result {
-        Ok(msg) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "ok", "summary": msg })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e })),
-        ),
-    }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "started",
+            "started_at": started_at,
+        })),
+    )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/evolve/batch-apply/cancel",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Cancellation signalled", body = serde_json::Value),
+        (status = 400, description = "No batch apply in progress", body = serde_json::Value),
+    ),
+)]
+/// POST /api/evolve/batch-apply/cancel — Force-clear a stuck batch apply.
+///
+/// Sets the cooperative cancel flag so the detached run task bails out at
+/// the next iteration boundary, and immediately force-clears
+/// `state.batch_apply_snapshot.running` so the UI unsticks even when the
+/// currently-executing evolution future is hung on a stalled LLM call.
+///
+/// Idempotent: returns 400 only when no run was in progress.
+pub async fn evolve_batch_apply_cancel(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let was_running = {
+        let snap = state.batch_apply_snapshot.read().await;
+        snap.running
+    };
+    if !was_running {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no batch apply in progress" })),
+        );
+    }
+    state
+        .batch_apply_cancel
+        .store(true, std::sync::atomic::Ordering::Release);
+    let now = chrono::Utc::now();
+    {
+        let mut snap = state.batch_apply_snapshot.write().await;
+        snap.running = false;
+        snap.finished_at = Some(now);
+        snap.step_label = None;
+        snap.last_error = Some("cancelled by user".into());
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "cancelled",
+            "cancelled_at": now,
+        })),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/evolve/batch-apply/preview",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/batch-apply/preview — Dry-run dedup over current pending
 /// suggestions. Computes the grouping in-memory; performs NO database writes.
 /// Use to preview what the next scheduled batch apply will do.
@@ -14714,6 +16836,14 @@ pub async fn evolve_batch_apply_preview(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/batch-apply/status",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/batch-apply/status — Server-side snapshot of the last
 /// preview or run triggered through this API. Drives the dashboard spinner
 /// and lets the last-preview / last-summary panels survive page reloads.
@@ -14814,6 +16944,14 @@ impl std::fmt::Display for EnqueueError {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/execute/status",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/execute/status — Snapshot of the execute queue for reload
 /// recovery. Returns the most recent snapshot regardless of `running`.
 pub async fn evolve_execute_status(
@@ -14822,6 +16960,14 @@ pub async fn evolve_execute_status(
     Json(state.evolve_execute_progress.read().await.clone())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/evolve/execute/stream",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/evolve/execute/stream — SSE stream of `EvolveExecuteEvent`s
 /// published by the background worker. Each subscriber gets a fresh
 /// receiver from the broadcast channel; missed events (subscribed mid-run)
@@ -15041,6 +17187,14 @@ pub fn spawn_evolve_execute_worker(
     });
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/evolve/suggestion",
+    tag = "evolve",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// DELETE /api/evolve/suggestion — Delete a single evolution suggestion.
 pub async fn evolve_delete_suggestion(
     State(state): State<Arc<AppState>>,

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 /// A classification label applied to data flowing through the system.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum TaintLabel {
     /// Data that originated from an external network request.
     ExternalNetwork,
@@ -37,7 +37,7 @@ impl fmt::Display for TaintLabel {
 }
 
 /// A value annotated with taint labels tracking its provenance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TaintedValue {
     /// The actual string payload.
     pub value: String,
@@ -207,7 +207,7 @@ impl fmt::Display for TaintViolation {
 impl std::error::Error for TaintViolation {}
 
 /// Enforcement mode for taint policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TaintMode {
     /// Hard block — taint violations are rejected immediately.
@@ -220,7 +220,7 @@ pub enum TaintMode {
 }
 
 /// Action to take when PII is detected in outgoing data.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PiiAction {
     /// Hard block — reject the operation entirely.
@@ -240,7 +240,7 @@ fn default_ner_confidence() -> f32 {
 ///
 /// Controls whether PII/secret detection blocks tool execution, asks the
 /// user for approval, or is skipped entirely.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct TaintPolicy {
     /// Enforcement mode (for secrets and non-PII taint labels).

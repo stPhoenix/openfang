@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A specific permission granted to an agent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "value")]
 pub enum Capability {
     // -- File system --

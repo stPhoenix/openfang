@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported media types for understanding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaType {
     Image,
@@ -22,7 +22,7 @@ impl std::fmt::Display for MediaType {
 }
 
 /// Source of media content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum MediaSource {
     /// Path to a local file.
@@ -34,7 +34,7 @@ pub enum MediaSource {
 }
 
 /// A media attachment to be analyzed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MediaAttachment {
     /// What kind of media this is.
     pub media_type: MediaType,
@@ -47,7 +47,7 @@ pub struct MediaAttachment {
 }
 
 /// Result of media analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MediaUnderstanding {
     /// What type of media was analyzed.
     pub media_type: MediaType,
@@ -60,7 +60,7 @@ pub struct MediaUnderstanding {
 }
 
 /// Configuration for media understanding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct MediaConfig {
     /// Enable image description. Default: true.
@@ -113,7 +113,7 @@ impl Default for MediaConfig {
 }
 
 /// Configuration for link understanding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct LinkConfig {
     /// Enable automatic link understanding. Default: false.
@@ -201,7 +201,7 @@ impl MediaAttachment {
 }
 
 /// Supported image generation models.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImageGenModel {
     #[default]
@@ -222,7 +222,7 @@ impl std::fmt::Display for ImageGenModel {
 }
 
 /// Image generation request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImageGenRequest {
     /// The prompt describing the image to generate.
     pub prompt: String,
@@ -343,7 +343,7 @@ impl ImageGenRequest {
 }
 
 /// Result of image generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImageGenResult {
     /// Generated images.
     pub images: Vec<GeneratedImage>,
@@ -354,7 +354,7 @@ pub struct ImageGenResult {
 }
 
 /// A single generated image.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GeneratedImage {
     /// Base64-encoded image data.
     pub data_base64: String,

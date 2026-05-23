@@ -33,7 +33,7 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 // ---------------------------------------------------------------------------
 
 /// Risk level of an operation requiring approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     Low,
@@ -59,7 +59,7 @@ impl RiskLevel {
 // ---------------------------------------------------------------------------
 
 /// Decision on an approval request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Approved,
@@ -72,7 +72,7 @@ pub enum ApprovalDecision {
 // ---------------------------------------------------------------------------
 
 /// An approval request for a dangerous agent operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ApprovalRequest {
     pub id: Uuid,
     pub agent_id: String,
@@ -150,7 +150,7 @@ impl ApprovalRequest {
 // ---------------------------------------------------------------------------
 
 /// Response to an approval request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ApprovalResponse {
     pub request_id: Uuid,
     pub decision: ApprovalDecision,
@@ -163,7 +163,7 @@ pub struct ApprovalResponse {
 // ---------------------------------------------------------------------------
 
 /// Configurable approval policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ApprovalPolicy {
     /// Tools that always require approval. Default: `["shell_exec"]`.

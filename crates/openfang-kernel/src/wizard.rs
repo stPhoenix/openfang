@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// The extracted intent from a user's natural language description.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentIntent {
     /// Agent name (slug-style).
     pub name: String,

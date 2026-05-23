@@ -34,7 +34,7 @@ use bitflags::bitflags;
 use serde::Serialize;
 
 /// Command category used for help grouping.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, utoipa::ToSchema)]
 pub enum CommandCategory {
     /// Greet/welcome/help commands.
     General,

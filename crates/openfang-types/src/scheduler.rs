@@ -43,7 +43,7 @@ const MAX_WEBHOOK_URL_LEN: usize = 2048;
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for a scheduled job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CronJobId(pub Uuid);
 
 impl CronJobId {
@@ -78,7 +78,7 @@ impl std::str::FromStr for CronJobId {
 // ---------------------------------------------------------------------------
 
 /// When a scheduled job fires.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronSchedule {
     /// Fire once at a specific time.
@@ -105,7 +105,7 @@ pub enum CronSchedule {
 // ---------------------------------------------------------------------------
 
 /// What a scheduled job does when it fires.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronAction {
     /// Publish a system event.
@@ -150,7 +150,7 @@ pub enum CronAction {
 // ---------------------------------------------------------------------------
 
 /// Where the job's output is delivered.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronDelivery {
     /// No delivery — fire and forget.
@@ -181,7 +181,7 @@ pub enum CronDelivery {
 /// `delivery_targets` field. When the job fires and produces output, the
 /// delivery engine sends the same output to every target concurrently.
 /// Failures in one target do not abort delivery to the others.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CronDeliveryTarget {
     /// Deliver via an existing channel adapter (Telegram/Slack/Discord/etc.).
@@ -223,7 +223,7 @@ pub enum CronDeliveryTarget {
 // ---------------------------------------------------------------------------
 
 /// A scheduled job belonging to a specific agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CronJob {
     /// Unique job identifier.
     pub id: CronJobId,

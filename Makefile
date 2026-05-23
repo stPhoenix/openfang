@@ -94,6 +94,11 @@ docker-dev-logs: ## Show dev container logs
 docker-dev-clean: ## Remove dev volumes
 	$(COMPOSE_DEV) down -v
 
+## OpenAPI
+
+openapi: ## Generate openapi.json from openfang-api utoipa annotations
+	cargo run -p xtask -- openapi --out openapi.json
+
 ## Cleanup
 
 clean: ## Remove all build artifacts

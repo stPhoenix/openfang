@@ -128,6 +128,14 @@ pub struct FsQuery {
     pub path: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/roots",
+    tag = "files",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/files/roots — Enumerate the two browseable roots.
 pub async fn list_roots(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let roots: Vec<serde_json::Value> = [Root::Workspaces, Root::Hands]
@@ -145,6 +153,14 @@ pub async fn list_roots(State(state): State<Arc<AppState>>) -> impl IntoResponse
     Json(serde_json::json!({ "roots": roots })).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/list",
+    tag = "files",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/files/list?root=<n>&path=<rel> — Directory listing.
 pub async fn list_dir(
     State(state): State<Arc<AppState>>,
@@ -249,6 +265,14 @@ pub async fn list_dir(
     .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/read",
+    tag = "files",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/files/read?root=<n>&path=<rel> — Inline file content (text only).
 pub async fn read_file(
     State(state): State<Arc<AppState>>,
@@ -332,6 +356,14 @@ pub async fn read_file(
     .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/download",
+    tag = "files",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /api/files/download?root=<n>&path=<rel> — Stream file as attachment.
 pub async fn download_file(
     State(state): State<Arc<AppState>>,

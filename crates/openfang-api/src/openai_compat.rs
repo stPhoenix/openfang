@@ -23,7 +23,7 @@ use tracing::warn;
 
 // ── Request types ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<OaiMessage>,
@@ -37,14 +37,14 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct OaiMessage {
     pub role: String,
     #[serde(default)]
     pub content: OaiContent,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum OaiContent {
     Text(String),
@@ -53,7 +53,7 @@ pub enum OaiContent {
     Null,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type")]
 pub enum OaiContentPart {
     #[serde(rename = "text")]
@@ -62,7 +62,7 @@ pub enum OaiContentPart {
     ImageUrl { image_url: OaiImageUrlRef },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct OaiImageUrlRef {
     pub url: String,
 }
@@ -250,6 +250,14 @@ fn convert_messages(oai_messages: &[OaiMessage]) -> Vec<Message> {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "openai-compat",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
@@ -577,6 +585,14 @@ async fn stream_response(
         .into_response())
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "openai-compat",
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+    ),
+)]
 /// GET /v1/models — List available agents as OpenAI model objects.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.kernel.registry.list();

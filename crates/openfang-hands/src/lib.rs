@@ -498,10 +498,11 @@ impl HandInstance {
 }
 
 /// Request to activate a hand.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ActivateHandRequest {
     /// Optional configuration overrides.
     #[serde(default)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub config: HashMap<String, serde_json::Value>,
     /// Override the hand's declared provider (e.g. "groq", "openai").
     #[serde(default)]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Whether a tool actually performs an action or only loads persona/skill
 /// instructions when called. Persona loaders must be tagged in `ToolSearch`
 /// output so the model does not call them expecting search/fetch results.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     #[default]
@@ -14,7 +14,7 @@ pub enum ToolKind {
 }
 
 /// Definition of a tool that an agent can use.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolDefinition {
     /// Unique tool identifier.
     pub name: String,
@@ -56,7 +56,7 @@ impl ToolKind {
 }
 
 /// A tool call requested by the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolCall {
     /// Unique ID for this tool use instance.
     pub id: String,
@@ -67,7 +67,7 @@ pub struct ToolCall {
 }
 
 /// Result of a tool execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolResult {
     /// The tool_use ID this result corresponds to.
     pub tool_use_id: String,

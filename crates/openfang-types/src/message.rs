@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A message in an LLM conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Message {
     /// The role of the sender.
     pub role: Role,
@@ -30,7 +30,7 @@ pub struct Message {
 // ---------------------------------------------------------------------------
 
 /// Extensible metadata attached to a message.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MessageMetadata {
     /// What kind of special message this is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,7 +81,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// The kind of special message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
     /// Regular conversation message.
@@ -95,7 +95,7 @@ pub enum MessageType {
 }
 
 /// What triggered a compaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactTrigger {
     /// User explicitly requested compaction.
@@ -105,7 +105,7 @@ pub enum CompactTrigger {
 }
 
 /// Metadata stored on a compact boundary marker message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CompactBoundaryMetadata {
     /// What triggered this compaction.
     pub trigger: CompactTrigger,
@@ -120,7 +120,7 @@ pub struct CompactBoundaryMetadata {
 }
 
 /// Identifies preserved messages that were kept verbatim across a compaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PreservedSegment {
     /// UUID of the first preserved message.
     pub head_uuid: Uuid,
@@ -131,7 +131,7 @@ pub struct PreservedSegment {
 }
 
 /// The role of a message sender in an LLM conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// System prompt.
@@ -143,7 +143,7 @@ pub enum Role {
 }
 
 /// Content of a message — can be simple text or structured blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// Simple text content.
@@ -153,7 +153,7 @@ pub enum MessageContent {
 }
 
 /// A content block within a message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     /// A text block.
@@ -374,7 +374,7 @@ impl Message {
 }
 
 /// Why the LLM stopped generating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model finished its turn.
@@ -388,7 +388,7 @@ pub enum StopReason {
 }
 
 /// Token usage information from an LLM call.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TokenUsage {
     /// Tokens used for the input/prompt.
     pub input_tokens: u64,
@@ -409,7 +409,7 @@ impl TokenUsage {
 /// - `reply_to`: reply to a specific message ID
 /// - `current_thread`: reply in the current thread
 /// - `silent`: suppress the response entirely
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplyDirectives {
     /// Reply to a specific message ID.
     pub reply_to: Option<String>,

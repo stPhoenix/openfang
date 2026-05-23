@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A node in the agent topology graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TopoNode {
     /// Agent ID.
     pub id: String,
@@ -20,7 +20,7 @@ pub struct TopoNode {
 }
 
 /// An edge in the agent topology graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TopoEdge {
     /// Source agent ID.
     pub from: String,
@@ -31,7 +31,7 @@ pub struct TopoEdge {
 }
 
 /// The kind of relationship between two agents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// Parent spawned child.
@@ -41,14 +41,14 @@ pub enum EdgeKind {
 }
 
 /// The full agent topology: nodes + edges.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Topology {
     pub nodes: Vec<TopoNode>,
     pub edges: Vec<TopoEdge>,
 }
 
 /// A communication event between agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommsEvent {
     /// Unique event ID.
     pub id: String,
@@ -69,7 +69,7 @@ pub struct CommsEvent {
 }
 
 /// The kind of inter-agent communication event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommsEventKind {
     /// Agent-to-agent message.
@@ -87,7 +87,7 @@ pub enum CommsEventKind {
 }
 
 /// Request body for POST /api/comms/send.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct CommsSendRequest {
     pub from_agent_id: String,
     pub to_agent_id: String,
@@ -95,7 +95,7 @@ pub struct CommsSendRequest {
 }
 
 /// Request body for POST /api/comms/task.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct CommsTaskRequest {
     pub title: String,
     pub description: String,

@@ -10,7 +10,19 @@ use std::fmt;
 
 /// Verified role of the message sender, mirroring `UserRole` from the kernel
 /// RBAC system but usable across all crates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema
+)]
 pub enum SenderRole {
     /// Read-only — can view agent output but cannot interact with tools.
     Viewer = 0,

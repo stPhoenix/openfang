@@ -122,6 +122,7 @@ async fn test_full_daemon_lifecycle() {
         evolve_execute_tx: None,
         evolve_execute_events: None,
         batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        batch_apply_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let app = Router::new()
@@ -254,6 +255,7 @@ async fn test_server_immediate_responsiveness() {
         evolve_execute_tx: None,
         evolve_execute_events: None,
         batch_apply_snapshot: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        batch_apply_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let app = Router::new()

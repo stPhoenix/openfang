@@ -168,6 +168,9 @@ openssl = { version = "0.10", features = ["vendored"] }
 tokio-test = "0.4"
 tempfile = "3"
 
+# OpenAPI spec generation
+utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras", "preserve_order"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 2
