@@ -298,6 +298,7 @@ function evolutionPage() {
               var data = await OpenFangAPI.get('/api/evolve/batch-apply/preview');
               this.batchApply.lastPreview = data;
               OpenFangToast.success('Preview: ' + (data.total_pending || 0) + ' pending, ' +
+                  (data.unprocessable || 0) + ' unprocessable, ' +
                   (data.superseded || 0) + ' would dedup, ' + (data.survivors || 0) + ' survivors');
           } catch (e) {
               this.batchApply.error = e.message || String(e);
@@ -1627,6 +1628,51 @@ function evolutionPage() {
       if (k === 'captured') return 'badge-success';
       return 'badge-dim';
     },
+      suggestionStatus(s) {
+          if (!s) return 'pending';
+          if (s.status) return s.status;
+          if (s.executed_at) return 'applied';
+          if (s.failed_at) return 'failed';
+          return 'pending';
+      },
+      suggestionIsPending(s) {
+          return this.suggestionStatus(s) === 'pending';
+      },
+      suggestionStatusClass(s) {
+          switch (this.suggestionStatus(s)) {
+              case 'applied':
+                  return 'badge-success';
+              case 'failed':
+                  return 'badge-error';
+              case 'declined':
+                  return 'badge-warning';
+              case 'superseded':
+                  return 'badge-dim';
+              case 'unprocessable':
+                  return 'badge-info';
+              default:
+                  return 'badge-dim';
+          }
+      },
+      suggestionStatusLabel(s) {
+          switch (this.suggestionStatus(s)) {
+              case 'applied':
+                  return 'Applied';
+              case 'failed':
+                  return 'Failed';
+              case 'declined':
+                  return 'Declined';
+              case 'superseded':
+                  return 'Superseded';
+              case 'unprocessable':
+                  return 'Unprocessable';
+              default:
+                  return 'Pending';
+          }
+      },
+      suggestionStatusTitle(s) {
+          return s.failure_reason || s.dedup_reason || '';
+      },
     issueClass(t) {
       if (t === 'failure') return 'badge-danger';
       if (t === 'misuse') return 'badge-warning';

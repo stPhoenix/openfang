@@ -227,6 +227,10 @@ pub enum SuggestionStatus {
     /// surface a distinct badge in the UI and don't re-try on next batch.
     Declined,
     Superseded,
+    /// Structurally invalid — missing a required field (e.g. FIX with no
+    /// target_skill). Filtered out of pending lists so batch-apply never
+    /// re-emits it.
+    Unprocessable,
 }
 
 impl std::fmt::Display for SuggestionStatus {
@@ -237,6 +241,7 @@ impl std::fmt::Display for SuggestionStatus {
             Self::Failed => write!(f, "failed"),
             Self::Declined => write!(f, "declined"),
             Self::Superseded => write!(f, "superseded"),
+            Self::Unprocessable => write!(f, "unprocessable"),
         }
     }
 }
@@ -250,8 +255,31 @@ impl std::str::FromStr for SuggestionStatus {
             "failed" => Ok(Self::Failed),
             "declined" => Ok(Self::Declined),
             "superseded" => Ok(Self::Superseded),
+            "unprocessable" => Ok(Self::Unprocessable),
             _ => Err(format!("unknown suggestion status: {s}")),
         }
+    }
+}
+
+/// Predicate that returns `Some(reason)` when the suggestion is structurally
+/// invalid and cannot be executed as-is. Used at `save_analysis` time and as
+/// a lazy backfill sweep at batch-apply entry. Add new rules here as
+/// one-liners — keep it pure and synchronous so the same predicate runs in
+/// both contexts.
+pub fn is_unprocessable(sug: &EvolutionSuggestion) -> Option<&'static str> {
+    let empty_target = sug
+        .target_skill
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    match sug.kind {
+        SuggestionKind::Fix if empty_target => {
+            Some("fix requires target_skill but analyzer named none")
+        }
+        SuggestionKind::Derived if empty_target => {
+            Some("derived requires a parent target_skill")
+        }
+        _ => None,
     }
 }
 
@@ -694,6 +722,58 @@ mod tests {
             let parsed: SuggestionKind = k.parse().unwrap();
             assert_eq!(&parsed.to_string(), k);
         }
+    }
+
+    #[test]
+    fn suggestion_status_roundtrip_includes_unprocessable() {
+        for s in &[
+            "pending",
+            "applied",
+            "failed",
+            "declined",
+            "superseded",
+            "unprocessable",
+        ] {
+            let parsed: SuggestionStatus = s.parse().unwrap();
+            assert_eq!(&parsed.to_string(), s);
+        }
+    }
+
+    fn make_sug(kind: SuggestionKind, target: Option<&str>) -> EvolutionSuggestion {
+        EvolutionSuggestion {
+            kind,
+            target_skill: target.map(String::from),
+            description: "x".into(),
+            priority: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_unprocessable_fix_without_target_skill() {
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Fix, None)).is_some());
+    }
+
+    #[test]
+    fn is_unprocessable_fix_with_empty_target_skill() {
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Fix, Some(""))).is_some());
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Fix, Some("   "))).is_some());
+    }
+
+    #[test]
+    fn is_unprocessable_derived_without_target_skill() {
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Derived, None)).is_some());
+    }
+
+    #[test]
+    fn is_unprocessable_fix_with_target_is_processable() {
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Fix, Some("docker"))).is_none());
+    }
+
+    #[test]
+    fn is_unprocessable_captured_without_target_is_processable() {
+        // CAPTURED has no target by design — it proposes a brand-new skill.
+        assert!(is_unprocessable(&make_sug(SuggestionKind::Captured, None)).is_none());
     }
 
     #[test]

@@ -17,6 +17,9 @@ use tracing::{info, warn};
 pub struct BatchApplyReport {
     /// Total pending suggestions found at the start of the run.
     pub total_pending: usize,
+    /// Number of suggestions marked `unprocessable` by the lazy backfill
+    /// sweep (structurally invalid rows — e.g. FIX with no target_skill).
+    pub unprocessable: usize,
     /// Number of suggestions marked superseded by dedup.
     pub superseded: usize,
     /// Whether the LLM judge produced a usable response.
@@ -24,6 +27,10 @@ pub struct BatchApplyReport {
     /// Contexts ready to be enqueued/executed, in priority desc order, capped
     /// by `apply_max_per_run`.
     pub contexts: Vec<EvolutionContext>,
+    /// Row ids of the suggestions emitted as `contexts`. The kernel uses this
+    /// for an after-batch sweep that marks any still-pending row as `failed`
+    /// (catches code paths that returned without marking the suggestion).
+    pub emitted_ids: Vec<i64>,
     /// Dedup decisions (useful for preview endpoints).
     pub dedup_groups: Vec<DedupGroup>,
     /// Whether dedup was skipped (dedup_enabled=false or <2 candidates).
@@ -63,6 +70,38 @@ where
     if pending.is_empty() {
         return Ok(BatchApplyReport {
             total_pending,
+            dedup_skipped: true,
+            ..Default::default()
+        });
+    }
+
+    // Lazy backfill: stamp `unprocessable` on rows whose structure makes them
+    // un-executable (FIX/Derived without a target_skill). Skips writes on
+    // dry_run so the Preview endpoint stays side-effect-free.
+    let mut unprocessable = 0usize;
+    let pending: Vec<(i64, AnalysisId, EvolutionSuggestion)> = pending
+        .into_iter()
+        .filter(|(id, _, sug)| match crate::types::is_unprocessable(sug) {
+            Some(reason) => {
+                if !dry_run {
+                    match store.mark_suggestion_unprocessable(*id, reason) {
+                        Ok(n) if n > 0 => unprocessable += 1,
+                        Ok(_) => {}
+                        Err(e) => warn!(id, error = %e, "failed to mark suggestion unprocessable"),
+                    }
+                } else {
+                    unprocessable += 1;
+                }
+                false
+            }
+            None => true,
+        })
+        .collect();
+
+    if pending.is_empty() {
+        return Ok(BatchApplyReport {
+            total_pending,
+            unprocessable,
             dedup_skipped: true,
             ..Default::default()
         });
@@ -115,7 +154,8 @@ where
     };
 
     let mut contexts = Vec::with_capacity(capped.len());
-    for (_id, analysis_id, suggestion) in capped {
+    let mut emitted_ids = Vec::with_capacity(capped.len());
+    for (id, analysis_id, suggestion) in capped {
         let target_skills = if let Some(ref target) = suggestion.target_skill {
             store
                 .get_skill_record(target)
@@ -127,6 +167,7 @@ where
             vec![]
         };
 
+        emitted_ids.push(id);
         contexts.push(EvolutionContext {
             evolution_type: suggestion.kind.clone(),
             target_skills,
@@ -142,6 +183,7 @@ where
 
     info!(
         total_pending,
+        unprocessable,
         superseded,
         used_llm = dedup_result.used_llm,
         queued = contexts.len(),
@@ -150,9 +192,11 @@ where
 
     Ok(BatchApplyReport {
         total_pending,
+        unprocessable,
         superseded,
         used_llm: dedup_result.used_llm,
         contexts,
+        emitted_ids,
         dedup_groups: dedup_result.groups,
         dedup_skipped,
     })
@@ -435,5 +479,102 @@ mod tests {
         // Crucially: no DB writes — all 3 rows still pending.
         let remaining = store.list_all_pending_suggestions().unwrap();
         assert_eq!(remaining.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sweeps_legacy_unprocessable_rows() {
+        // Bug B regression: a legacy FIX-without-target row was inserted as
+        // pending (pre-fix code path). Batch-apply must mark it unprocessable
+        // and exclude it from the dedup input.
+        let store = setup_store();
+        let analysis_id = save_analysis_with_suggestions(
+            &store,
+            vec![
+                sug(SuggestionKind::Fix, Some("docker"), "good", 4),
+            ],
+        );
+        // Hand-insert a fix-with-no-target row that bypasses save_analysis's
+        // upfront stamping, mimicking legacy data.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO evolve_suggestions \
+                   (analysis_id, kind, target_skill, description, priority, status) \
+                 VALUES (?1, 'fix', NULL, 'legacy-no-target', 3, 'pending')",
+                rusqlite::params![analysis_id.to_string()],
+            )
+                .unwrap();
+        }
+
+        let report = run_batch_apply(&store, false, None, false, |_| async {
+            Ok::<String, String>(String::new())
+        })
+            .await
+            .unwrap();
+        assert_eq!(report.total_pending, 2);
+        assert_eq!(report.unprocessable, 1);
+        assert_eq!(report.contexts.len(), 1);
+        assert_eq!(report.contexts[0].direction, "good");
+    }
+
+    #[tokio::test]
+    async fn regression_bug_a_no_pending_left_after_run() {
+        // Bug A regression: judge returns empty groups (the production
+        // scenario user reported). With the additive heuristic merge, the
+        // duplicates must be deduped and survivor + sweep must leave zero
+        // pending rows after we simulate the kernel's executor finishing.
+        let store = setup_store();
+        save_analysis_with_suggestions(
+            &store,
+            vec![
+                sug(SuggestionKind::Fix, Some("ra"), "retry on timeout", 4),
+                sug(SuggestionKind::Fix, Some("ra"), "add retry for timeout", 3),
+                sug(SuggestionKind::Fix, Some("ra"), "more retries", 2),
+                sug(SuggestionKind::Fix, Some("ra"), "yet another retry", 1),
+            ],
+        );
+
+        // Simulate the live bug: judge succeeds but returns empty groups.
+        let report = run_batch_apply(&store, true, None, false, |_| async {
+            Ok(r#"{"groups":[]}"#.to_string())
+        })
+            .await
+            .unwrap();
+        assert!(report.superseded >= 3, "heuristic must dedup duplicates");
+        assert_eq!(report.contexts.len(), 1);
+        assert_eq!(report.emitted_ids.len(), 1);
+
+        // Simulate the kernel's after-batch sweep — survivor never got
+        // executed, so the sweep flips it failed.
+        for id in &report.emitted_ids {
+            store
+                .mark_emitted_pending_as_failed(*id, "test sweep")
+                .unwrap();
+        }
+        let remaining = store.list_all_pending_suggestions().unwrap();
+        assert_eq!(remaining.len(), 0, "no pending rows must remain");
+    }
+
+    #[tokio::test]
+    async fn emitted_ids_tracked() {
+        let store = setup_store();
+        save_analysis_with_suggestions(
+            &store,
+            vec![
+                sug(SuggestionKind::Fix, Some("a"), "x", 5),
+                sug(SuggestionKind::Fix, Some("b"), "y", 4),
+            ],
+        );
+
+        let report = run_batch_apply(&store, false, None, false, |_| async {
+            Ok::<String, String>(String::new())
+        })
+            .await
+            .unwrap();
+        assert_eq!(report.emitted_ids.len(), 2);
+        // Ids match the rowid order inserted (1, 2).
+        let mut ids = report.emitted_ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
     }
 }

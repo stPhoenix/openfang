@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -69,6 +69,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 15 {
         migrate_v15(conn)?;
+    }
+
+    if current_version < 16 {
+        migrate_v16(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -569,6 +573,24 @@ fn migrate_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 16: Backfill `unprocessable` status for legacy evolve_suggestions
+/// rows that are structurally invalid (FIX/Derived without a target_skill).
+/// Mirrors the runtime `is_unprocessable` predicate in openfang-evolve. Keeps
+/// batch-apply idempotent across pre-existing data.
+fn migrate_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "UPDATE evolve_suggestions
+         SET status = 'unprocessable',
+             dedup_reason = COALESCE(dedup_reason, 'missing required target_skill')
+         WHERE status = 'pending'
+           AND kind IN ('fix','derived')
+           AND (target_skill IS NULL OR TRIM(target_skill) = '');
+         INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (16, datetime('now'), 'Backfill unprocessable status for fix/derived rows missing target_skill');",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +622,61 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // Should not error
+    }
+
+    #[test]
+    fn migrate_v16_backfills_unprocessable() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Need an analysis row for the FK.
+        conn.execute_batch(
+            "INSERT INTO execution_analyses
+                (id, session_id, agent_id, task_completed, execution_note, model_used, analyzed_at)
+              VALUES ('a1','s1','ag1',1,'ok','m','2025-01-01T00:00:00Z');",
+        )
+            .unwrap();
+
+        // Seed: one fix-no-target (should flip), one fix-with-target (stays),
+        // one derived-empty (should flip), one captured-no-target (stays).
+        conn.execute_batch(
+            "INSERT INTO evolve_suggestions
+                (analysis_id, kind, target_skill, description, priority, status)
+              VALUES
+                ('a1','fix',NULL,'no-target',3,'pending'),
+                ('a1','fix','docker','with-target',3,'pending'),
+                ('a1','derived','','empty-target',3,'pending'),
+                ('a1','captured',NULL,'captured-ok',3,'pending');",
+        )
+            .unwrap();
+
+        // Force-rewind user_version so migrate_v16 fires again.
+        conn.pragma_update(None, "user_version", 15u32).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT description, status FROM evolve_suggestions ORDER BY description")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
+        assert_eq!(map["no-target"], "unprocessable");
+        assert_eq!(map["with-target"], "pending");
+        assert_eq!(map["empty-target"], "unprocessable");
+        assert_eq!(map["captured-ok"], "pending");
+    }
+
+    #[test]
+    fn migrate_v16_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // Re-rewind and re-run.
+        conn.pragma_update(None, "user_version", 15u32).unwrap();
+        run_migrations(&conn).unwrap();
+        run_migrations(&conn).unwrap();
     }
 }

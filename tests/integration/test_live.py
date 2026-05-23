@@ -624,3 +624,37 @@ def test_dashboard_wires_batch_apply(client: httpx.Client) -> None:
     html = r.text
     for token in ("batchApply", "analyzeCronExpr", "applyCronExpr", "previewBatchApply"):
         assert token in html, f"dashboard markup missing '{token}'"
+
+
+def test_dashboard_wires_unprocessable_status(client: httpx.Client) -> None:
+    """Dashboard SPA must ship the new SuggestionStatus helpers + badge labels
+    so deduped/declined/unprocessable rows render distinct UI from pending."""
+    r = client.get("/")
+    assert r.status_code == 200, r.status_code
+    html = r.text
+    for token in (
+        "suggestionStatusLabel",
+        "suggestionStatusClass",
+        "suggestionIsPending",
+        "Unprocessable",
+        "Superseded",
+        "Declined",
+    ):
+        assert token in html, f"dashboard markup missing '{token}'"
+
+
+def test_batch_apply_preview_exposes_unprocessable_field(
+    client: httpx.Client,
+) -> None:
+    """Preview endpoint must report the unprocessable count so the dashboard
+    can surface structurally-invalid suggestions to the operator."""
+    r = client.get("/api/evolve/batch-apply/preview")
+    # Engine may be disabled in test env (400) or running concurrently (409).
+    # When it succeeds (200) the body must include the new field.
+    if r.status_code == 200:
+        body = r.json()
+        assert "unprocessable" in body, f"preview body missing 'unprocessable': {body}"
+    else:
+        assert r.status_code in (400, 409), (
+            f"unexpected preview status {r.status_code}: {r.text[:200]}"
+        )

@@ -7703,6 +7703,27 @@ impl OpenFangKernel {
             return Err(openfang_evolve::EvolveError::NotEnabled);
         }
 
+        // Early guard: a FIX with no resolvable target_skill cannot execute.
+        // Mark the suggestion failed here so it isn't re-emitted by the next
+        // batch-apply run, then return an error the caller can surface.
+        if matches!(context.evolution_type, SuggestionKind::Fix)
+            && context.target_skills.is_empty()
+        {
+            if let Some(ref aid) = context.source_analysis {
+                if let Err(e) = self.evolve_engine.store().mark_suggestion_failed(
+                    aid,
+                    &context.evolution_type,
+                    &context.direction,
+                    "fix dispatched without resolvable target_skill",
+                ) {
+                    warn!(error = %e, "failed to mark fix-without-target suggestion failed");
+                }
+            }
+            return Err(openfang_evolve::EvolveError::Other(
+                "fix evolution requires a resolvable target_skill".into(),
+            ));
+        }
+
         // Cost-cap gate: skip when the combined analyzer+evolver monthly cost
         // has breached the configured cap. Surfaces as `Declined`, not a
         // failure, so cron/queue UIs distinguish it from real errors.
@@ -8346,10 +8367,27 @@ impl OpenFangKernel {
             }
         }
 
+        // After-batch sweep: any survivor row we emitted as a context but
+        // whose status is still `pending` means a code path returned without
+        // marking it (timeout race, early-return, cancel). Stamp `failed` so
+        // the next batch-apply doesn't re-process it.
+        let mut swept = 0u32;
+        for id in &report.emitted_ids {
+            match self
+                .evolve_engine
+                .store()
+                .mark_emitted_pending_as_failed(*id, "batch finished without status update")
+            {
+                Ok(n) if n > 0 => swept += 1,
+                Ok(_) => {}
+                Err(e) => warn!(id, error = %e, "after-batch sweep mark failed"),
+            }
+        }
+
         let suffix = if cancelled { " (cancelled)" } else { "" };
         Ok(format!(
-            "batch apply: {} pending, {} superseded (used_llm={}), {} applied, {} declined, {} failed{suffix}",
-            report.total_pending, report.superseded, report.used_llm, applied, declined, failed
+            "batch apply: {} pending, {} unprocessable, {} superseded (used_llm={}), {} applied, {} declined, {} failed, {} swept{suffix}",
+            report.total_pending, report.unprocessable, report.superseded, report.used_llm, applied, declined, failed, swept
         ))
     }
 

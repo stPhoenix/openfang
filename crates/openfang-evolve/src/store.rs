@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 /// Shares the same database connection as the rest of the memory substrate.
 #[derive(Clone)]
 pub struct EvolveStore {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl EvolveStore {
@@ -76,15 +76,24 @@ impl EvolveStore {
         }
 
         for suggestion in &analysis.evolution_suggestions {
+            // Stamp `unprocessable` upfront when the suggestion is missing a
+            // required field — keeps batch-apply from re-emitting it forever.
+            let (status, reason) = match crate::types::is_unprocessable(suggestion) {
+                Some(r) => ("unprocessable", Some(r)),
+                None => ("pending", None),
+            };
             tx.execute(
-                "INSERT INTO evolve_suggestions (analysis_id, kind, target_skill, description, priority)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO evolve_suggestions \
+                    (analysis_id, kind, target_skill, description, priority, status, dedup_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     analysis_id,
                     suggestion.kind.to_string(),
                     suggestion.target_skill,
                     suggestion.description,
                     suggestion.priority as i32,
+                    status,
+                    reason,
                 ],
             )?;
         }
@@ -969,6 +978,10 @@ impl EvolveStore {
 
     /// Mark a suggestion row as superseded by another suggestion's row id.
     /// Loser row keeps its analysis_id and content but is filtered out of pending lists.
+    ///
+    /// Accepts losers in either `pending` or `unprocessable` state — an
+    /// unprocessable row that's also a dedup loser should end up as
+    /// `superseded` (the stronger terminal status).
     pub fn mark_suggestion_superseded(
         &self,
         loser_id: i64,
@@ -982,10 +995,55 @@ impl EvolveStore {
         conn.execute(
             "UPDATE evolve_suggestions \
              SET status = 'superseded', supersedes_id = ?1, dedup_reason = ?2 \
-             WHERE id = ?3 AND status = 'pending'",
+             WHERE id = ?3 AND status IN ('pending','unprocessable')",
             rusqlite::params![survivor_id, reason, loser_id],
         )?;
         Ok(())
+    }
+
+    /// Mark a suggestion row as `unprocessable` with a short reason.
+    /// Returns rows affected (0 means the row was no longer in `pending`).
+    pub fn mark_suggestion_unprocessable(
+        &self,
+        id: i64,
+        reason: &str,
+    ) -> Result<usize, EvolveError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        let n = conn.execute(
+            "UPDATE evolve_suggestions \
+             SET status = 'unprocessable', dedup_reason = ?2 \
+             WHERE id = ?1 AND status = 'pending'",
+            rusqlite::params![id, reason],
+        )?;
+        Ok(n)
+    }
+
+    /// After-batch safety sweep — when a suggestion was emitted as a context
+    /// during batch-apply but never had its status updated by the executor
+    /// (e.g. cancel mid-loop, early-return path that forgot to mark it),
+    /// stamp it `failed` so it isn't re-tried next run.
+    ///
+    /// Idempotent — only updates rows still in `pending`.
+    pub fn mark_emitted_pending_as_failed(
+        &self,
+        id: i64,
+        reason: &str,
+    ) -> Result<usize, EvolveError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| EvolveError::Other(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let n = conn.execute(
+            "UPDATE evolve_suggestions \
+             SET status = 'failed', failed_at = ?2, failure_reason = ?3 \
+             WHERE id = ?1 AND status = 'pending'",
+            rusqlite::params![id, now, reason],
+        )?;
+        Ok(n)
     }
 
     /// Persist the evolve config to SQLite as a JSON blob.
@@ -1461,4 +1519,138 @@ mod tests {
         assert!(!loaded.is_active);
     }
 
+    fn analysis_with(
+        suggestions: Vec<EvolutionSuggestion>,
+    ) -> ExecutionAnalysis {
+        ExecutionAnalysis {
+            id: AnalysisId::new(),
+            session_id: "sess-x".into(),
+            agent_id: "agent-x".into(),
+            task_completed: true,
+            execution_note: "ok".into(),
+            tool_issues: vec![],
+            skill_judgments: vec![],
+            evolution_suggestions: suggestions,
+            model_used: "test".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            analyzed_at: Utc::now(),
+        }
+    }
+
+    fn sug(kind: SuggestionKind, target: Option<&str>, desc: &str) -> EvolutionSuggestion {
+        EvolutionSuggestion {
+            kind,
+            target_skill: target.map(String::from),
+            description: desc.into(),
+            priority: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn save_analysis_stamps_unprocessable_for_fix_without_target() {
+        let conn = setup_db();
+        let store = EvolveStore::new(conn);
+        let a = analysis_with(vec![
+            sug(SuggestionKind::Fix, None, "fix-no-target"),
+            sug(SuggestionKind::Fix, Some("docker"), "fix-with-target"),
+        ]);
+        store.save_analysis(&a).unwrap();
+
+        let pending = store.list_all_pending_suggestions().unwrap();
+        assert_eq!(pending.len(), 1, "only the fix-with-target should be pending");
+        assert_eq!(pending[0].2.description, "fix-with-target");
+
+        // Confirm the no-target row is `unprocessable` in the underlying table.
+        let loaded = store.get_analysis(&a.id.to_string()).unwrap().unwrap();
+        let no_target = loaded
+            .evolution_suggestions
+            .iter()
+            .find(|s| s.description == "fix-no-target")
+            .unwrap();
+        assert_eq!(no_target.status, SuggestionStatus::Unprocessable);
+        assert!(no_target.dedup_reason.is_some());
+    }
+
+    #[test]
+    fn mark_suggestion_unprocessable_idempotent() {
+        let conn = setup_db();
+        let store = EvolveStore::new(conn);
+        let a = analysis_with(vec![sug(SuggestionKind::Fix, Some("docker"), "x")]);
+        store.save_analysis(&a).unwrap();
+        let (id, _, _) = store.list_all_pending_suggestions().unwrap()[0].clone();
+
+        let first = store.mark_suggestion_unprocessable(id, "r").unwrap();
+        let second = store.mark_suggestion_unprocessable(id, "r").unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "second call must be a no-op");
+    }
+
+    #[test]
+    fn mark_suggestion_superseded_now_accepts_unprocessable() {
+        // Even rows that started as `unprocessable` should flip to
+        // `superseded` if dedup names them a loser — superseded is the
+        // stronger terminal status.
+        let conn = setup_db();
+        let store = EvolveStore::new(conn);
+        let a = analysis_with(vec![
+            sug(SuggestionKind::Fix, None, "a"),
+            sug(SuggestionKind::Fix, Some("docker"), "b"),
+        ]);
+        store.save_analysis(&a).unwrap();
+
+        let all = store
+            .get_analysis(&a.id.to_string())
+            .unwrap()
+            .unwrap()
+            .evolution_suggestions;
+        // Find raw ids via list_all_pending + a direct query.
+        let pending = store.list_all_pending_suggestions().unwrap();
+        let survivor_id = pending[0].0;
+        // The unprocessable row id: locate it by description via SQL.
+        let conn2 = store.conn.lock().unwrap();
+        let loser_id: i64 = conn2
+            .query_row(
+                "SELECT id FROM evolve_suggestions WHERE description = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn2);
+        let _ = all;
+
+        store
+            .mark_suggestion_superseded(loser_id, survivor_id, "dup")
+            .unwrap();
+
+        let conn3 = store.conn.lock().unwrap();
+        let status: String = conn3
+            .query_row(
+                "SELECT status FROM evolve_suggestions WHERE id = ?1",
+                [loser_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "superseded");
+    }
+
+    #[test]
+    fn mark_emitted_pending_as_failed_skips_non_pending() {
+        let conn = setup_db();
+        let store = EvolveStore::new(conn);
+        let a = analysis_with(vec![sug(SuggestionKind::Fix, Some("docker"), "x")]);
+        store.save_analysis(&a).unwrap();
+        let id = store.list_all_pending_suggestions().unwrap()[0].0;
+
+        let n = store
+            .mark_emitted_pending_as_failed(id, "sweep")
+            .unwrap();
+        assert_eq!(n, 1);
+        // Second call should be a no-op (status no longer pending).
+        let n2 = store
+            .mark_emitted_pending_as_failed(id, "sweep")
+            .unwrap();
+        assert_eq!(n2, 0);
+    }
 }

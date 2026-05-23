@@ -206,7 +206,15 @@ where
     match judge_fn(prompt).await {
         Ok(text) => {
             if let Some(raw) = parse_judge_response(&text) {
-                let groups = validate_groups(raw, &valid_ids);
+                let mut groups = validate_groups(raw, &valid_ids);
+                // Additive safety: judge may parse but return an empty
+                // groups list (LLM said "all distinct"). Run the heuristic
+                // as a second pass so obvious (kind, target_skill) ties
+                // still get deduped — keeps batch-apply idempotent across
+                // runs even when the judge is conservative.
+                if groups.is_empty() {
+                    groups = heuristic_dedup(&candidates);
+                }
                 return DedupResult {
                     groups,
                     used_llm: true,
@@ -272,6 +280,25 @@ mod tests {
         .await;
         assert!(res.used_llm);
         assert_eq!(res.groups.len(), 1);
+        assert_eq!(res.groups[0].survivor_id, 10);
+        assert_eq!(res.groups[0].loser_ids, vec![20]);
+    }
+
+    #[tokio::test]
+    async fn heuristic_runs_when_llm_returns_empty_groups() {
+        // Regression for Bug A: judge says "all distinct" but two candidates
+        // share (kind, target_skill). The heuristic must still group them so
+        // batch-apply doesn't re-emit both rows on the next run.
+        let candidates = vec![
+            (10, s(SuggestionKind::Fix, Some("ra"), "x", 4)),
+            (20, s(SuggestionKind::Fix, Some("ra"), "y", 3)),
+        ];
+        let res = dedup_pending(candidates, |_| async {
+            Ok(r#"{"groups":[]}"#.to_string())
+        })
+            .await;
+        assert!(res.used_llm, "judge parsed successfully");
+        assert_eq!(res.groups.len(), 1, "heuristic must run on empty LLM groups");
         assert_eq!(res.groups[0].survivor_id, 10);
         assert_eq!(res.groups[0].loser_ids, vec![20]);
     }

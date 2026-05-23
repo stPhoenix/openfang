@@ -16801,6 +16801,7 @@ pub async fn evolve_batch_apply_preview(
         Ok(report) => {
             let body = serde_json::json!({
                 "total_pending": report.total_pending,
+                "unprocessable": report.unprocessable,
                 "superseded": report.superseded,
                 "used_llm": report.used_llm,
                 "dedup_skipped": report.dedup_skipped,

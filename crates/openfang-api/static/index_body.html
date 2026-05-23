@@ -6472,14 +6472,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                                             <td x-text="es.priority"></td>
                                                             <td x-text="es.description"></td>
                                                             <td>
-                                                                <template x-if="es.executed_at">
-                                                                    <span class="badge badge-success badge-sm">Done</span>
-                                                                </template>
-                                                                <template x-if="es.failed_at && !es.executed_at">
-                                                                    <span :title="es.failure_reason || ''"
-                                                                          class="badge badge-error badge-sm">Failed</span>
-                                                                </template>
-                                                                <template x-if="!es.executed_at && !es.failed_at">
+                                                                <template x-if="suggestionIsPending(es)">
                                                                     <button :disabled="es._executing || isSuggestionExecuting(a.id, es) || (es.kind === 'fix' && !es.target_skill)"
                                                                             :title="(es.kind === 'fix' && !es.target_skill) ? 'FIX requires a target skill — analyzer did not name one' : ''"
                                                                             @click="executeSuggestion(a.id, es)"
@@ -6488,6 +6481,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                                                                               x-show="es._executing || isSuggestionExecuting(a.id, es)"></span>
                                                                         <span x-show="!(es._executing || isSuggestionExecuting(a.id, es))">Evolve</span>
                                                                     </button>
+                                                                </template>
+                                                                <template x-if="!suggestionIsPending(es)">
+                                                                    <span :class="suggestionStatusClass(es)"
+                                                                          :title="suggestionStatusTitle(es)"
+                                                                          class="badge badge-sm"
+                                                                          x-text="suggestionStatusLabel(es)"></span>
                                                                 </template>
                                                             </td>
                                                         </tr>
@@ -6612,7 +6611,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         </thead>
                         <tbody>
                         <template :key="row._key" x-for="row in paginatedSuggestions">
-                            <tr :class="row.executed_at || row.failed_at ? 'opacity-50' : ''">
+                            <tr :class="!suggestionIsPending(row) ? 'opacity-50' : ''">
                                 <td @click.stop style="text-align:center">
                                     <input :checked="!!selectedSuggestions[row._key]" @change="selectedSuggestions[row._key] = $event.target.checked || undefined"
                                            type="checkbox">
@@ -6622,15 +6621,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                               <td><code style="font-size:12px" x-text="row.target_skill || '-'"></code></td>
                               <td style="font-size:13px" x-text="row.description"></td>
                               <td>
-                                <template x-if="row.executed_at">
-                                  <span class="badge badge-success badge-sm">Done</span>
-                                </template>
-                                <template x-if="row.failed_at && !row.executed_at">
-                                  <span class="badge badge-error badge-sm" :title="row.failure_reason || ''">Failed</span>
-                                </template>
-                                <template x-if="!row.executed_at && !row.failed_at">
-                                  <span class="badge badge-dim badge-sm">Pending</span>
-                                </template>
+                                <span :class="suggestionStatusClass(row)"
+                                      :title="suggestionStatusTitle(row)"
+                                      class="badge badge-sm"
+                                      x-text="suggestionStatusLabel(row)"></span>
                               </td>
                               <td>
                                 <a href="#" style="font-size:12px;color:var(--primary);text-decoration:underline;cursor:pointer"
@@ -6639,10 +6633,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                               </td>
                               <td style="font-size:12px;opacity:0.7" x-text="fmtTime(row._analysis.analyzed_at)"></td>
                               <td style="white-space:nowrap">
-                                <template x-if="row.executed_at">
-                                  <span class="badge badge-success badge-sm">Done</span>
-                                </template>
-                                <template x-if="!row.executed_at">
+                                  <template x-if="suggestionIsPending(row)">
                                   <button class="btn btn-xs btn-primary"
                                     @click="executeSuggestion(row._analysis.id, row)"
                                     :disabled="row._executing || isSuggestionExecuting(row._analysis.id, row) || (row.kind === 'fix' && !row.target_skill)"
