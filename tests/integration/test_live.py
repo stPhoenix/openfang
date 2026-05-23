@@ -449,6 +449,133 @@ def test_a2a_send_task_subscribe_cancel_midstream(base_url: str) -> None:
         assert poll_state == state, (poll_state, state)
 
 
+# ── A2A concurrency: parallel across sessions, serial within a session ───────
+
+
+def test_a2a_concurrent_send_across_sessions_runs_in_parallel(base_url: str) -> None:
+    """Three /a2a/tasks/send calls without a shared sessionId target the same
+    demiurg agent but distinct sessions. They must execute concurrently — the
+    wall-clock for all three should be on the order of a single task, not 3x.
+
+    Single-task baseline is measured first to compute the parallel threshold.
+    """
+    import threading
+    import time as _time
+
+    payload = {
+        "params": {
+            "message": {"parts": [{"type": "text", "text": "Reply with exactly the word OK."}]}
+        }
+    }
+
+    def _send_and_poll(c: httpx.Client) -> float:
+        t0 = _time.monotonic()
+        r = c.post("/a2a/tasks/send", json=payload)
+        assert r.status_code == 200, f"send returned {r.status_code}: {r.text[:300]}"
+        tid = r.json()["id"]
+        # Poll until terminal.
+        deadline = _time.monotonic() + 120.0
+        while _time.monotonic() < deadline:
+            g = c.get(f"/a2a/tasks/{tid}")
+            assert g.status_code == 200, g.text[:200]
+            body = g.json()
+            status = body.get("status")
+            state = status.get("state") if isinstance(status, dict) else status
+            if state in ("completed", "failed", "cancelled"):
+                assert state == "completed", f"task {tid} ended in {state}: {body}"
+                return _time.monotonic() - t0
+            _time.sleep(0.25)
+        raise AssertionError(f"task {tid} did not terminate within 120s")
+
+    # Baseline: one call alone.
+    with httpx.Client(base_url=base_url, timeout=180.0) as c:
+        baseline = _send_and_poll(c)
+
+    # Fire 3 concurrent.
+    elapsed: list[float] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            with httpx.Client(base_url=base_url, timeout=180.0) as c:
+                elapsed.append(_send_and_poll(c))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker, daemon=True) for _ in range(3)]
+    parallel_start = _time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=240.0)
+    parallel_wall = _time.monotonic() - parallel_start
+
+    assert not errors, f"concurrent workers failed: {errors!r}"
+    assert len(elapsed) == 3, f"expected 3 completions, got {len(elapsed)}"
+
+    # If execution were strictly serial, parallel_wall ≈ 3 * baseline. With
+    # per-session locking it should be roughly 1 * baseline plus scheduling
+    # jitter. Allow generous margin: 2 * baseline is still strong evidence of
+    # parallelism (one full serial run would be ≥ 3 * baseline).
+    threshold = max(2.0 * baseline, baseline + 5.0)
+    assert parallel_wall < threshold, (
+        f"3 parallel A2A sends took {parallel_wall:.1f}s, expected < {threshold:.1f}s "
+        f"(baseline single-call {baseline:.1f}s). Looks serial."
+    )
+
+
+def test_a2a_concurrent_sendSubscribe_same_session_serializes(base_url: str) -> None:
+    """Two sendSubscribe calls pinned to the SAME sessionId must serialize at
+    the per-session lock. Both must reach state=completed (broken history
+    would cause the second call to fail with a malformed-message provider
+    error). The second call's wall time should be ≥ the first call's, since
+    it queues behind the first."""
+    import threading
+    import time as _time
+    import uuid
+
+    shared_session = str(uuid.uuid4())
+    payload = {
+        "params": {
+            "sessionId": shared_session,
+            "message": {"parts": [{"type": "text", "text": "Reply with exactly the word OK."}]},
+        }
+    }
+
+    results: list[tuple[float, str]] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            t0 = _time.monotonic()
+            terminal: dict | None = None
+            with httpx.Client(base_url=base_url, timeout=180.0) as c:
+                with c.stream("POST", "/a2a/tasks/sendSubscribe", json=payload) as resp:
+                    assert resp.status_code == 200
+                    for _ev, data in _parse_sse(resp.iter_lines()):
+                        if isinstance(data, dict) and data.get("final") is True:
+                            terminal = data
+                            break
+            assert terminal is not None
+            state = terminal["status"]["state"]
+            results.append((_time.monotonic() - t0, state))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=240.0)
+
+    assert not errors, f"concurrent SSE workers failed: {errors!r}"
+    assert len(results) == 2
+
+    # Both must complete cleanly — corruption would surface as 'failed'.
+    for elapsed, state in results:
+        assert state == "completed", f"unexpected terminal state {state} ({elapsed:.1f}s)"
+
+
 # ── Evolve batch-apply (dedup + scheduled apply pipeline) ─────────────────────
 
 

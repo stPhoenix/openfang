@@ -1594,7 +1594,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
 dependencies = [
-    "nu-ansi-term",
+ "nu-ansi-term",
 ]
 
 [[package]]
@@ -4222,7 +4222,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
-    "utoipa",
+ "utoipa",
  "uuid",
 ]
 
@@ -4324,12 +4324,12 @@ name = "openfang-evolve"
 version = "0.6.4"
 dependencies = [
  "chrono",
-    "diffy",
+ "diffy",
  "openfang-types",
  "rusqlite",
  "serde",
  "serde_json",
-    "strsim",
+ "strsim",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4381,7 +4381,7 @@ dependencies = [
  "tokio-test",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
-    "utoipa",
+ "utoipa",
  "uuid",
 ]
 
@@ -4422,7 +4422,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
-    "utoipa",
+ "utoipa",
  "uuid",
  "zeroize",
 ]
@@ -4547,7 +4547,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
-    "utoipa",
+ "utoipa",
  "uuid",
 ]
 
@@ -8165,10 +8165,10 @@ version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
 dependencies = [
-    "indexmap 2.13.0",
-    "serde",
-    "serde_json",
-    "utoipa-gen",
+ "indexmap 2.13.0",
+ "serde",
+ "serde_json",
+ "utoipa-gen",
 ]
 
 [[package]]
@@ -8177,11 +8177,11 @@ version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
 dependencies = [
-    "proc-macro2",
-    "quote",
-    "regex",
-    "syn 2.0.117",
-    "uuid",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 2.0.117",
+ "uuid",
 ]
 
 [[package]]
@@ -9638,10 +9638,10 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 name = "xtask"
 version = "0.6.4"
 dependencies = [
-    "clap",
-    "openfang-api",
-    "serde_json",
-    "utoipa",
+ "clap",
+ "openfang-api",
+ "serde_json",
+ "utoipa",
 ]
 
 [[package]]

@@ -207,10 +207,13 @@ pub struct OpenFangKernel {
     /// boot-time `self.config.fallback_providers`". (#1129)
     pub fallback_providers_override:
         std::sync::RwLock<Option<Vec<openfang_types::config::FallbackProviderConfig>>>,
-    /// Per-agent message locks — serializes LLM calls for the same agent to prevent
-    /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
-    /// messages via Telegram). Different agents can still run in parallel.
-    agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Per-session message locks — serializes LLM calls that share a session
+    /// (the unit of conversation history), so concurrent writes can't corrupt
+    /// the message log or break `tool_use`/`tool_result` pairing. Calls
+    /// targeting different sessions (including different A2A tasks against the
+    /// same agent) run in parallel.
+    session_msg_locks:
+        dashmap::DashMap<openfang_types::agent::SessionId, Arc<tokio::sync::Mutex<()>>>,
     /// Set of agents currently inside an `agent_loop` run (streaming or not).
     /// Used by `/api/agents` to surface a "generating" badge for delegated
     /// sub-agents whose loop is invoked outside the WebSocket pipeline.
@@ -1352,7 +1355,7 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
-            agent_msg_locks: dashmap::DashMap::new(),
+            session_msg_locks: dashmap::DashMap::new(),
             active_loops: dashmap::DashSet::new(),
             evolve_engine,
             evolver_exec_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2212,15 +2215,29 @@ impl OpenFangKernel {
         .await
     }
 
+    /// Returns the per-session mutex used to serialize concurrent agent-loop
+    /// runs that share a session. Creates an entry on first use. Different
+    /// sessions return distinct mutexes and run independently.
+    pub(crate) fn session_lock(
+        &self,
+        session_id: openfang_types::agent::SessionId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.session_msg_locks
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Send a message with optional content blocks and an optional kernel handle.
     ///
     /// When `content_blocks` is `Some`, the LLM agent loop receives structured
     /// multimodal content (text + images) instead of just a text string. This
     /// enables vision models to process images sent from channels like Telegram.
     ///
-    /// Per-agent locking ensures that concurrent messages for the same agent
-    /// are serialized (preventing session corruption), while messages for
-    /// different agents run in parallel.
+    /// Per-session locking ensures that concurrent messages sharing a session
+    /// are serialized (preventing message-history corruption), while calls
+    /// against different sessions — including different A2A tasks targeting
+    /// the same agent — run in parallel.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message_with_handle_and_blocks(
         &self,
@@ -2234,15 +2251,20 @@ impl OpenFangKernel {
         session_id_override: Option<openfang_types::agent::SessionId>,
         already_persisted: bool,
     ) -> KernelResult<AgentLoopResult> {
-        // Acquire per-agent lock to serialize concurrent messages for the same agent.
-        // This prevents session corruption when multiple messages arrive in quick
-        // succession (e.g. rapid voice messages via Telegram). Messages for different
-        // agents are not blocked — each agent has its own independent lock.
-        let lock = self
-            .agent_msg_locks
-            .entry(agent_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        // Fetch the registry entry first so we can derive the effective session
+        // id — that is the lock key. Caller may override the agent's default
+        // session (e.g. A2A `tasks/send` pins a per-task UUID); otherwise we
+        // fall back to the agent's canonical session.
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let effective_session = session_id_override.unwrap_or(entry.session_id);
+
+        // Acquire per-session lock to serialize concurrent agent-loop runs
+        // that share a session (the unit of conversation history). Calls
+        // targeting different sessions — including parallel A2A tasks against
+        // the same agent — proceed concurrently.
+        let lock = self.session_lock(effective_session);
         let _guard = lock.lock().await;
 
         // Mark this agent as actively running an agent_loop so /api/agents
@@ -2267,10 +2289,6 @@ impl OpenFangKernel {
         self.scheduler
             .check_quota(agent_id)
             .map_err(KernelError::OpenFang)?;
-
-        let entry = self.registry.get(agent_id).ok_or_else(|| {
-            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
-        })?;
 
         // Dispatch based on module type
         let result = if entry.manifest.module.starts_with("wasm:") {
@@ -2434,6 +2452,11 @@ impl OpenFangKernel {
         })?;
         let active_session_id = session_override.unwrap_or(entry.session_id);
 
+        // Per-session lock — guard is acquired INSIDE each spawned future so
+        // it spans the entire agent-loop lifetime. Acquiring before spawn and
+        // releasing on return would leave the run unprotected.
+        let session_lock = self.session_lock(active_session_id);
+
         let is_wasm = entry.manifest.module.starts_with("wasm:");
         let is_python = entry.manifest.module.starts_with("python:");
 
@@ -2443,8 +2466,10 @@ impl OpenFangKernel {
             let kernel_clone = Arc::clone(self);
             let message_owned = message.to_string();
             let entry_clone = entry.clone();
+            let session_lock_inner = Arc::clone(&session_lock);
 
             let handle = tokio::spawn(async move {
+                let _session_guard = session_lock_inner.lock().await;
                 let result = if is_wasm {
                     kernel_clone
                         .execute_wasm_agent(&entry_clone, &message_owned, kernel_handle)
@@ -2488,59 +2513,11 @@ impl OpenFangKernel {
             return Ok((rx, handle));
         }
 
-        // LLM agent: true streaming via agent loop
-        let mut session = self
-            .memory
-            .get_session(active_session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: active_session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
-
-        // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
-        let needs_compact = {
-            use openfang_runtime::compactor::{
-                estimate_token_count, needs_compaction as check_compact,
-                needs_compaction_by_tokens, CompactionConfig,
-            };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
-            let estimated = estimate_token_count(
-                &session.messages,
-                Some(&entry.manifest.model.system_prompt),
-                None,
-            );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
-            if by_tokens && !by_messages {
-                info!(
-                    agent_id = %agent_id,
-                    estimated_tokens = estimated,
-                    messages = session.messages.len(),
-                    "Token-based compaction triggered (messages below threshold but tokens above)"
-                );
-            }
-            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
-                let threshold = (headroom as f64 * 0.8) as u64;
-                if estimated as u64 > threshold && session.messages.len() > 4 {
-                    info!(
-                        agent_id = %agent_id,
-                        estimated_tokens = estimated,
-                        quota_headroom = headroom,
-                        "Quota-headroom compaction triggered (session would consume >80% of remaining quota)"
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            by_messages || by_tokens || by_quota
-        };
+        // LLM agent: true streaming via agent loop. The session load and
+        // compaction check are deferred to inside the spawned task so they
+        // happen *after* the per-session lock is acquired (preventing a
+        // TOCTOU read of session state between two concurrent callers).
+        let base_system_prompt = entry.manifest.model.system_prompt.clone();
 
         let driver = self.resolve_driver(&entry.manifest)?;
 
@@ -2741,8 +2718,14 @@ impl OpenFangKernel {
             kernel_handle
         };
         let kernel_clone = Arc::clone(self);
+        let session_lock_inner = Arc::clone(&session_lock);
 
         let handle = tokio::spawn(async move {
+            // Acquire the per-session lock FIRST. Held across session load,
+            // compaction, agent loop, and post-loop persistence. Released on
+            // natural return or task abort (RAII).
+            let _session_guard = session_lock_inner.lock().await;
+
             // Mark this agent as actively generating (parallels the
             // non-streaming path's tracking so /api/agents shows the
             // "generating" indicator for delegated and streaming runs alike).
@@ -2759,6 +2742,62 @@ impl OpenFangKernel {
             let _active_loop_guard = ActiveLoopGuard {
                 kernel: Arc::clone(&kernel_clone),
                 id: agent_id,
+            };
+
+            // Load session under the lock so concurrent callers sharing this
+            // session id always see each other's writes.
+            let mut session = memory
+                .get_session(active_session_id)
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: active_session_id,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                });
+
+            // Compaction check (message-count OR token-count OR quota-headroom).
+            let needs_compact = {
+                use openfang_runtime::compactor::{
+                    estimate_token_count, needs_compaction as check_compact,
+                    needs_compaction_by_tokens, CompactionConfig,
+                };
+                let config = CompactionConfig::default();
+                let by_messages = check_compact(&session, &config);
+                let estimated = estimate_token_count(
+                    &session.messages,
+                    Some(&base_system_prompt),
+                    None,
+                );
+                let by_tokens = needs_compaction_by_tokens(estimated, &config);
+                if by_tokens && !by_messages {
+                    info!(
+                        agent_id = %agent_id,
+                        estimated_tokens = estimated,
+                        messages = session.messages.len(),
+                        "Token-based compaction triggered (messages below threshold but tokens above)"
+                    );
+                }
+                let by_quota = if let Some(headroom) =
+                    kernel_clone.scheduler.token_headroom(agent_id)
+                {
+                    let threshold = (headroom as f64 * 0.8) as u64;
+                    if estimated as u64 > threshold && session.messages.len() > 4 {
+                        info!(
+                            agent_id = %agent_id,
+                            estimated_tokens = estimated,
+                            quota_headroom = headroom,
+                            "Quota-headroom compaction triggered (session would consume >80% of remaining quota)"
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                by_messages || by_tokens || by_quota
             };
 
             // Auto-compact if the session is large before running the loop
@@ -12436,5 +12475,121 @@ mod tests {
         // Manually shut down via Arc::try_unwrap — easier here is to skip
         // shutdown since tempfile cleans up; the kernel has no live tasks.
         drop(kernel);
+    }
+
+    /// The per-session lock keys on `SessionId`. Two distinct sessions must
+    /// hand out distinct mutex handles; the same session id must hand out the
+    /// same handle so callers contend on it.
+    #[test]
+    fn test_session_lock_keyed_by_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-session-lock-keying");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("boot");
+
+        let sid_a = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+        let sid_b = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+
+        let lock_a1 = kernel.session_lock(sid_a);
+        let lock_a2 = kernel.session_lock(sid_a);
+        let lock_b = kernel.session_lock(sid_b);
+
+        assert!(
+            Arc::ptr_eq(&lock_a1, &lock_a2),
+            "same SessionId must return the same mutex handle"
+        );
+        assert!(
+            !Arc::ptr_eq(&lock_a1, &lock_b),
+            "distinct SessionIds must return distinct mutex handles"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Two A2A tasks pinned to *different* sessions for the same agent must
+    /// be able to run concurrently. Holding the lock for session A must not
+    /// block session B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_lock_different_sessions_run_in_parallel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-session-lock-parallel");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("boot"));
+
+        let sid_a = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+        let sid_b = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+
+        // Hold session A's lock for 200ms in a background task.
+        let kernel_a = Arc::clone(&kernel);
+        let holder = tokio::spawn(async move {
+            let lock = kernel_a.session_lock(sid_a);
+            let _g = lock.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        // Give holder time to grab the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Session B's lock must be acquirable immediately, well under the
+        // 200ms holder window. If it had to wait for sid_a we'd see ~180ms+.
+        let start = std::time::Instant::now();
+        let lock_b = kernel.session_lock(sid_b);
+        let _g = lock_b.lock().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "different sessions must not serialize; acquired in {elapsed:?}"
+        );
+
+        holder.await.unwrap();
+        kernel.shutdown();
+    }
+
+    /// Two callers contending on the *same* session lock must serialize —
+    /// the second cannot proceed until the first releases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_lock_same_session_serializes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-session-lock-serial");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("boot"));
+
+        let sid = openfang_types::agent::SessionId(uuid::Uuid::new_v4());
+
+        let kernel_holder = Arc::clone(&kernel);
+        let holder = tokio::spawn(async move {
+            let lock = kernel_holder.session_lock(sid);
+            let _g = lock.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let start = std::time::Instant::now();
+        let lock = kernel.session_lock(sid);
+        let _g = lock.lock().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "same session must serialize; acquired in {elapsed:?} (expected to wait for holder)"
+        );
+
+        holder.await.unwrap();
+        kernel.shutdown();
     }
 }
