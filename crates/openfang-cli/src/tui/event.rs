@@ -444,6 +444,8 @@ pub fn spawn_daemon_stream(
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            truncated: false,
+            truncation_reason: None,
         })));
     });
 }
@@ -480,6 +482,10 @@ fn daemon_fallback(
             cost_usd: body["cost_usd"].as_f64(),
             silent: false,
             directives: Default::default(),
+            truncated: body["truncated"].as_bool().unwrap_or(false),
+            truncation_reason: body["truncation_reason"]
+                .as_str()
+                .map(|s| s.to_string()),
         })
     } else {
         Err(body["error"]

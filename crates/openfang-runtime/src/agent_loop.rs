@@ -83,6 +83,30 @@ fn tool_timeout_for(tool_name: &str) -> Duration {
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
 
+/// Extra tool calls granted to the agent when it first trips `CircuitBreak` or
+/// `MaxIterationsExceeded`. The intent is to let it wrap up using what it has
+/// already gathered, not to keep investigating. Applied at most once per loop.
+const FINALIZE_GRACE_TOOL_CALLS: u32 = 10;
+
+/// Extra iterations granted alongside `FINALIZE_GRACE_TOOL_CALLS` so the agent
+/// has room to actually issue those wrap-up tool calls and then produce a
+/// final text turn.
+const FINALIZE_GRACE_ITERATIONS: u32 = 3;
+
+/// User-turn injected when the grace finalization window opens. Tells the
+/// agent it has a small budget left and must produce its final answer.
+fn build_grace_message(reason: &str, detail: &str) -> String {
+    format!(
+        "[System: You have reached your tool-use budget ({reason}: {detail}). \
+         You have {tools} more tool calls and a few iterations to wrap up. \
+         Do NOT start new investigations — use the information you have \
+         already gathered to produce your final answer to the original task.]",
+        reason = reason,
+        detail = detail,
+        tools = FINALIZE_GRACE_TOOL_CALLS,
+    )
+}
+
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
@@ -322,7 +346,7 @@ pub enum LoopPhase {
 pub type PhaseCallback = Arc<dyn Fn(LoopPhase) + Send + Sync>;
 
 /// Result of an agent loop execution.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AgentLoopResult {
     /// The final text response from the agent.
     pub response: String,
@@ -336,6 +360,13 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+    /// True when the loop entered the grace finalization phase because it
+    /// hit `global_circuit_breaker` or `max_iterations`. The response is
+    /// still authoritative but the agent was forced to wrap up.
+    pub truncated: bool,
+    /// `"circuit_break"` or `"max_iterations_exceeded"` when `truncated` is
+    /// true; otherwise `None`.
+    pub truncation_reason: Option<String>,
 }
 
 /// Build the user-turn message, combining text with any image content blocks.
@@ -593,8 +624,10 @@ pub async fn run_agent_loop(
         messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
-    // Use autonomous config max_iterations if set, else default
-    let max_iterations = manifest
+    // Use autonomous config max_iterations if set, else default. Mutable so
+    // the grace finalization phase can extend it after a CircuitBreak or
+    // MaxIterations trip.
+    let mut max_iterations = manifest
         .autonomous
         .as_ref()
         .map(|a| a.max_iterations)
@@ -620,7 +653,19 @@ pub async fn run_agent_loop(
     let model_max_output = max_output_tokens_for_model.unwrap_or(32_000);
     let mut auto_compact_state = crate::compactor::AutoCompactState::default();
 
-    for iteration in 0..max_iterations {
+    // Wrapped in an outer labeled loop so we can grant a single grace
+    // finalization window when either the iteration cap or LoopGuard circuit
+    // breaker trips. See `FINALIZE_GRACE_*` constants and
+    // `LoopGuard::extend_budget` for the policy.
+    let mut iter_start: u32 = 0;
+    let mut entered_grace_reason: Option<String> = None;
+    let mut grace_msg_pending: Option<String> = None;
+    'outer: loop {
+        // Mutating `max_iterations` inside the body only takes effect on the
+        // next `'outer` pass (after `break`); the current for-range is fixed.
+        // That is intentional — silence the lint instead of restructuring.
+        #[allow(clippy::mut_range_bound)]
+        for iteration in iter_start..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
         // Layer 1: Microcompaction — clear old tool results if time gap exceeded
@@ -841,6 +886,8 @@ pub async fn run_agent_loop(
                             current_thread: parsed_directives.current_thread,
                             silent: true,
                         },
+                        truncated: entered_grace_reason.is_some(),
+                        truncation_reason: entered_grace_reason.clone(),
                     });
                 }
 
@@ -1019,6 +1066,8 @@ pub async fn run_agent_loop(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    truncated: entered_grace_reason.is_some(),
+                    truncation_reason: entered_grace_reason.clone(),
                 });
             }
             StopReason::ToolUse => {
@@ -1084,17 +1133,43 @@ pub async fn run_agent_loop(
                                 &tool_result_blocks,
                                 &format!("Tool execution skipped: {msg}"),
                             );
-                            if !synthetic.is_empty() {
-                                tool_result_blocks.extend(synthetic);
+                            tool_result_blocks.extend(synthetic);
+
+                            // First trip: extend the budget by FINALIZE_GRACE_*
+                            // and queue a wrap-up user-turn. The post-tool-loop
+                            // code below still pushes `tool_result_blocks` as
+                            // the user message — we inject the grace turn
+                            // immediately after so the conversation order is
+                            // assistant(tool_use) → user(tool_results) →
+                            // user(grace_msg).
+                            if loop_guard.extend_budget(FINALIZE_GRACE_TOOL_CALLS) {
+                                max_iterations = max_iterations
+                                    .saturating_add(FINALIZE_GRACE_ITERATIONS);
+                                grace_msg_pending = Some(build_grace_message(
+                                    "circuit_break",
+                                    msg,
+                                ));
+                                entered_grace_reason =
+                                    Some("circuit_break".to_string());
+                                info!(
+                                    reason = "circuit_break",
+                                    "Entered finalization grace phase"
+                                );
+                                break;
+                            }
+
+                            // Grace already consumed — bail. Preserve the
+                            // pre-grace behaviour: only push synthesized
+                            // results that weren't pushed elsewhere, then
+                            // save + hook + Err.
+                            if !tool_result_blocks.is_empty() {
                                 session.messages.push(Message::user_with_blocks(
                                     tool_result_blocks.clone(),
                                 ));
                             }
-                            // Save session before bailing
                             if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
-                            // Fire AgentLoopEnd hook on circuit break
                             if let Some(hook_reg) = hooks {
                                 let ctx = crate::hooks::HookContext {
                                     agent_name: &manifest.name,
@@ -1318,6 +1393,13 @@ pub async fn run_agent_loop(
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
+                // Flush the queued grace user-turn so it lands immediately
+                // after the tool results that closed the failing turn.
+                if let Some(grace_msg) = grace_msg_pending.take() {
+                    session.messages.push(Message::user(&grace_msg));
+                    messages.push(Message::user(&grace_msg));
+                }
+
                 // Interim save after tool execution to prevent data loss on crash
                 if let Err(e) = memory.save_session_async(session).await {
                     warn!("Failed to interim-save session: {e}");
@@ -1362,6 +1444,8 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        truncated: entered_grace_reason.is_some(),
+                        truncation_reason: entered_grace_reason.clone(),
                     });
                 }
                 // Model hit token limit — add partial response and continue
@@ -1373,6 +1457,27 @@ pub async fn run_agent_loop(
                 warn!(iteration, "Max tokens hit, continuing");
             }
         }
+    }
+        iter_start = max_iterations;
+        if loop_guard.is_finalization_active() {
+            break 'outer;
+        }
+        if loop_guard.extend_budget(FINALIZE_GRACE_TOOL_CALLS) {
+            max_iterations = max_iterations.saturating_add(FINALIZE_GRACE_ITERATIONS);
+            let grace_msg = build_grace_message(
+                "max_iterations_exceeded",
+                &format!("{iter_start} iterations"),
+            );
+            session.messages.push(Message::user(&grace_msg));
+            messages.push(Message::user(&grace_msg));
+            entered_grace_reason = Some("max_iterations_exceeded".to_string());
+            info!(
+            reason = "max_iterations_exceeded",
+            "Entered finalization grace phase"
+        );
+            continue 'outer;
+        }
+        break 'outer;
     }
 
     // Save session before failing so conversation history is preserved
@@ -1986,8 +2091,10 @@ pub async fn run_agent_loop_streaming(
         messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
-    // Use autonomous config max_iterations if set, else default
-    let max_iterations = manifest
+    // Use autonomous config max_iterations if set, else default. Mutable so
+    // the grace finalization phase can extend it after a CircuitBreak or
+    // MaxIterations trip.
+    let mut max_iterations = manifest
         .autonomous
         .as_ref()
         .map(|a| a.max_iterations)
@@ -2013,7 +2120,15 @@ pub async fn run_agent_loop_streaming(
     let model_max_output = max_output_tokens_for_model.unwrap_or(32_000);
     let mut auto_compact_state = crate::compactor::AutoCompactState::default();
 
-    for iteration in 0..max_iterations {
+    // Same grace finalization wrapper as in `run_agent_loop`; see comments
+    // there for the policy. Kept in sync between the streaming and
+    // non-streaming paths.
+    let mut iter_start: u32 = 0;
+    let mut entered_grace_reason: Option<String> = None;
+    let mut grace_msg_pending: Option<String> = None;
+    'outer: loop {
+        #[allow(clippy::mut_range_bound)]
+        for iteration in iter_start..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
         // Boundary marker for the WS snapshot: clears the per-agent
@@ -2268,6 +2383,8 @@ pub async fn run_agent_loop_streaming(
                             current_thread: parsed_directives_s.current_thread,
                             silent: true,
                         },
+                        truncated: entered_grace_reason.is_some(),
+                        truncation_reason: entered_grace_reason.clone(),
                     });
                 }
 
@@ -2421,6 +2538,8 @@ pub async fn run_agent_loop_streaming(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    truncated: entered_grace_reason.is_some(),
+                    truncation_reason: entered_grace_reason.clone(),
                 });
             }
             StopReason::ToolUse => {
@@ -2472,16 +2591,30 @@ pub async fn run_agent_loop_streaming(
                     match &verdict {
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered (streaming)");
-                            // Pair every assistant tool_use with a tool_result
-                            // before persisting — otherwise the next turn sees a
-                            // dangling tool_use and the provider 400s.
                             let synthetic = synthesize_missing_tool_results(
                                 &assistant_blocks,
                                 &tool_result_blocks,
                                 &format!("Tool execution skipped: {msg}"),
                             );
-                            if !synthetic.is_empty() {
-                                tool_result_blocks.extend(synthetic);
+                            tool_result_blocks.extend(synthetic);
+
+                            if loop_guard.extend_budget(FINALIZE_GRACE_TOOL_CALLS) {
+                                max_iterations = max_iterations
+                                    .saturating_add(FINALIZE_GRACE_ITERATIONS);
+                                grace_msg_pending = Some(build_grace_message(
+                                    "circuit_break",
+                                    msg,
+                                ));
+                                entered_grace_reason =
+                                    Some("circuit_break".to_string());
+                                info!(
+                                    reason = "circuit_break",
+                                    "Entered finalization grace phase (streaming)"
+                                );
+                                break;
+                            }
+
+                            if !tool_result_blocks.is_empty() {
                                 session.messages.push(Message::user_with_blocks(
                                     tool_result_blocks.clone(),
                                 ));
@@ -2489,7 +2622,6 @@ pub async fn run_agent_loop_streaming(
                             if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
-                            // Fire AgentLoopEnd hook on circuit break
                             if let Some(hook_reg) = hooks {
                                 let ctx = crate::hooks::HookContext {
                                     agent_name: &manifest.name,
@@ -2724,6 +2856,13 @@ pub async fn run_agent_loop_streaming(
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
+                // Flush the queued grace user-turn so it lands immediately
+                // after the tool results that closed the failing turn.
+                if let Some(grace_msg) = grace_msg_pending.take() {
+                    session.messages.push(Message::user(&grace_msg));
+                    messages.push(Message::user(&grace_msg));
+                }
+
                 if let Err(e) = memory.save_session_async(session).await {
                     warn!("Failed to interim-save session: {e}");
                 }
@@ -2766,6 +2905,8 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        truncated: entered_grace_reason.is_some(),
+                        truncation_reason: entered_grace_reason.clone(),
                     });
                 }
                 let text = response.text();
@@ -2776,6 +2917,27 @@ pub async fn run_agent_loop_streaming(
                 warn!(iteration, "Max tokens hit (streaming), continuing");
             }
         }
+    }
+        iter_start = max_iterations;
+        if loop_guard.is_finalization_active() {
+            break 'outer;
+        }
+        if loop_guard.extend_budget(FINALIZE_GRACE_TOOL_CALLS) {
+            max_iterations = max_iterations.saturating_add(FINALIZE_GRACE_ITERATIONS);
+            let grace_msg = build_grace_message(
+                "max_iterations_exceeded",
+                &format!("{iter_start} iterations"),
+            );
+            session.messages.push(Message::user(&grace_msg));
+            messages.push(Message::user(&grace_msg));
+            entered_grace_reason = Some("max_iterations_exceeded".to_string());
+            info!(
+            reason = "max_iterations_exceeded",
+            "Entered finalization grace phase (streaming)"
+        );
+            continue 'outer;
+        }
+        break 'outer;
     }
 
     if let Err(e) = memory.save_session_async(session).await {

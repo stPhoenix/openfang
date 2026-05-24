@@ -3132,6 +3132,8 @@ impl OpenFangKernel {
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            truncated: false,
+            truncation_reason: None,
         })
     }
 
@@ -3193,6 +3195,8 @@ impl OpenFangKernel {
             iterations: 1,
             silent: false,
             directives: Default::default(),
+            truncated: false,
+            truncation_reason: None,
         })
     }
 

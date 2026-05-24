@@ -119,6 +119,9 @@ pub struct LoopGuard {
     blocked_calls: u32,
     /// Map from call hash to tool name (for stats reporting).
     hash_to_tool: HashMap<String, String>,
+    /// True after `extend_budget` has been invoked once. Prevents repeated
+    /// grace-window extensions from masking a true runaway loop.
+    finalization_active: bool,
 }
 
 impl LoopGuard {
@@ -135,7 +138,32 @@ impl LoopGuard {
             poll_counts: HashMap::new(),
             blocked_calls: 0,
             hash_to_tool: HashMap::new(),
+            finalization_active: false,
         }
+    }
+
+    /// One-shot grace extension. On the first call raises the global circuit
+    /// breaker so the next `extra` `check()` invocations return `Allow`
+    /// instead of `CircuitBreak`, marks the guard as in finalization mode,
+    /// and returns `true`. Subsequent calls return `false` without mutating
+    /// state — the agent gets exactly one wrap-up window per loop.
+    ///
+    /// Anchors the new cap to the current `total_calls` (which already
+    /// counts the call that triggered the trip) so callers reliably get
+    /// `extra` *more* successful checks regardless of how many calls were
+    /// already attempted.
+    pub fn extend_budget(&mut self, extra: u32) -> bool {
+        if self.finalization_active {
+            return false;
+        }
+        self.config.global_circuit_breaker = self.total_calls.saturating_add(extra);
+        self.finalization_active = true;
+        true
+    }
+
+    /// True once `extend_budget` has been consumed.
+    pub fn is_finalization_active(&self) -> bool {
+        self.finalization_active
     }
 
     /// Check whether a tool call should proceed.
@@ -149,11 +177,20 @@ impl LoopGuard {
         // Global circuit breaker
         if self.total_calls > self.config.global_circuit_breaker {
             self.blocked_calls += 1;
-            return LoopGuardVerdict::CircuitBreak(format!(
-                "Circuit breaker: exceeded {} total tool calls in this loop. \
-                 The agent appears to be stuck.",
-                self.config.global_circuit_breaker
-            ));
+            let msg = if self.finalization_active {
+                format!(
+                    "Circuit breaker: exceeded {} total tool calls in this loop \
+                     (grace window exhausted). The agent appears to be stuck.",
+                    self.config.global_circuit_breaker
+                )
+            } else {
+                format!(
+                    "Circuit breaker: exceeded {} total tool calls in this loop. \
+                     The agent appears to be stuck.",
+                    self.config.global_circuit_breaker
+                )
+            };
+            return LoopGuardVerdict::CircuitBreak(msg);
         }
 
         let hash = Self::compute_hash(tool_name, params);
@@ -602,6 +639,48 @@ mod tests {
         assert_eq!(config.warn_threshold, 3);
         assert_eq!(config.block_threshold, 5);
         assert_eq!(config.global_circuit_breaker, 30);
+    }
+
+    #[test]
+    fn extend_budget_is_one_shot() {
+        let config = LoopGuardConfig {
+            warn_threshold: 100,
+            block_threshold: 100,
+            global_circuit_breaker: 5,
+            ..Default::default()
+        };
+        let mut guard = LoopGuard::new(config);
+        for i in 0..5 {
+            assert_eq!(
+                guard.check("tool", &serde_json::json!({ "n": i })),
+                LoopGuardVerdict::Allow
+            );
+        }
+        // First trip on the 6th call
+        assert!(matches!(
+            guard.check("tool", &serde_json::json!({ "n": 5 })),
+            LoopGuardVerdict::CircuitBreak(_)
+        ));
+
+        // Grace extension anchored on total_calls (=6): allow 3 more
+        assert!(guard.extend_budget(3));
+        assert!(guard.is_finalization_active());
+
+        // Exactly 3 more allowed
+        for i in 6..9 {
+            assert_eq!(
+                guard.check("tool", &serde_json::json!({ "n": i })),
+                LoopGuardVerdict::Allow,
+                "call {i} should be allowed after grace"
+            );
+        }
+        // 4th post-grace call trips
+        assert!(matches!(
+            guard.check("tool", &serde_json::json!({ "n": 9 })),
+            LoopGuardVerdict::CircuitBreak(_)
+        ));
+        // Second extend attempt is rejected
+        assert!(!guard.extend_budget(100));
     }
 
     // ========================================================================

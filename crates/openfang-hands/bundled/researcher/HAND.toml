@@ -161,7 +161,7 @@ provider = "default"
 model = "default"
 max_tokens = 16384
 temperature = 0.3
-max_iterations = 25
+max_iterations = 60
 # Researcher makes long LLM calls; 30s (kernel default) causes false-positive
 # recovery triggers. 120s matches typical deep-research call latency.
 heartbeat_interval_secs = 120

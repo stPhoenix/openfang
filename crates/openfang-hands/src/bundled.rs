@@ -349,7 +349,7 @@ mod tests {
         assert!(def.tools.contains(&"event_publish".to_string()));
         assert!(!def.settings.is_empty());
         assert!(!def.dashboard.metrics.is_empty());
-        assert_eq!(def.agent.max_iterations, Some(25));
+        assert_eq!(def.agent.max_iterations, Some(60));
     }
 
     #[test]
