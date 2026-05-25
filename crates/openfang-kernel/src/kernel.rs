@@ -10437,18 +10437,28 @@ impl KernelHandle for OpenFangKernel {
     ) -> Result<bool, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
-        // Hand agents are curated trusted packages — auto-approve tool execution.
-        // Check if this agent has a "hand:" tag indicating it was spawned by activate_hand().
+        let policy = self.approval_manager.policy();
+
+        // Trusted-agent bypasses — skip the human approval gate entirely.
         if let Ok(aid) = agent_id.parse::<AgentId>() {
             if let Some(entry) = self.registry.get(aid) {
+                // Hand agents are curated trusted packages spawned by activate_hand().
                 if entry.tags.iter().any(|t| t.starts_with("hand:")) {
                     info!(agent_id, tool_name, "Auto-approved for hand agent");
                     return Ok(true);
                 }
+                // Autonomous-mode bypass: cron-spawned evolution agents run unattended,
+                // so no human can answer the approval prompt before it times out.
+                // Gated behind ApprovalPolicy.auto_approve_autonomous (default false).
+                if policy.auto_approve_autonomous && entry.tags.iter().any(|t| t == "evolution") {
+                    info!(
+                        agent_id,
+                        tool_name, "Auto-approved for autonomous evolution agent"
+                    );
+                    return Ok(true);
+                }
             }
         }
-
-        let policy = self.approval_manager.policy();
         let req = TypedRequest {
             id: uuid::Uuid::new_v4(),
             agent_id: agent_id.to_string(),
